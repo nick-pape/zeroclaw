@@ -77,7 +77,7 @@ fn open_sqlite_with_jsonl_import(
 mod tests {
     use super::*;
     use tempfile::TempDir;
-    use zeroclaw_api::provider::ChatMessage;
+    use zeroclaw_api::model_provider::ChatMessage;
 
     fn user_msg(content: &str) -> ChatMessage {
         ChatMessage::user(content)

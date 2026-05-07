@@ -24,7 +24,6 @@ use super::platform::PLATFORMS;
 use super::{IntegrationCategory, IntegrationEntry, IntegrationStatus};
 use crate::tools::BUILTIN_TOOL_INTEGRATIONS;
 use zeroclaw_config::schema::Config;
-use zeroclaw_providers::ProviderActivation;
 
 fn bool_to_status(active: bool) -> IntegrationStatus {
     if active {
@@ -49,48 +48,23 @@ fn parse_category(label: &str) -> IntegrationCategory {
     }
 }
 
-/// Compute an AI-model integration's status from its `ProviderActivation`
-/// strategy. The registry never branches on a provider name — every
-/// per-vendor decision lives on the `ProviderInfo` row in
-/// `zeroclaw_providers::list_providers()`.
-///
-/// V3 has no global `providers.fallback`; activation is derived from
-/// the presence of `[providers.models.<type>.<alias>]` entries that
-/// match the provider info's name or aliases. Strategy variants that
-/// previously consulted the global fallback now consult the same
-/// per-type matching logic plus their original side condition.
-fn evaluate_provider_activation(
+/// Compute an AI-model integration's status from typed-family slot
+/// occupancy. The registry never branches on a provider name — the
+/// canonical slot list (`for_each_model_provider_slot!`) is the single
+/// source of truth, and a slot is "active" iff at least one alias is
+/// configured under it. Regional variants and OAuth modes that used to
+/// drive richer activation predicates are now folded onto the parent
+/// typed slot, so per-row activation enums are unnecessary.
+fn evaluate_model_provider_activation(
     config: &Config,
-    info: &zeroclaw_providers::ProviderInfo,
+    info: &zeroclaw_providers::ModelProviderInfo,
 ) -> IntegrationStatus {
-    let provider_type_matches =
-        |type_key: &str| -> bool { type_key == info.name || info.aliases.contains(&type_key) };
-
-    let active = match info.activation {
-        ProviderActivation::FallbackKey => config
+    bool_to_status(
+        config
             .providers
             .models
-            .keys()
-            .any(|k| provider_type_matches(k.as_str())),
-        ProviderActivation::FallbackKeyWithApiKey => config
-            .providers
-            .models
-            .iter()
-            .filter(|(k, _)| provider_type_matches(k.as_str()))
-            .any(|(_, aliases)| aliases.values().any(|p| p.api_key.is_some())),
-        ProviderActivation::ModelPrefix(prefix) => config
-            .providers
-            .models
-            .values()
-            .flat_map(|aliases| aliases.values())
-            .any(|p| p.model.as_deref().is_some_and(|m| m.starts_with(prefix))),
-        ProviderActivation::FallbackKeyMatches(predicate) => config
-            .providers
-            .models
-            .keys()
-            .any(|k| predicate(k.as_str())),
-    };
-    bool_to_status(active)
+            .contains_model_provider_type(info.name),
+    )
 }
 
 /// Returns the integration catalog computed against `config`.
@@ -125,13 +99,13 @@ pub fn all_integrations(config: &Config) -> Vec<IntegrationEntry> {
             status: bool_to_status(d.active),
         });
 
-    let providers = zeroclaw_providers::list_providers()
+    let providers = zeroclaw_providers::list_model_providers()
         .into_iter()
         .map(|info| {
-            let status = evaluate_provider_activation(config, &info);
+            let status = evaluate_model_provider_activation(config, &info);
             IntegrationEntry {
                 name: info.display_name.to_string(),
-                description: info.description.to_string(),
+                description: String::new(),
                 category: IntegrationCategory::AiModel,
                 status,
             }
@@ -463,52 +437,44 @@ mod tests {
     }
 
     #[test]
-    fn regional_provider_aliases_activate_expected_ai_integrations() {
-        // For each multi-region family that uses
-        // `ProviderActivation::FallbackKeyMatches`, configuring a
-        // `[providers.models.<provider_type>.<alias>]` entry must mark
-        // the corresponding `ProviderInfo`-derived integration entry as
-        // Active. Looks the entry up by canonical name (not
-        // display_name) so display copy can change without breaking
-        // the contract. V3 has no global `providers.fallback`; the
-        // FallbackKeyMatches predicate is run against the keys of
-        // `providers.models` instead.
-        let cases = [
-            ("minimax-cn", "minimax"),
-            ("glm-cn", "glm"),
-            ("moonshot-intl", "moonshot"),
-            ("qwen-intl", "qwen"),
-            ("zai-cn", "zai"),
-            ("baidu", "qianfan"),
-        ];
-        for (provider_type, canonical) in cases {
+    fn populated_typed_slot_activates_corresponding_ai_integration() {
+        // PR-branch typed-family layout: regional variants are folded
+        // onto the parent canonical slot (e.g. minimax-cn → minimax with
+        // a typed `endpoint` enum on the alias entry). Activation is
+        // therefore "any alias under the canonical slot" — a one-call
+        // `contains_model_provider_type` check that drops the V2-era
+        // `FallbackKeyMatches` predicate scaffolding.
+        //
+        // Drives every entry of `list_model_providers()` so adding a
+        // new family later (one row in `for_each_model_provider_slot!`
+        // + one display_name row here) is automatically covered.
+        for info in zeroclaw_providers::list_model_providers() {
             let mut config = Config::default();
-            config
-                .providers
-                .models
-                .entry(provider_type.to_string())
-                .or_default()
-                .entry("default".to_string())
-                .or_default();
+            assert!(
+                config
+                    .providers
+                    .models
+                    .ensure(info.name, "default")
+                    .is_some(),
+                "ModelProviderInfo {:?} must correspond to a typed slot \
+                 (drift: name not in `for_each_model_provider_slot!`)",
+                info.name,
+            );
             let entries = all_integrations(&config);
-            let info = zeroclaw_providers::list_providers()
-                .into_iter()
-                .find(|p| p.name == canonical)
-                .unwrap_or_else(|| {
-                    panic!("ProviderInfo for canonical name {canonical:?} must exist")
-                });
             let integration = entries
                 .iter()
                 .find(|e| e.name == info.display_name)
                 .unwrap_or_else(|| {
                     panic!(
-                        "integration entry for {canonical:?} (display {:?}) must exist",
-                        info.display_name,
+                        "integration entry for {:?} (display {:?}) must exist",
+                        info.name, info.display_name,
                     )
                 });
             assert!(
                 matches!(integration.status, IntegrationStatus::Active),
-                "provider type {provider_type:?} must activate {canonical:?} integration",
+                "configuring slot {:?} must activate {:?} integration",
+                info.name,
+                info.display_name,
             );
         }
     }

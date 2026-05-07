@@ -31,7 +31,7 @@ use axum::{Router, extract::State, routing::post};
 use tempfile::TempDir;
 use tokio::sync::Mutex as AsyncMutex;
 use zeroclaw_config::providers::ProvidersConfig;
-use zeroclaw_config::schema::{Config, DelegateAgentConfig, ModelProviderConfig};
+use zeroclaw_config::schema::{Config, DelegateAgentConfig, RiskProfileConfig};
 use zeroclaw_memory::{Memory, MemoryCategory, SqliteMemory};
 
 // Unique sentinel that exists ONLY in the planted Conversation entry — must
@@ -70,7 +70,10 @@ async fn scheduled_run_does_not_leak_conversation_memory_into_provider_request()
 
     // ── Mock provider ───────────────────────────────────────────────
     let (addr, captured) = spawn_mock_provider().await;
-    let provider_name = format!("custom:http://{addr}");
+    let provider_uri = format!("http://{addr}");
+    // Canonical typed-family slot. The agent's `model_provider` references
+    // the alias by `<type>.<alias>` (here `custom.default`).
+    let provider_type = "custom";
 
     // ── Plant a chat-origin Conversation memory ────────────────────
     // Keys like "discord:guild:chan:msg-N" come from real channel handlers
@@ -100,39 +103,42 @@ async fn scheduled_run_does_not_leak_conversation_memory_into_provider_request()
     }
 
     // ── Config pointing the agent at the mock provider ─────────────
-    // V3 nests provider profiles by `<provider_type>.<alias>`; the
-    // agent's `model_provider` references that path. The test's
-    // `default` agent points at `<provider_name>.default` so
-    // `agent::run` resolves the mock provider through the same
-    // codepath production daemons use.
-    let mut profiles = HashMap::new();
-    profiles.insert(
-        "default".to_string(),
-        ModelProviderConfig {
-            api_key: Some("test-key".to_string()),
-            model: Some("test-model".to_string()),
-            ..Default::default()
-        },
-    );
-    let mut models = HashMap::new();
-    models.insert(provider_name.clone(), profiles);
+    // V3 typed-family layout: `[providers.models.<type>.<alias>]`. The
+    // agent's `model_provider` references that path as `<type>.<alias>`.
+    // The test's `default` agent points at `custom.default` so `agent::run`
+    // resolves the mock provider through the same codepath production
+    // daemons use.
+    let mut providers = ProvidersConfig::default();
+    {
+        let base = providers
+            .models
+            .ensure(provider_type, "default")
+            .expect("`custom` slot must exist on ModelProviders");
+        base.api_key = Some("test-key".to_string());
+        base.model = Some("test-model".to_string());
+        base.uri = Some(provider_uri.clone());
+    }
     let mut agents = HashMap::new();
     agents.insert(
         "default".to_string(),
         DelegateAgentConfig {
             enabled: true,
-            model_provider: format!("{}.default", provider_name),
+            model_provider: format!("{provider_type}.default").into(),
+            risk_profile: "default".to_string(),
             ..Default::default()
         },
     );
+    // PR branch requires every agent to point at a configured risk_profile;
+    // wire up a permissive entry so the agent loop reaches the LLM call we
+    // care about auditing here.
+    let mut risk_profiles = HashMap::new();
+    risk_profiles.insert("default".to_string(), RiskProfileConfig::default());
     let mut config = Config {
         workspace_dir: workspace_dir.clone(),
         config_path: tmp.path().join("config.toml"),
-        providers: ProvidersConfig {
-            models,
-            ..Default::default()
-        },
+        providers,
         agents,
+        risk_profiles,
         ..Config::default()
     };
     // No retries / no waits — fail fast if the mock has issues, and don't

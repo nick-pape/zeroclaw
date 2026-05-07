@@ -114,8 +114,8 @@ pub struct WsQuery {
     pub session_id: Option<String>,
     /// Optional human-readable name for the session.
     pub name: Option<String>,
-    /// Configured agent alias to run as. Required: V3 has no default
-    /// agent — every WebSocket session is bound to an explicit agent.
+    /// Configured agent alias to run as. Required — every WebSocket
+    /// session is bound to an explicit agent (no default agent exists).
     #[serde(default, alias = "agentAlias", alias = "agent")]
     pub agent_alias: Option<String>,
     /// Project root / working directory for this session.
@@ -201,7 +201,7 @@ pub async fn handle_ws_chat(
     };
 
     // Reject the upgrade up-front when the client didn't pick an agent.
-    // V3 has no default — every WS session is bound to an explicit agent.
+    // No default — every WS session is bound to an explicit agent.
     let Some(agent_alias) = params.agent_alias.filter(|s| !s.trim().is_empty()) else {
         return (
             axum::http::StatusCode::BAD_REQUEST,
@@ -667,14 +667,14 @@ async fn process_chat_message(
         .config
         .lock()
         .providers
-        .first_provider_type()
+        .first_model_provider_type()
         .unwrap_or("unknown")
         .to_string();
 
     // Broadcast agent_start event
     let _ = state.event_tx.send(serde_json::json!({
         "type": "agent_start",
-        "provider": provider_label,
+        "model_provider": provider_label,
         "model": state.model,
     }));
 
@@ -905,7 +905,7 @@ async fn process_chat_message(
         // Broadcast agent_end event
         let _ = state.event_tx.send(serde_json::json!({
             "type": "agent_end",
-            "provider": provider_label,
+            "model_provider": provider_label,
             "model": state.model,
         }));
 
@@ -942,13 +942,13 @@ async fn process_chat_message(
             // are extracted to long-term memory (Daily + Core categories).
             if state.auto_save {
                 let mem = state.mem.clone();
-                let provider = state.provider.clone();
+                let model_provider = state.model_provider.clone();
                 let model = state.model.clone();
                 let user_msg = content.to_string();
                 let assistant_resp = response.clone();
                 tokio::spawn(async move {
                     if let Err(e) = zeroclaw_memory::consolidation::consolidate_turn(
-                        provider.as_ref(),
+                        model_provider.as_ref(),
                         &model,
                         mem.as_ref(),
                         &user_msg,
@@ -1003,7 +1003,7 @@ async fn process_chat_message(
             // Broadcast agent_end event
             let _ = state.event_tx.send(serde_json::json!({
                 "type": "agent_end",
-                "provider": provider_label,
+                "model_provider": provider_label,
                 "model": state.model,
             }));
 
@@ -1040,7 +1040,7 @@ async fn process_chat_message(
                 || sanitized.to_lowercase().contains("unauthorized")
             {
                 "AUTH_ERROR"
-            } else if sanitized.to_lowercase().contains("provider")
+            } else if sanitized.to_lowercase().contains("model_provider")
                 || sanitized.to_lowercase().contains("model")
             {
                 "PROVIDER_ERROR"
@@ -1108,13 +1108,9 @@ fn record_turn_cost(
     let pricing_map = config
         .providers
         .models
-        .iter()
-        .flat_map(|(type_k, alias_map)| {
-            alias_map.iter().map(move |(alias_k, profile)| {
-                (format!("{type_k}.{alias_k}"), profile.pricing.clone())
-            })
-        })
-        .filter(|(_, p)| !p.is_empty())
+        .iter_entries()
+        .filter(|(_, _, base)| !base.pricing.is_empty())
+        .map(|(type_k, alias_k, base)| (format!("{type_k}.{alias_k}"), base.pricing.clone()))
         .collect::<std::collections::HashMap<String, std::collections::HashMap<String, f64>>>();
     drop(config);
     let model_pricing = pricing_map.get(provider_name);
