@@ -52,20 +52,6 @@ pub enum AccessMode {
     ReadWrite,
 }
 
-impl AccessMode {
-    /// Whether this mode includes read access.
-    #[must_use]
-    pub const fn allows_read(self) -> bool {
-        matches!(self, Self::Read | Self::ReadWrite)
-    }
-
-    /// Whether this mode includes write access.
-    #[must_use]
-    pub const fn allows_write(self) -> bool {
-        matches!(self, Self::Write | Self::ReadWrite)
-    }
-}
-
 /// Single non-agent member of a peer group: a human or an external bot reachable
 /// at `username` on the group's `channel`. The channel ref lives on the group,
 /// so the entry only carries the username.
@@ -233,16 +219,6 @@ mod tests {
             let back: AccessMode = serde_json::from_str(&json).unwrap();
             assert_eq!(back, mode);
         }
-    }
-
-    #[test]
-    fn access_mode_capability_predicates() {
-        assert!(AccessMode::Read.allows_read());
-        assert!(!AccessMode::Read.allows_write());
-        assert!(!AccessMode::Write.allows_read());
-        assert!(AccessMode::Write.allows_write());
-        assert!(AccessMode::ReadWrite.allows_read());
-        assert!(AccessMode::ReadWrite.allows_write());
     }
 
     #[test]

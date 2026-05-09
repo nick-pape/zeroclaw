@@ -77,20 +77,6 @@ impl AgentScopedMemory {
         }
     }
 
-    /// The bound agent's UUID.
-    #[must_use]
-    pub fn bound_agent_id(&self) -> &str {
-        &self.agent_id
-    }
-
-    /// The full allowlist this wrapper recalls from (bound agent
-    /// included). Borrowed slice for read-only inspection by tests
-    /// and callers that need to log effective scope.
-    #[must_use]
-    pub fn allowed_agent_ids(&self) -> &HashSet<String> {
-        &self.allowed_agent_ids
-    }
-
     /// Build a `Vec<&str>` of the allowlist for passing to the
     /// `Memory::recall_for_agents` trait method, which takes a
     /// borrowed slice. Stable iteration order is not required.

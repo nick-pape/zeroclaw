@@ -39,15 +39,6 @@ pub struct ResolvedPeers {
 }
 
 impl ResolvedPeers {
-    /// True when the resolved set is empty across every channel —
-    /// the agent has no declared peers anywhere. The agent still runs;
-    /// peer-aware tools simply have nothing to surface.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.agent_peers.values().all(BTreeSet::is_empty)
-            && self.external_peers.values().all(BTreeSet::is_empty)
-    }
-
     /// Whether the bound agent should accept inbound messages from
     /// the supplied origin on the supplied channel.
     ///
@@ -166,8 +157,9 @@ mod tests {
     fn resolve_returns_empty_when_agent_has_no_peer_groups() {
         let cfg = make_config_with_two_agents_in_one_group();
         let resolved = resolve_peer_set(&cfg, "gamma");
-        assert!(
-            resolved.is_empty(),
+        assert_eq!(
+            resolved,
+            ResolvedPeers::default(),
             "an agent not on any group has no peers, got {resolved:?}"
         );
     }
