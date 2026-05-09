@@ -3477,7 +3477,7 @@ mod tests {
     /// the alias-specific entry rather than `first_model_provider()`.
     fn config_with_two_anthropic_aliases() -> zeroclaw_config::schema::Config {
         use zeroclaw_config::schema::{
-            AnthropicModelProviderConfig, Config, AliasedAgentConfig, ModelProviderConfig,
+            AliasedAgentConfig, AnthropicModelProviderConfig, Config, ModelProviderConfig,
         };
         let mut config = Config::default();
         let default_alias = AnthropicModelProviderConfig {

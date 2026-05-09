@@ -13707,6 +13707,100 @@ impl Config {
                     "agents.{alias}.risk_profile must reference a configured [risk_profiles.<alias>] entry",
                 );
             }
+
+            // workspace.access: keys must point at OTHER agents, never
+            // self, and every target must be a configured agent. #6272 P3.
+            for (target, mode) in &agent.workspace.access {
+                let target_str = target.as_str();
+                if target_str == alias.as_str() {
+                    validation_bail!(
+                        InvalidFormat,
+                        format!("agents.{alias}.workspace.access.{target_str}"),
+                        "agents.{alias}.workspace.access.{target_str} = {mode:?} but {target_str} is this agent itself; an agent always has full access to its own workspace, so self-references in the cross-agent allowlist are not permitted",
+                    );
+                }
+                if !self.agents.contains_key(target_str) {
+                    validation_bail!(
+                        DanglingReference,
+                        format!("agents.{alias}.workspace.access.{target_str}"),
+                        "agents.{alias}.workspace.access.{target_str} = {mode:?} but agents.{target_str} is not configured",
+                    );
+                }
+            }
+
+            // workspace.read_memory_from: every alias must exist as a
+            // configured agent and must use the same MemoryBackendKind
+            // as the declaring agent. Cross-backend memory sharing is
+            // deferred to v0.8.1; until then, mismatched backends fail
+            // at config load rather than producing a runtime error
+            // from the AgentScopedMemory<M> wrapper. #6272 P3.
+            let agent_backend = agent.memory.backend;
+            for (i, target) in agent.workspace.read_memory_from.iter().enumerate() {
+                let target_str = target.as_str();
+                if target_str == alias.as_str() {
+                    validation_bail!(
+                        InvalidFormat,
+                        format!("agents.{alias}.workspace.read_memory_from[{i}]"),
+                        "agents.{alias}.workspace.read_memory_from[{i}] = {target_str:?} but {target_str} is this agent itself; an agent always sees its own memory rows, so self-references in the cross-agent allowlist are not permitted",
+                    );
+                }
+                let Some(target_agent) = self.agents.get(target_str) else {
+                    validation_bail!(
+                        DanglingReference,
+                        format!("agents.{alias}.workspace.read_memory_from[{i}]"),
+                        "agents.{alias}.workspace.read_memory_from[{i}] = {target_str:?} but agents.{target_str} is not configured",
+                    );
+                };
+                if target_agent.memory.backend != agent_backend {
+                    let target_backend = target_agent.memory.backend;
+                    validation_bail!(
+                        InvalidFormat,
+                        format!("agents.{alias}.workspace.read_memory_from[{i}]"),
+                        "agents.{alias}.workspace.read_memory_from[{i}] points at agents.{target_str} which uses memory backend {target_backend:?}, but agents.{alias} uses {agent_backend:?}; cross-backend memory sharing is deferred to v0.8.1, so the allowlist must point at same-backend siblings only",
+                    );
+                }
+            }
+        }
+
+        // Peer groups: every member alias must exist as a configured
+        // agent, and the group's channel must be in each member's
+        // channels list. Mutual opt-in resolution happens at runtime
+        // (P11); the cross-reference check here keeps misconfigured
+        // group members from looking like real peer relationships at
+        // load time. #6272 P3.
+        let mut peer_group_names: Vec<&String> = self.peer_groups.keys().collect();
+        peer_group_names.sort();
+        for group_name in peer_group_names {
+            let group = &self.peer_groups[group_name];
+            let group_channel = group.channel.as_str();
+            if group_channel.trim().is_empty() {
+                validation_bail!(
+                    RequiredFieldEmpty,
+                    format!("peer_groups.{group_name}.channel"),
+                    "peer_groups.{group_name}.channel must reference a configured [channels.<type>.<alias>] entry",
+                );
+            }
+            for (i, member) in group.agents.iter().enumerate() {
+                let member_str = member.as_str();
+                let Some(member_agent) = self.agents.get(member_str) else {
+                    validation_bail!(
+                        DanglingReference,
+                        format!("peer_groups.{group_name}.agents[{i}]"),
+                        "peer_groups.{group_name}.agents[{i}] = {member_str:?} but agents.{member_str} is not configured",
+                    );
+                };
+                let channel_in_list = member_agent
+                    .channels
+                    .iter()
+                    .any(|ch| ch.as_str() == group_channel);
+                if !channel_in_list {
+                    validation_bail!(
+                        InvalidFormat,
+                        format!("peer_groups.{group_name}.agents[{i}]"),
+                        "peer_groups.{group_name}.agents[{i}] = {member_str:?} but agents.{member_str}.channels does not include {group_channel:?}; an agent can only join a peer group whose channel it has access to",
+                    );
+                }
+            }
         }
 
         Ok(())
@@ -20144,5 +20238,225 @@ allowed_users = []
         let whatsapp: WhatsAppConfig =
             serde_json::from_str(r#"{"approval_timeout_secs":180}"#).unwrap();
         assert_eq!(whatsapp.approval_timeout_secs, 180);
+    }
+
+    // ── Multi-agent (#6272 P3): cross-reference validators ─────────
+
+    /// Build a minimal valid Config with one agent on a configured
+    /// channel + risk profile + model provider. Each test mutates a
+    /// single field to provoke a validator.
+    fn multi_agent_test_config() -> Config {
+        use crate::providers::ChannelRef;
+
+        let mut config = Config::default();
+
+        // Risk profile (mandatory for enabled agents).
+        config
+            .risk_profiles
+            .insert("default".to_string(), RiskProfileConfig::default());
+
+        // Anthropic model provider (mandatory for the agent).
+        config.providers.models.anthropic.insert(
+            "default".to_string(),
+            AnthropicModelProviderConfig::default(),
+        );
+
+        // A configured Telegram channel the agent can reference. Just
+        // having the entry in the map is enough for the dotted-alias
+        // validator; we are not exercising channel-level behavior here.
+        config
+            .channels
+            .telegram
+            .insert("draft".to_string(), TelegramConfig::default());
+
+        // Agent that targets the model provider, risk profile, and
+        // channel. Default workspace is jailed.
+        let agent = AliasedAgentConfig {
+            channels: vec![ChannelRef::new("telegram.draft")],
+            model_provider: crate::providers::ModelProviderRef::new("anthropic.default"),
+            risk_profile: "default".to_string(),
+            ..AliasedAgentConfig::default()
+        };
+        config.agents.insert("alpha".to_string(), agent);
+
+        config
+    }
+
+    #[test]
+    async fn validate_rejects_workspace_access_self_reference() {
+        let mut config = multi_agent_test_config();
+        let alpha = config.agents.get_mut("alpha").unwrap();
+        alpha.workspace.access.insert(
+            crate::multi_agent::AgentAlias::new("alpha"),
+            crate::multi_agent::AccessMode::Read,
+        );
+        let err = config
+            .validate()
+            .expect_err("self-reference must fail validation");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("agents.alpha.workspace.access.alpha"),
+            "expected field path in error, got: {msg}"
+        );
+        assert!(
+            msg.contains("self-references"),
+            "expected self-reference explanation, got: {msg}"
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_workspace_access_dangling_target() {
+        let mut config = multi_agent_test_config();
+        let alpha = config.agents.get_mut("alpha").unwrap();
+        alpha.workspace.access.insert(
+            crate::multi_agent::AgentAlias::new("ghost"),
+            crate::multi_agent::AccessMode::ReadWrite,
+        );
+        let err = config
+            .validate()
+            .expect_err("dangling target must fail validation");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("agents.ghost is not configured"),
+            "expected dangling-ref explanation, got: {msg}"
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_read_memory_from_self_reference() {
+        let mut config = multi_agent_test_config();
+        let alpha = config.agents.get_mut("alpha").unwrap();
+        alpha
+            .workspace
+            .read_memory_from
+            .push(crate::multi_agent::AgentAlias::new("alpha"));
+        let err = config
+            .validate()
+            .expect_err("self-reference must fail validation");
+        assert!(
+            err.to_string().contains("read_memory_from[0]"),
+            "expected indexed field path, got: {err}"
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_read_memory_from_cross_backend() {
+        let mut config = multi_agent_test_config();
+
+        // Add a second agent on Postgres.
+        let beta = AliasedAgentConfig {
+            channels: vec![crate::providers::ChannelRef::new("telegram.draft")],
+            model_provider: crate::providers::ModelProviderRef::new("anthropic.default"),
+            risk_profile: "default".to_string(),
+            memory: crate::multi_agent::AgentMemoryConfig {
+                backend: crate::multi_agent::MemoryBackendKind::Postgres,
+            },
+            ..AliasedAgentConfig::default()
+        };
+        config.agents.insert("beta".to_string(), beta);
+
+        // Alpha (Sqlite default) tries to read from beta (Postgres).
+        let alpha = config.agents.get_mut("alpha").unwrap();
+        alpha
+            .workspace
+            .read_memory_from
+            .push(crate::multi_agent::AgentAlias::new("beta"));
+
+        let err = config
+            .validate()
+            .expect_err("cross-backend allowlist must fail validation");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cross-backend memory sharing is deferred to v0.8.1"),
+            "expected cross-backend explanation, got: {msg}"
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_peer_group_dangling_member() {
+        let mut config = multi_agent_test_config();
+        let group = crate::multi_agent::PeerGroupConfig {
+            channel: crate::providers::ChannelRef::new("telegram.draft"),
+            agents: vec![
+                crate::multi_agent::AgentAlias::new("alpha"),
+                crate::multi_agent::AgentAlias::new("ghost"),
+            ],
+            ..crate::multi_agent::PeerGroupConfig::default()
+        };
+        config.peer_groups.insert("team_chat".to_string(), group);
+        let err = config
+            .validate()
+            .expect_err("dangling group member must fail validation");
+        assert!(
+            err.to_string().contains("peer_groups.team_chat.agents[1]"),
+            "expected indexed field path, got: {err}"
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_peer_group_member_without_channel() {
+        let mut config = multi_agent_test_config();
+
+        // Add a discord channel and a beta agent that ONLY uses discord.
+        config
+            .channels
+            .discord
+            .insert("ops".to_string(), DiscordConfig::default());
+        let beta = AliasedAgentConfig {
+            channels: vec![crate::providers::ChannelRef::new("discord.ops")],
+            model_provider: crate::providers::ModelProviderRef::new("anthropic.default"),
+            risk_profile: "default".to_string(),
+            ..AliasedAgentConfig::default()
+        };
+        config.agents.insert("beta".to_string(), beta);
+
+        // Group on telegram.draft includes beta (who only has discord).
+        let group = crate::multi_agent::PeerGroupConfig {
+            channel: crate::providers::ChannelRef::new("telegram.draft"),
+            agents: vec![
+                crate::multi_agent::AgentAlias::new("alpha"),
+                crate::multi_agent::AgentAlias::new("beta"),
+            ],
+            ..crate::multi_agent::PeerGroupConfig::default()
+        };
+        config.peer_groups.insert("team_chat".to_string(), group);
+
+        let err = config
+            .validate()
+            .expect_err("channel-mismatch group member must fail validation");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("agents.beta.channels does not include"),
+            "expected channel-mismatch explanation, got: {msg}"
+        );
+    }
+
+    #[test]
+    async fn validate_accepts_valid_peer_group_with_two_compatible_members() {
+        let mut config = multi_agent_test_config();
+
+        // Beta on the same telegram channel.
+        let beta = AliasedAgentConfig {
+            channels: vec![crate::providers::ChannelRef::new("telegram.draft")],
+            model_provider: crate::providers::ModelProviderRef::new("anthropic.default"),
+            risk_profile: "default".to_string(),
+            ..AliasedAgentConfig::default()
+        };
+        config.agents.insert("beta".to_string(), beta);
+
+        // Group on telegram.draft includes both members.
+        let group = crate::multi_agent::PeerGroupConfig {
+            channel: crate::providers::ChannelRef::new("telegram.draft"),
+            agents: vec![
+                crate::multi_agent::AgentAlias::new("alpha"),
+                crate::multi_agent::AgentAlias::new("beta"),
+            ],
+            ..crate::multi_agent::PeerGroupConfig::default()
+        };
+        config.peer_groups.insert("team_chat".to_string(), group);
+
+        config
+            .validate()
+            .expect("two-member same-channel peer group must validate cleanly");
     }
 }

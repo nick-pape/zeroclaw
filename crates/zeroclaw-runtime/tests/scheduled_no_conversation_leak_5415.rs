@@ -31,7 +31,7 @@ use axum::{Router, extract::State, routing::post};
 use tempfile::TempDir;
 use tokio::sync::Mutex as AsyncMutex;
 use zeroclaw_config::providers::ProvidersConfig;
-use zeroclaw_config::schema::{Config, AliasedAgentConfig, RiskProfileConfig};
+use zeroclaw_config::schema::{AliasedAgentConfig, Config, RiskProfileConfig};
 use zeroclaw_memory::{Memory, MemoryCategory, SqliteMemory};
 
 // Unique sentinel that exists ONLY in the planted Conversation entry — must

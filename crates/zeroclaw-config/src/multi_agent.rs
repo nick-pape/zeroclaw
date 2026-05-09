@@ -346,7 +346,10 @@ gamma = "read_write"
 
     #[test]
     fn agent_memory_config_default_is_sqlite() {
-        assert_eq!(AgentMemoryConfig::default().backend, MemoryBackendKind::Sqlite);
+        assert_eq!(
+            AgentMemoryConfig::default().backend,
+            MemoryBackendKind::Sqlite
+        );
     }
 
     #[test]

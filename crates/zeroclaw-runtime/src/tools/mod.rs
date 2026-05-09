@@ -143,7 +143,7 @@ use async_trait::async_trait;
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
-use zeroclaw_config::schema::{Config, AliasedAgentConfig};
+use zeroclaw_config::schema::{AliasedAgentConfig, Config};
 use zeroclaw_memory::Memory;
 
 /// Shared handle to the delegate tool's parent-tools list.
