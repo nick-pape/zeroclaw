@@ -1444,7 +1444,6 @@ async fn prompt_agent_fields(cfg: &mut Config, ui: &mut dyn OnboardUi, alias: &s
     let skill_aliases = cfg.get_map_keys("skill_bundles").unwrap_or_default();
     let knowledge_aliases = cfg.get_map_keys("knowledge_bundles").unwrap_or_default();
     let mcp_aliases = cfg.get_map_keys("mcp_bundles").unwrap_or_default();
-    let memory_aliases = cfg.get_map_keys("memory_namespaces").unwrap_or_default();
 
     let mut step: usize = 0;
     loop {
@@ -1467,10 +1466,6 @@ async fn prompt_agent_fields(cfg: &mut Config, ui: &mut dyn OnboardUi, alias: &s
                     .await?
             }
             8 => prompt_agent_alias_multi(cfg, ui, alias, "mcp_bundles", &mcp_aliases).await?,
-            9 => {
-                prompt_agent_alias_single(cfg, ui, alias, "memory_namespace", &memory_aliases)
-                    .await?
-            }
             _ => return Ok(Nav::Done),
         };
         match nav {

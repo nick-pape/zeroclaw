@@ -13,10 +13,10 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use zeroclaw_api::tool::{Tool, ToolResult};
 use zeroclaw_config::schema::{
-    AliasedAgentConfig, DelegateToolConfig, MemoryNamespaceConfig, ModelProviderConfig,
-    RiskProfileConfig, RuntimeProfileConfig, SkillBundleConfig,
+    AliasedAgentConfig, DelegateToolConfig, ModelProviderConfig, RiskProfileConfig,
+    RuntimeProfileConfig, SkillBundleConfig,
 };
-use zeroclaw_memory::{Memory, NamespacedMemory};
+use zeroclaw_memory::Memory;
 use zeroclaw_providers::{self, ChatMessage, ModelProvider};
 
 /// Default temperature for sub-agent tool loops when the delegate config
@@ -89,8 +89,6 @@ pub struct DelegateTool {
     runtime_profiles: Arc<HashMap<String, RuntimeProfileConfig>>,
     /// named skill bundles for skills-directory resolution.
     skill_bundles: Arc<HashMap<String, SkillBundleConfig>>,
-    /// named memory namespaces for isolation resolution.
-    memory_namespaces: Arc<HashMap<String, MemoryNamespaceConfig>>,
 }
 
 impl DelegateTool {
@@ -129,7 +127,6 @@ impl DelegateTool {
             risk_profiles: Arc::new(HashMap::new()),
             runtime_profiles: Arc::new(HashMap::new()),
             skill_bundles: Arc::new(HashMap::new()),
-            memory_namespaces: Arc::new(HashMap::new()),
         }
     }
 
@@ -174,7 +171,6 @@ impl DelegateTool {
             risk_profiles: Arc::new(HashMap::new()),
             runtime_profiles: Arc::new(HashMap::new()),
             skill_bundles: Arc::new(HashMap::new()),
-            memory_namespaces: Arc::new(HashMap::new()),
         }
     }
 
@@ -253,12 +249,6 @@ impl DelegateTool {
     /// Attach skill bundles for skills-directory resolution.
     pub fn with_skill_bundles(mut self, m: HashMap<String, SkillBundleConfig>) -> Self {
         self.skill_bundles = Arc::new(m);
-        self
-    }
-
-    /// Attach memory namespaces for isolation resolution.
-    pub fn with_memory_namespaces(mut self, m: HashMap<String, MemoryNamespaceConfig>) -> Self {
-        self.memory_namespaces = Arc::new(m);
         self
     }
 
@@ -362,32 +352,6 @@ impl DelegateTool {
             .filter(|a| !a.is_empty())
             .filter_map(|a| self.skill_bundles.get(a).and_then(|b| b.directory.clone()))
             .collect()
-    }
-
-    /// Resolve memory namespace string from the named memory namespace config.
-    fn resolve_memory_ns(&self, memory_namespace: &str) -> Option<String> {
-        if memory_namespace.is_empty() {
-            return None;
-        }
-        self.memory_namespaces
-            .get(memory_namespace)
-            .map(|n| n.namespace.clone())
-            .filter(|s| !s.is_empty())
-            .or_else(|| Some(memory_namespace.to_string()))
-    }
-
-    /// Wrap memory with namespace isolation if configured for the given agent.
-    /// Returns the namespaced memory if memory_namespace is set, otherwise returns
-    /// the original memory.
-    #[allow(dead_code)] // WIP: will be used when delegate agents support memory
-    fn get_agent_memory(&self, agent_config: &AliasedAgentConfig) -> Option<Arc<dyn Memory>> {
-        self.memory.as_ref().map(|mem| {
-            if let Some(ns) = self.resolve_memory_ns(&agent_config.memory_namespace) {
-                Arc::new(NamespacedMemory::new(mem.clone(), ns)) as Arc<dyn Memory>
-            } else {
-                mem.clone()
-            }
-        })
     }
 
     /// Directory where background delegate results are stored.
@@ -810,7 +774,6 @@ impl DelegateTool {
         let risk_profiles = Arc::clone(&self.risk_profiles);
         let runtime_profiles = Arc::clone(&self.runtime_profiles);
         let skill_bundles = Arc::clone(&self.skill_bundles);
-        let memory_namespaces = Arc::clone(&self.memory_namespaces);
 
         tokio::spawn(async move {
             // Build an inner DelegateTool for the spawned context
@@ -830,7 +793,6 @@ impl DelegateTool {
                 risk_profiles,
                 runtime_profiles,
                 skill_bundles,
-                memory_namespaces,
             };
 
             let args_inner = json!({
@@ -991,7 +953,6 @@ impl DelegateTool {
             let risk_profiles = Arc::clone(&self.risk_profiles);
             let runtime_profiles = Arc::clone(&self.runtime_profiles);
             let skill_bundles = Arc::clone(&self.skill_bundles);
-            let memory_namespaces = Arc::clone(&self.memory_namespaces);
             let receipt_scope = parent_receipt_scope.clone();
 
             handles.push(tokio::spawn(async move {
@@ -1011,7 +972,6 @@ impl DelegateTool {
                     risk_profiles,
                     runtime_profiles,
                     skill_bundles,
-                    memory_namespaces,
                 };
                 let agent_name_for_return = agent_name.clone();
                 let result = crate::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT

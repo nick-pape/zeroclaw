@@ -1168,8 +1168,10 @@ fn drain_enabled_keep(channel_type: &str, instance: &mut toml::Table) -> bool {
 /// - **T14d skills_directory drop**: V3 wants `skill_bundles: Vec<String>`
 ///   alias references; the V2 path-on-disk has no clean V3 equivalent.
 ///   Logged and dropped.
-/// - **T14e memory_namespace type widening**: V2 `Option<String>` → V3
-///   `String`. `None`/missing maps to `""` (V3's "no namespace" sentinel).
+/// - **T14e memory_namespace drop**: V3 retired V2's `memory_namespace`
+///   field on agents alongside the top-level `[memory_namespaces.<alias>]`
+///   section. Per-agent memory backends under `[agents.<alias>.memory]`
+///   serve the isolation use case. The V2 key is silently discarded.
 fn synthesize_agent_brains(
     agents: HashMap<String, toml::Value>,
     passthrough: &mut toml::Table,
@@ -1340,50 +1342,16 @@ fn synthesize_agent_brains(
             toml::Value::String(runtime_alias),
         );
 
-        // T14e: memory_namespace type widening (Option<String> → String).
-        // V3 wants a bare string; missing or unset becomes "". Also
-        // synthesize an empty memory_namespaces.<ns> entry when an agent
-        // references one, since V3 dangling-reference validation rejects
-        // unresolved alias references.
-        let referenced_ns = match agent_table.get("memory_namespace") {
-            Some(toml::Value::String(s)) if !s.is_empty() => Some(s.clone()),
-            Some(toml::Value::String(_)) => None,
-            Some(_) => {
-                agent_table.insert(
-                    "memory_namespace".to_string(),
-                    toml::Value::String(String::new()),
-                );
-                None
-            }
-            None => None,
-        };
-        if let Some(ns) = referenced_ns {
-            ensure_memory_namespace(passthrough, &ns);
-        }
+        // V3 retired the V2 `memory_namespace` field on agents (and the
+        // top-level [memory_namespaces.<alias>] section it referenced)
+        // when per-agent memory backends landed under
+        // [agents.<alias>.memory]. Drop the V2 key so it doesn't carry
+        // through to the V3 deserialization step.
+        agent_table.remove("memory_namespace");
 
         new_agents.insert(alias, toml::Value::Table(agent_table));
     }
     new_agents
-}
-
-/// Ensure `memory_namespaces.<alias>` exists with at least `namespace = "<alias>"`.
-/// V3 `MemoryNamespaceConfig` requires a `namespace` field — when an agent
-/// references a namespace alias and the user hasn't defined it explicitly,
-/// synthesize a minimal entry so V3 dangling-reference validation passes.
-fn ensure_memory_namespace(passthrough: &mut toml::Table, alias: &str) {
-    let section_value = passthrough
-        .entry("memory_namespaces".to_string())
-        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
-    if let Some(section_table) = section_value.as_table_mut() {
-        let entry_value = section_table
-            .entry(alias.to_string())
-            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
-        if let Some(entry_table) = entry_value.as_table_mut() {
-            entry_table
-                .entry("namespace".to_string())
-                .or_insert_with(|| toml::Value::String(alias.to_string()));
-        }
-    }
 }
 
 /// Pull V2 `AliasedAgentConfig` fields that V3 moved onto

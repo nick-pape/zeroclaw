@@ -31,7 +31,6 @@ pub mod knowledge_graph;
 pub mod knowledge_graph_pg;
 pub mod lucid;
 pub mod markdown;
-pub mod namespaced;
 pub mod none;
 pub mod policy;
 #[cfg(feature = "memory-postgres")]
@@ -53,7 +52,6 @@ pub use backend::{
 };
 pub use lucid::LucidMemory;
 pub use markdown::MarkdownMemory;
-pub use namespaced::NamespacedMemory;
 pub use none::NoneMemory;
 #[allow(unused_imports)]
 pub use policy::PolicyEnforcer;

@@ -348,11 +348,6 @@ pub struct Config {
     #[nested]
     pub skill_bundles: HashMap<String, SkillBundleConfig>,
 
-    /// Named memory namespaces (`[memory_namespaces.<alias>]`).
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    #[nested]
-    pub memory_namespaces: HashMap<String, MemoryNamespaceConfig>,
-
     /// Named knowledge bundles (`[knowledge_bundles.<alias>]`).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
@@ -2584,11 +2579,6 @@ pub struct AliasedAgentConfig {
     /// load.
     #[serde(default)]
     pub mcp_bundles: Vec<String>,
-    /// Memory namespace alias. Single-select reference into
-    /// `memory_namespaces[key]`. Empty string = no namespace isolation.
-    /// Multiple agents sharing a namespace see the same memory.
-    #[serde(default)]
-    pub memory_namespace: String,
     /// Cron job aliases. Each entry references `cron[key]` — a declarative
     /// scheduled job invoked by the scheduler on its configured trigger.
     /// When the cron fires, this agent is the actor that executes the job.
@@ -2726,7 +2716,6 @@ impl Default for AliasedAgentConfig {
             skill_bundles: Vec::new(),
             knowledge_bundles: Vec::new(),
             mcp_bundles: Vec::new(),
-            memory_namespace: String::new(),
             cron_jobs: Vec::new(),
             tts_provider: crate::providers::TtsProviderRef::default(),
             transcription_provider: crate::providers::TranscriptionProviderRef::default(),
@@ -8284,38 +8273,6 @@ pub struct SkillBundleConfig {
     pub exclude: Vec<String>,
 }
 
-/// Named memory namespace (`[memory_namespaces.<alias>]`).
-///
-/// Isolates agent memory operations within a named namespace, preventing
-/// cross-contamination between agents sharing the same backend.
-///
-/// Namespaces are tags within the active memory backend — they do not pick
-/// a different backend. SQL backends column-tag rows with the namespace
-/// value; qdrant uses per-namespace collections; markdown uses per-namespace
-/// directories. The per-backend isolation primitive is the runtime backend's
-/// responsibility.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "memory-namespace"]
-#[serde(default)]
-pub struct MemoryNamespaceConfig {
-    /// Namespace key used to scope memory operations.
-    pub namespace: String,
-    /// Optional backend override (DEPRECATED — namespaces share the
-    /// global backend; this field will be removed once runtime backend
-    /// routing migrates to per-agent storage selection).
-    pub backend: Option<String>,
-    /// Days to retain entries before purge for this namespace. `None`
-    /// inherits the global `[memory].purge_after_days` policy.
-    pub retention_days: Option<u32>,
-    /// Reject writes against this namespace at the runtime backend layer.
-    /// Reads remain unaffected — useful for archival namespaces.
-    pub read_only: bool,
-    /// Memory categories to pin from purge in this namespace (entries
-    /// tagged with any of these stay regardless of `retention_days`).
-    pub pinned_categories: Vec<String>,
-}
-
 /// Named knowledge bundle (`[knowledge_bundles.<alias>]`).
 ///
 /// A reusable set of knowledge sources (documents, URLs, or RAG corpus paths)
@@ -12039,7 +11996,6 @@ impl Default for Config {
             risk_profiles: HashMap::new(),
             runtime_profiles: HashMap::new(),
             skill_bundles: HashMap::new(),
-            memory_namespaces: HashMap::new(),
             knowledge_bundles: HashMap::new(),
             mcp_bundles: HashMap::new(),
             peer_groups: HashMap::new(),
@@ -13462,11 +13418,6 @@ impl Config {
                     "runtime-profile",
                     agent.runtime_profile.as_str(),
                 ),
-                (
-                    "memory-namespaces",
-                    "memory-namespace",
-                    agent.memory_namespace.as_str(),
-                ),
             ];
             for (section, field, raw) in bare_single {
                 let trimmed = raw.trim();
@@ -14581,7 +14532,6 @@ auto_save = true
             agents: HashMap::new(),
             runtime_profiles: HashMap::new(),
             skill_bundles: HashMap::new(),
-            memory_namespaces: HashMap::new(),
             knowledge_bundles: HashMap::new(),
             mcp_bundles: HashMap::new(),
             peer_groups: HashMap::new(),
@@ -15154,7 +15104,6 @@ default_temperature = 0.7
             risk_profiles: HashMap::new(),
             runtime_profiles: HashMap::new(),
             skill_bundles: HashMap::new(),
-            memory_namespaces: HashMap::new(),
             knowledge_bundles: HashMap::new(),
             mcp_bundles: HashMap::new(),
             peer_groups: HashMap::new(),

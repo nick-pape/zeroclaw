@@ -135,7 +135,7 @@ fn error_response(err: ConfigApiError) -> Response {
 #[derive(Debug, Serialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct SectionInfo {
-    /// Stable section key — `workspace`, `model_providers`, `channels`, `memory`,
+    /// Stable section key — `model_providers`, `channels`, `memory`,
     /// `hardware`, `tunnel`. Matches `Section::as_path_prefix` in
     /// zeroclaw-runtime so CLI / web stay aligned.
     pub key: String,
@@ -145,7 +145,7 @@ pub struct SectionInfo {
     pub help: String,
     /// `true` when this section requires picking an item before the form
     /// renders (Providers / Channels / Memory / Tunnel). `false` for sections
-    /// that have a single direct form (Workspace / Hardware).
+    /// that have a single direct form (Hardware).
     pub has_picker: bool,
     /// Whether the user has marked the section completed in
     /// `onboard_state.completed_sections`.
@@ -222,7 +222,6 @@ pub struct AgentOptionsResponse {
     pub skill_bundles: Vec<String>,
     pub knowledge_bundles: Vec<String>,
     pub mcp_bundles: Vec<String>,
-    pub memory_namespaces: Vec<String>,
 }
 
 /// `GET /api/onboard/agent-options` — every alias-reference list the
@@ -260,7 +259,6 @@ pub async fn handle_agent_options(State(state): State<AppState>, headers: Header
         skill_bundles: cfg.get_map_keys("skill_bundles").unwrap_or_default(),
         knowledge_bundles: cfg.get_map_keys("knowledge_bundles").unwrap_or_default(),
         mcp_bundles: cfg.get_map_keys("mcp_bundles").unwrap_or_default(),
-        memory_namespaces: cfg.get_map_keys("memory_namespaces").unwrap_or_default(),
     };
 
     axum::Json(response).into_response()
@@ -363,11 +361,12 @@ fn humanize_section(key: &str) -> String {
 /// `Config.tsx`), not this list.
 fn section_group(key: &str) -> &'static str {
     match key {
-        // The 6 foundation sections (TUI's `Section` enum) — every install
+        // The 5 foundation sections (TUI's `Section` enum) — every install
         // touches these. Named for the role they play, not for the wizard
         // that happens to walk them on first run.
-        "workspace" | "model_providers" | "channels" | "memory" | "hardware" | "tunnel"
-        | "agents" => "Foundation",
+        "model_providers" | "channels" | "memory" | "hardware" | "tunnel" | "agents" => {
+            "Foundation"
+        }
         // Agent loop, scheduling, and orchestration.
         "agent"
         | "autonomy"
@@ -409,9 +408,6 @@ fn section_group(key: &str) -> &'static str {
 /// someone writes copy).
 fn section_help(key: &str) -> &'static str {
     match key {
-        "workspace" => {
-            "Where ZeroClaw stores its config and runtime data. Defaults work for most setups."
-        }
         "model_providers" => {
             "Paste an API key (e.g. `sk-ant-...` for Anthropic, `sk-...` for OpenAI) when prompted. \
                         For OAuth-based model_providers run: zeroclaw auth login --model-provider <name>"
@@ -480,7 +476,7 @@ pub struct PickerResponse {
 ///   section, then strip the section prefix from `prop_fields()` and dedupe
 ///   by first segment. Same trick the TUI uses; new channels appear
 ///   automatically when a `#[nested] Option<...>` field is added.
-/// * Anything else returns 404 (workspace/hardware have no picker).
+/// * Anything else returns 404 (hardware has no picker).
 pub async fn handle_section_picker(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -512,7 +508,7 @@ pub async fn handle_section_picker(
                     ConfigApiCode::PathNotFound,
                     format!(
                         "no picker for section `{other}`; \
-                         workspace and hardware are direct-form sections \
+                         hardware is a direct-form section \
                          (use GET /api/config/list?prefix=<section>)"
                     ),
                 )
@@ -883,9 +879,8 @@ mod tests {
         for hidden in HIDDEN_TOP_LEVEL {
             roots.remove(*hidden);
         }
-        // The 6 onboarding sections must still be in the derived set.
+        // The 5 onboarding sections must still be in the derived set.
         for required in [
-            "workspace",
             "model_providers",
             "channels",
             "memory",

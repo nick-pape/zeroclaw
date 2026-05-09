@@ -708,19 +708,6 @@ fn t14d_skills_directory_synthesizes_per_agent_skill_bundle() {
     );
 }
 
-#[test]
-fn t14e_memory_namespace_widening() {
-    let cfg = v3_config();
-    let agent = cfg
-        .agents
-        .get("complex_agent")
-        .expect("agents.complex_agent present");
-    assert_eq!(
-        agent.memory_namespace, "complex",
-        "V2 Option<String> memory_namespace must widen to V3 String unchanged"
-    );
-}
-
 // ─────────────────────────────────────────────────────────────
 // V3 fields synthesized from V1/V2 input
 // ─────────────────────────────────────────────────────────────

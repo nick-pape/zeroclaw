@@ -966,8 +966,7 @@ pub fn all_tools_with_runtime(
         })
         .with_risk_profiles(root_config.risk_profiles.clone())
         .with_runtime_profiles(root_config.runtime_profiles.clone())
-        .with_skill_bundles(root_config.skill_bundles.clone())
-        .with_memory_namespaces(root_config.memory_namespaces.clone());
+        .with_skill_bundles(root_config.skill_bundles.clone());
         tool_arcs.push(Arc::new(delegate_tool));
         Some(parent_tools)
     };
