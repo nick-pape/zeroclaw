@@ -13473,7 +13473,8 @@ impl Config {
             // as the declaring agent. Cross-backend memory sharing is
             // deferred to v0.8.1; until then, mismatched backends fail
             // at config load rather than producing a runtime error
-            // from the AgentScopedMemory<M> wrapper. #6272 P3.
+            // when the per-agent memory plumbing eventually consumes
+            // the allowlist. #6272 P3.
             let agent_backend = agent.memory.backend;
             for (i, target) in agent.workspace.read_memory_from.iter().enumerate() {
                 let target_str = target.as_str();

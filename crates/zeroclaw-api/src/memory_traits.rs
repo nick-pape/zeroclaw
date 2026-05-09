@@ -289,59 +289,6 @@ pub trait Memory: Send + Sync {
     ) -> anyhow::Result<()> {
         self.store(key, content, category, session_id).await
     }
-
-    /// Store a memory entry attributed to an explicit agent UUID
-    /// (#6272 multi-agent runtime). The default implementation
-    /// ignores `_agent_id` and falls back to `store_with_metadata`,
-    /// which is correct for backends that do not yet have agent
-    /// columns; backends with native agent_id columns (SqliteMemory,
-    /// PostgresMemory after P6) override to actually persist the
-    /// attribution. Wrappers that hold a bound agent (e.g.
-    /// `AgentScopedMemory<M>`) call this on every store so the
-    /// inner backend can persist the attribution; non-wrapper
-    /// callers continue to use `store` and `store_with_metadata`.
-    async fn store_with_agent(
-        &self,
-        key: &str,
-        content: &str,
-        category: MemoryCategory,
-        session_id: Option<&str>,
-        namespace: Option<&str>,
-        importance: Option<f64>,
-        _agent_id: Option<&str>,
-    ) -> anyhow::Result<()> {
-        self.store_with_metadata(key, content, category, session_id, namespace, importance)
-            .await
-    }
-
-    /// Recall memory entries scoped to a specific set of agent UUIDs
-    /// (#6272 multi-agent runtime). When `allowed_agent_ids` is
-    /// non-empty, the backend filters its result set to rows whose
-    /// `agent_id` column matches one of the listed UUIDs (or is
-    /// NULL, which represents legacy rows that pre-date the
-    /// v0.8.0 migration and belong to the default agent).
-    ///
-    /// The default implementation falls back to `recall()` without
-    /// any filtering. Backends with native `agent_id` columns
-    /// (SqliteMemory, PostgresMemory) override this method to add
-    /// a `WHERE agent_id IN (...)` clause to the underlying SQL
-    /// so the filter happens at the storage layer instead of in
-    /// Rust on every recalled batch.
-    ///
-    /// `AgentScopedMemory<M>` is the canonical caller. Direct
-    /// invocation from agent code is also valid for read-only
-    /// cross-agent queries that bypass the wrapper.
-    async fn recall_for_agents(
-        &self,
-        _allowed_agent_ids: &[&str],
-        query: &str,
-        limit: usize,
-        session_id: Option<&str>,
-        since: Option<&str>,
-        until: Option<&str>,
-    ) -> anyhow::Result<Vec<MemoryEntry>> {
-        self.recall(query, limit, session_id, since, until).await
-    }
 }
 
 #[cfg(test)]

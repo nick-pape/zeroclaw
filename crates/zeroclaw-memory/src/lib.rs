@@ -16,7 +16,6 @@
 //! Channel-scoped variants (e.g. `telegram_user_msg_*`, `discord_*`) are
 //! **not** filtered — they use different prefixes and are handled separately.
 
-pub mod agent_scoped;
 pub mod audit;
 pub mod backend;
 pub mod chunker;

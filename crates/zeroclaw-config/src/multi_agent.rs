@@ -130,9 +130,11 @@ pub enum MemoryBackendKind {
 /// per-agent scope; off by default and audited.
 ///
 /// `read_memory_from` is the cross-agent memory allowlist (parallel to
-/// `access` but for the memory layer). Populated entries become the
-/// `allowed_agent_ids` set on `AgentScopedMemory<M>` at agent
-/// construction; empty means the agent only sees its own memory rows.
+/// `access` but for the memory layer). The runtime-side enforcement
+/// that consumes this list lands in v0.8.1 alongside the per-agent
+/// memory plumbing in `Agent::from_config`; the schema field validates
+/// today (cross-references and same-backend invariants), so configs
+/// stay stable across the version boundary.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "agent-workspace"]
@@ -151,8 +153,8 @@ pub struct AgentWorkspaceConfig {
     /// auditable.
     pub unrestricted_filesystem: bool,
     /// Cross-agent memory allowlist (inbound declaration). Each alias
-    /// listed here may appear in this agent's `allowed_agent_ids` set
-    /// when `AgentScopedMemory<M>` constructs. Empty = own only.
+    /// listed here is the v0.8.1-target set of sibling agents this
+    /// agent may recall memory rows from. Empty = own only.
     pub read_memory_from: Vec<AgentAlias>,
 }
 

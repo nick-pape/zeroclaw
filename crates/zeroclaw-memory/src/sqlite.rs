@@ -250,9 +250,10 @@ impl SqliteMemory {
     ///
     /// `agent_id` is left nullable at the SQLite layer because SQLite
     /// cannot add a NOT NULL FK column to an existing populated table
-    /// without a full table rebuild. The application layer enforces
-    /// non-null at write time via `AgentScopedMemory<M>` (P7), which
-    /// holds the bound agent's UUID and injects it on every store.
+    /// without a full table rebuild. The application-layer wrapper
+    /// that enforces non-null at write time (and pushes the
+    /// allowlist filter into SQL on recall) lands in v0.8.1 alongside
+    /// `Agent::from_config`'s switch to a per-agent memory backend.
     fn migrate_v0_8_0_multi_agent(db_path: &Path, conn: &Connection) -> anyhow::Result<()> {
         if Self::memories_has_agent_id_column(conn)? {
             return Ok(());
@@ -286,8 +287,8 @@ impl SqliteMemory {
         // 3. ALTER TABLE memories ADD COLUMN agent_id, then backfill
         //    every existing row to the default agent. The column stays
         //    nullable at the DB layer (see doc-comment above); the
-        //    AgentScopedMemory<M> wrapper enforces non-null at write
-        //    time in P7.
+        //    application-layer enforcement of non-null on writes lands
+        //    in v0.8.1 alongside the per-agent memory plumbing.
         conn.execute_batch(
             "ALTER TABLE memories ADD COLUMN agent_id TEXT;
              CREATE INDEX IF NOT EXISTS idx_memories_agent_id ON memories(agent_id);",
