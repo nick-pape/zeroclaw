@@ -35,6 +35,7 @@ pub mod sop_approve;
 pub mod sop_execute;
 pub mod sop_list;
 pub mod sop_status;
+pub mod spawn_subagent;
 pub mod verifiable_intent;
 
 // Tool types from zeroclaw-tools (direct imports, no shims)
@@ -135,6 +136,7 @@ pub use sop_approve::SopApproveTool;
 pub use sop_execute::SopExecuteTool;
 pub use sop_list::SopListTool;
 pub use sop_status::SopStatusTool;
+pub use spawn_subagent::SpawnSubagentTool;
 pub use verifiable_intent::VerifiableIntentTool;
 
 use crate::platform::{NativeRuntime, RuntimeAdapter};
@@ -273,6 +275,10 @@ pub const BUILTIN_TOOL_INTEGRATIONS: &[(&str, &str)] = &[
     ("Shell", "Terminal command execution"),
     ("File System", "Read/write files"),
     ("Weather", "Forecasts & conditions (wttr.in)"),
+    (
+        "Spawn SubAgent",
+        "Spawn an ephemeral SubAgent that inherits this agent's identity",
+    ),
 ];
 
 /// Create full tool registry including memory tools and optional Composio
@@ -402,6 +408,10 @@ pub fn all_tools_with_runtime(
         Arc::new(ScheduleTool::new(
             security.clone(),
             root_config.clone(),
+            agent_alias,
+        )),
+        Arc::new(SpawnSubagentTool::new(
+            Arc::new(root_config.clone()),
             agent_alias,
         )),
         Arc::new(ModelRoutingConfigTool::new(
