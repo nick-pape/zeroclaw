@@ -56,7 +56,6 @@ struct OpenAiModel {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Section {
     All,
-    Workspace,
     Providers,
     Channels,
     Memory,
@@ -73,7 +72,6 @@ impl Section {
     pub fn as_path_prefix(self) -> Option<&'static str> {
         match self {
             Self::All => None,
-            Self::Workspace => Some("workspace"),
             Self::Providers => Some("model_providers"),
             Self::Channels => Some("channels"),
             Self::Memory => Some("memory"),
@@ -94,7 +92,6 @@ impl Section {
     pub fn from_path(path: &str) -> Option<Self> {
         let prefix = path.split('.').next()?;
         match prefix {
-            "workspace" => Some(Self::Workspace),
             "model_providers" => Some(Self::Providers),
             "channels" => Some(Self::Channels),
             "memory" => Some(Self::Memory),
@@ -131,10 +128,6 @@ pub async fn run(
 ) -> Result<()> {
     match section {
         Section::All => run_all(cfg, ui, flags).await,
-        Section::Workspace => {
-            let _ = workspace(cfg, ui, flags).await?;
-            Ok(())
-        }
         Section::Providers => {
             let _ = model_providers(cfg, ui, flags).await?;
             Ok(())
@@ -174,17 +167,16 @@ async fn run_all(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> Res
     let mut i: usize = 0;
     loop {
         let nav = match i {
-            0 => workspace(cfg, ui, flags).await?,
-            1 => model_providers(cfg, ui, flags).await?,
-            2 => channels(cfg, ui, flags).await?,
-            3 => memory(cfg, ui, flags).await?,
-            4 => hardware(cfg, ui, flags).await?,
-            5 => tunnel(cfg, ui, flags).await?,
+            0 => model_providers(cfg, ui, flags).await?,
+            1 => channels(cfg, ui, flags).await?,
+            2 => memory(cfg, ui, flags).await?,
+            3 => hardware(cfg, ui, flags).await?,
+            4 => tunnel(cfg, ui, flags).await?,
             // Personality lives at the end so the user has answered the
-            // structural questions (workspace, model_providers, memory, …)
-            // before authoring the markdown files that reference them.
-            6 => personality(cfg, ui, flags).await?,
-            7 => agents(cfg, ui, flags).await?,
+            // structural questions (model_providers, memory, …) before
+            // authoring the markdown files that reference them.
+            5 => personality(cfg, ui, flags).await?,
+            6 => agents(cfg, ui, flags).await?,
             _ => return Ok(()),
         };
         match nav {
@@ -475,8 +467,8 @@ async fn prompt_fields_under(
 /// Section-level skip gate. A section is "already configured" when EITHER
 /// (a) it has a marker in `onboard_state.completed_sections` (user finished
 /// the flow once), OR (b) the caller supplies a section-specific
-/// has-meaningful-config signal (e.g. workspace.enabled == true, model_providers
-/// has a fallback + api-key set). `--force` bypasses unconditionally.
+/// has-meaningful-config signal (e.g. providers has a fallback + api-key
+/// set). `--force` bypasses unconditionally.
 async fn skip_if_configured(
     cfg: &Config,
     ui: &mut dyn OnboardUi,
@@ -515,7 +507,6 @@ async fn skip_if_configured(
 /// from `Config::default()`'s idle state).
 fn section_has_signal(cfg: &Config, section_key: &str) -> bool {
     match section_key {
-        "workspace" => cfg.workspace.enabled,
         "model_providers" => !cfg.providers.models.is_empty(),
         // `channels.cli: bool` is a default-true scalar that lives directly
         // under `channels.*`, so a bare `starts_with("channels.")` check
@@ -709,46 +700,6 @@ async fn mark_completed(cfg: &mut Config, section_key: &str) -> Result<()> {
 // Each section returns `Nav::Back` when the user hits Esc at the very first
 // prompt. Back from a later prompt within the section rewinds locally (via
 // prompt_fields_under / per-section loop), never propagates to the parent.
-
-async fn workspace(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> Result<Nav> {
-    ui.heading(1, "Workspace");
-    ui.status(&format!(
-        "Workspace directory: {}",
-        cfg.workspace_dir.display()
-    ));
-    match skip_if_configured(
-        cfg,
-        ui,
-        flags,
-        "workspace",
-        "Workspace",
-        section_has_signal(cfg, "workspace"),
-    )
-    .await?
-    {
-        SkipNav::Skip => return Ok(Nav::Done),
-        SkipNav::Back => return Ok(Nav::Back),
-        SkipNav::Enter => {}
-    }
-
-    loop {
-        match prompt_field(cfg, ui, "workspace.enabled", None).await? {
-            Nav::Back => return Ok(Nav::Back),
-            Nav::Done => {}
-        }
-        if cfg.workspace.enabled {
-            match prompt_fields_under(cfg, ui, "workspace", &["enabled"], &[]).await? {
-                Nav::Back => continue,
-                Nav::Done => break,
-            }
-        } else {
-            break;
-        }
-    }
-
-    mark_completed(cfg, "workspace").await?;
-    Ok(Nav::Done)
-}
 
 async fn model_providers(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> Result<Nav> {
     ui.heading(1, "Providers");
@@ -1831,15 +1782,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn section_has_signal_workspace_tracks_enabled_flag() {
-        let temp = TempDir::new().unwrap();
-        let mut cfg = test_cfg(&temp);
-        assert!(!section_has_signal(&cfg, "workspace"));
-        cfg.workspace.enabled = true;
-        assert!(section_has_signal(&cfg, "workspace"));
-    }
-
-    #[tokio::test]
     async fn section_has_signal_providers_requires_models_entry() {
         let temp = TempDir::new().unwrap();
         let mut cfg = test_cfg(&temp);
@@ -1875,13 +1817,13 @@ mod tests {
     async fn mark_completed_is_dedupe_safe() {
         let temp = TempDir::new().unwrap();
         let mut cfg = test_cfg(&temp);
-        mark_completed(&mut cfg, "workspace").await.unwrap();
-        mark_completed(&mut cfg, "workspace").await.unwrap();
+        mark_completed(&mut cfg, "memory").await.unwrap();
+        mark_completed(&mut cfg, "memory").await.unwrap();
         let count = cfg
             .onboard_state
             .completed_sections
             .iter()
-            .filter(|s| s.as_str() == "workspace")
+            .filter(|s| s.as_str() == "memory")
             .count();
         assert_eq!(count, 1, "marker should be inserted at most once");
     }
@@ -1890,23 +1832,15 @@ mod tests {
     async fn skip_gate_skips_when_marked_and_user_declines() {
         let temp = TempDir::new().unwrap();
         let mut cfg = test_cfg(&temp);
-        cfg.onboard_state
-            .completed_sections
-            .push("workspace".into());
+        cfg.onboard_state.completed_sections.push("memory".into());
 
         // QuickUi with no scripted answers returns `default` from `confirm`,
         // which for the reconfigure prompt is `false` → SkipNav::Skip.
         let mut ui = QuickUi::new();
-        let result = skip_if_configured(
-            &cfg,
-            &mut ui,
-            &Flags::default(),
-            "workspace",
-            "Workspace",
-            false,
-        )
-        .await
-        .unwrap();
+        let result =
+            skip_if_configured(&cfg, &mut ui, &Flags::default(), "memory", "Memory", false)
+                .await
+                .unwrap();
         assert_eq!(result, SkipNav::Skip);
     }
 
@@ -1916,16 +1850,9 @@ mod tests {
         let cfg = test_cfg(&temp);
         // No marker, but caller reports meaningful config in this section.
         let mut ui = QuickUi::new();
-        let result = skip_if_configured(
-            &cfg,
-            &mut ui,
-            &Flags::default(),
-            "workspace",
-            "Workspace",
-            true,
-        )
-        .await
-        .unwrap();
+        let result = skip_if_configured(&cfg, &mut ui, &Flags::default(), "memory", "Memory", true)
+            .await
+            .unwrap();
         assert_eq!(result, SkipNav::Skip);
     }
 
@@ -1933,16 +1860,14 @@ mod tests {
     async fn skip_gate_enters_when_force_flag_set() {
         let temp = TempDir::new().unwrap();
         let mut cfg = test_cfg(&temp);
-        cfg.onboard_state
-            .completed_sections
-            .push("workspace".into());
+        cfg.onboard_state.completed_sections.push("memory".into());
 
         let mut ui = QuickUi::new();
         let flags = Flags {
             force: true,
             ..Default::default()
         };
-        let result = skip_if_configured(&cfg, &mut ui, &flags, "workspace", "Workspace", true)
+        let result = skip_if_configured(&cfg, &mut ui, &flags, "memory", "Memory", true)
             .await
             .unwrap();
         assert_eq!(result, SkipNav::Enter);
@@ -1953,16 +1878,10 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let cfg = test_cfg(&temp);
         let mut ui = QuickUi::new();
-        let result = skip_if_configured(
-            &cfg,
-            &mut ui,
-            &Flags::default(),
-            "workspace",
-            "Workspace",
-            false,
-        )
-        .await
-        .unwrap();
+        let result =
+            skip_if_configured(&cfg, &mut ui, &Flags::default(), "memory", "Memory", false)
+                .await
+                .unwrap();
         assert_eq!(result, SkipNav::Enter);
     }
 
@@ -2303,43 +2222,6 @@ mod tests {
             .expect("mochat subsection should be initialized");
         assert_eq!(mc.api_url, "http://mochat-test:8080/v1");
         assert_eq!(mc.api_token, "stub-mochat-token");
-    }
-
-    /// Acceptance-criteria guarantee: a double run of the same section must
-    /// produce identical on-disk TOML. The first run walks the workspace
-    /// section with QuickUi's `confirm` defaults (enabled stays false),
-    /// marks the section complete, and saves. The second run hits the
-    /// skip-gate, the user declines reconfigure (QuickUi default `false`),
-    /// and the section returns without writing.
-    #[tokio::test]
-    async fn workspace_double_run_is_idempotent_on_disk() {
-        let temp = TempDir::new().unwrap();
-        let mut cfg = test_cfg(&temp);
-        let flags = Flags::default();
-
-        let mut ui = QuickUi::new();
-        run(&mut cfg, &mut ui, Section::Workspace, &flags)
-            .await
-            .unwrap();
-
-        assert!(
-            cfg.onboard_state
-                .completed_sections
-                .iter()
-                .any(|s| s == "workspace"),
-            "first run should mark workspace completed"
-        );
-        let after_first = tokio::fs::read_to_string(&cfg.config_path).await.unwrap();
-
-        let mut ui = QuickUi::new();
-        run(&mut cfg, &mut ui, Section::Workspace, &flags)
-            .await
-            .unwrap();
-        let after_second = tokio::fs::read_to_string(&cfg.config_path).await.unwrap();
-        assert_eq!(
-            after_first, after_second,
-            "second run hit the skip-gate and must not rewrite config.toml"
-        );
     }
 
     // ---------------------------------------------------------------------------

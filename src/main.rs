@@ -310,8 +310,6 @@ enum Commands {
         hardware_only: bool,
         #[arg(long, hide = true)]
         tunnel_only: bool,
-        #[arg(long, hide = true)]
-        workspace_only: bool,
     },
 
     /// Start the AI agent loop
@@ -753,8 +751,6 @@ Examples:
 /// Section selector for `zeroclaw onboard <section>`.
 #[derive(Subcommand, Debug, Clone, Copy, PartialEq, Eq)]
 enum OnboardSection {
-    /// Workspace isolation settings.
-    Workspace,
     /// ModelProvider selection, credentials, and live model picker.
     Providers,
     /// Messaging channels (Telegram, Discord, Slack, Matrix, …).
@@ -799,7 +795,6 @@ fn resolve_onboard_target(
     memory_only: bool,
     hardware_only: bool,
     tunnel_only: bool,
-    workspace_only: bool,
 ) -> (
     zeroclaw_runtime::onboard::Section,
     Option<(&'static str, &'static str)>,
@@ -827,18 +822,11 @@ fn resolve_onboard_target(
             "hardware",
         ),
         (tunnel_only, Section::Tunnel, "--tunnel-only", "tunnel"),
-        (
-            workspace_only,
-            Section::Workspace,
-            "--workspace-only",
-            "workspace",
-        ),
     ]
     .into_iter()
     .find(|(flag, ..)| *flag);
 
     let explicit_section = explicit.map(|s| match s {
-        OnboardSection::Workspace => Section::Workspace,
         OnboardSection::Providers => Section::Providers,
         OnboardSection::Channels => Section::Channels,
         OnboardSection::Memory => Section::Memory,
@@ -1300,7 +1288,6 @@ async fn main() -> Result<()> {
         memory_only,
         hardware_only,
         tunnel_only,
-        workspace_only,
     } = &cli.command
     {
         use zeroclaw_runtime::onboard::ui::{QuickUi, TermUi};
@@ -1313,7 +1300,6 @@ async fn main() -> Result<()> {
             *memory_only,
             *hardware_only,
             *tunnel_only,
-            *workspace_only,
         );
         if let Some((old, new)) = deprecation {
             eprintln!("warning: {old} is deprecated; use `zeroclaw onboard {new}` instead");
@@ -4127,7 +4113,6 @@ mod tests {
             ("memory", OnboardSection::Memory),
             ("hardware", OnboardSection::Hardware),
             ("tunnel", OnboardSection::Tunnel),
-            ("workspace", OnboardSection::Workspace),
         ] {
             let cli = Cli::try_parse_from(["zeroclaw", "onboard", arg])
                 .unwrap_or_else(|_| panic!("onboard {arg} should parse"));
@@ -4142,8 +4127,7 @@ mod tests {
     #[cfg(feature = "agent-runtime")]
     fn resolve_onboard_target_no_explicit_no_legacy_runs_all() {
         use zeroclaw_runtime::onboard::Section;
-        let (target, deprecation) =
-            resolve_onboard_target(None, false, false, false, false, false, false);
+        let (target, deprecation) = resolve_onboard_target(None, false, false, false, false, false);
         assert_eq!(target, Section::All);
         assert!(deprecation.is_none());
     }
@@ -4154,7 +4138,6 @@ mod tests {
         use zeroclaw_runtime::onboard::Section;
         let (target, deprecation) = resolve_onboard_target(
             Some(OnboardSection::Channels),
-            false,
             false,
             false,
             false,
@@ -4171,59 +4154,39 @@ mod tests {
         use zeroclaw_runtime::onboard::Section;
         for (mut flags, expected_section, expected_old, expected_new) in [
             (
-                [true, false, false, false, false, false],
+                [true, false, false, false, false],
                 Section::Channels,
                 "--channels-only",
                 "channels",
             ),
             (
-                [false, true, false, false, false, false],
+                [false, true, false, false, false],
                 Section::Providers,
                 "--providers-only",
                 "providers",
             ),
             (
-                [false, false, true, false, false, false],
+                [false, false, true, false, false],
                 Section::Memory,
                 "--memory-only",
                 "memory",
             ),
             (
-                [false, false, false, true, false, false],
+                [false, false, false, true, false],
                 Section::Hardware,
                 "--hardware-only",
                 "hardware",
             ),
             (
-                [false, false, false, false, true, false],
+                [false, false, false, false, true],
                 Section::Tunnel,
                 "--tunnel-only",
                 "tunnel",
             ),
-            (
-                [false, false, false, false, false, true],
-                Section::Workspace,
-                "--workspace-only",
-                "workspace",
-            ),
         ] {
-            let [
-                channels,
-                model_providers,
-                memory,
-                hardware,
-                tunnel,
-                workspace,
-            ] = std::mem::take(&mut flags);
-            let (target, deprecation) = resolve_onboard_target(
-                None,
-                channels,
-                model_providers,
-                memory,
-                hardware,
-                tunnel,
-                workspace,
-            );
+            let [channels, model_providers, memory, hardware, tunnel] = std::mem::take(&mut flags);
+            let (target, deprecation) =
+                resolve_onboard_target(None, channels, model_providers, memory, hardware, tunnel);
             assert_eq!(target, expected_section, "{expected_old} target");
             assert_eq!(
                 deprecation,
@@ -4243,7 +4206,6 @@ mod tests {
         let (target, deprecation) = resolve_onboard_target(
             Some(OnboardSection::Providers),
             true, // --channels-only
-            false,
             false,
             false,
             false,

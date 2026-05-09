@@ -71,7 +71,7 @@ static RUNTIME_PROXY_CLIENT_CACHE: OnceLock<RwLock<HashMap<String, reqwest::Clie
 
 /// Top-level ZeroClaw configuration, loaded from `config.toml`.
 ///
-/// Resolution order: `ZEROCLAW_WORKSPACE` env → `active_workspace.toml` marker → `~/.zeroclaw/config.toml`.
+/// Resolution order: `ZEROCLAW_CONFIG_DIR` env → `ZEROCLAW_WORKSPACE` env → `~/.zeroclaw/config.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct Config {
@@ -403,11 +403,6 @@ pub struct Config {
     #[nested]
     pub nodes: NodesConfig,
 
-    /// Multi-client workspace isolation configuration (`[workspace]`).
-    #[serde(default)]
-    #[nested]
-    pub workspace: WorkspaceConfig,
-
     /// Meta-state for `zeroclaw onboard` (which sections the user has
     /// already walked through). Not user-facing config (`[onboard_state]`).
     #[serde(default)]
@@ -526,51 +521,6 @@ pub struct OnboardStateConfig {
     /// (`"workspace"`, `"model_providers"`, …).
     #[serde(default)]
     pub completed_sections: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "workspace"]
-pub struct WorkspaceConfig {
-    /// Turn on multi-workspace profiles — each named engagement gets its own memory, secrets, and audit directories so work for one client/project never bleeds into another. Leave off for single-workspace mode where everything lives under `~/.zeroclaw/workspace`.
-    #[serde(default)]
-    pub enabled: bool,
-    /// Which workspace profile is currently active — picks the `<workspaces_dir>/<name>/` directory ZeroClaw reads from and writes to. Required when multi-workspace is enabled; ignored otherwise.
-    #[serde(default)]
-    pub active_workspace: Option<String>,
-    /// Parent directory holding all workspace profiles, one subdirectory per profile. Override to keep profiles on a separate disk or inside an encrypted volume.
-    #[serde(default = "default_workspaces_dir")]
-    pub workspaces_dir: String,
-    /// Give each profile its own `brain.db` so conversation history, notes, and memories from one engagement don't leak into another. Turn off only if you want all profiles sharing a single memory store.
-    #[serde(default = "default_true")]
-    pub isolate_memory: bool,
-    /// Scope model_provider API keys, channel tokens, and other secrets to the active profile — so a key added while on `client-a` isn't visible from `client-b`. Turn off only if you want all profiles sharing one secret namespace.
-    #[serde(default = "default_true")]
-    pub isolate_secrets: bool,
-    /// Give each profile its own tool-call and channel-message audit trail, so you can hand off logs for a single engagement without exposing other work.
-    #[serde(default = "default_true")]
-    pub isolate_audit: bool,
-    /// Let memory search span all workspaces instead of only the active one. Off by default — turning it on defeats the point of isolation and is only useful for global admin queries.
-    #[serde(default)]
-    pub cross_workspace_search: bool,
-}
-
-fn default_workspaces_dir() -> String {
-    default_path_under_config_dir("workspaces")
-}
-
-impl Default for WorkspaceConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            active_workspace: None,
-            workspaces_dir: default_workspaces_dir(),
-            isolate_memory: true,
-            isolate_secrets: true,
-            isolate_audit: true,
-            cross_workspace_search: false,
-        }
-    }
 }
 
 /// Used by `#[serde(skip_serializing_if)]` on plain `bool` fields to omit
@@ -5807,9 +5757,6 @@ pub struct KnowledgeConfig {
     /// Proactively suggest relevant knowledge on queries. Default: true.
     #[serde(default = "default_true")]
     pub suggest_on_query: bool,
-    /// Allow searching across workspaces (disabled by default for client data isolation).
-    #[serde(default)]
-    pub cross_workspace_search: bool,
 }
 
 fn default_knowledge_db_path() -> String {
@@ -5828,7 +5775,6 @@ impl Default for KnowledgeConfig {
             max_nodes: default_knowledge_max_nodes(),
             auto_capture: false,
             suggest_on_query: true,
-            cross_workspace_search: false,
         }
     }
 }
@@ -12104,7 +12050,6 @@ impl Default for Config {
             tts: TtsConfig::default(),
             mcp: McpConfig::default(),
             nodes: NodesConfig::default(),
-            workspace: WorkspaceConfig::default(),
             onboard_state: OnboardStateConfig::default(),
             notion: NotionConfig::default(),
             jira: JiraConfig::default(),
@@ -12130,14 +12075,6 @@ impl Default for Config {
 fn default_config_and_workspace_dirs() -> Result<(PathBuf, PathBuf)> {
     let config_dir = default_config_dir()?;
     Ok((config_dir.clone(), config_dir.join("workspace")))
-}
-
-const ACTIVE_WORKSPACE_STATE_FILE: &str = "active_workspace.toml";
-
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-struct ActiveWorkspaceState {
-    config_dir: String,
 }
 
 fn default_config_dir() -> Result<PathBuf> {
@@ -12171,142 +12108,6 @@ fn default_path_under_config_dir(relative: &str) -> String {
         Ok(dir) => dir.join(relative).to_string_lossy().into_owned(),
         Err(_) => format!("~/.zeroclaw/{relative}"),
     }
-}
-
-fn active_workspace_state_path(default_dir: &Path) -> PathBuf {
-    default_dir.join(ACTIVE_WORKSPACE_STATE_FILE)
-}
-
-/// Returns `true` if `path` lives under the OS temp directory.
-fn is_temp_directory(path: &Path) -> bool {
-    let temp = std::env::temp_dir();
-    // Canonicalize when possible to handle symlinks (macOS /var → /private/var)
-    let canon_temp = temp.canonicalize().unwrap_or_else(|_| temp.clone());
-    let canon_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    canon_path.starts_with(&canon_temp)
-}
-
-async fn load_persisted_workspace_dirs(
-    default_config_dir: &Path,
-) -> Result<Option<(PathBuf, PathBuf)>> {
-    let state_path = active_workspace_state_path(default_config_dir);
-    if !state_path.exists() {
-        return Ok(None);
-    }
-
-    let contents = match fs::read_to_string(&state_path).await {
-        Ok(contents) => contents,
-        Err(error) => {
-            tracing::warn!(
-                "Failed to read active workspace marker {}: {error}",
-                state_path.display()
-            );
-            return Ok(None);
-        }
-    };
-
-    let state: ActiveWorkspaceState = match toml::from_str(&contents) {
-        Ok(state) => state,
-        Err(error) => {
-            tracing::warn!(
-                "Failed to parse active workspace marker {}: {error}",
-                state_path.display()
-            );
-            return Ok(None);
-        }
-    };
-
-    let raw_config_dir = state.config_dir.trim();
-    if raw_config_dir.is_empty() {
-        tracing::warn!(
-            "Ignoring active workspace marker {} because config_dir is empty",
-            state_path.display()
-        );
-        return Ok(None);
-    }
-
-    let parsed_dir = expand_tilde_path(raw_config_dir);
-    let config_dir = if parsed_dir.is_absolute() {
-        parsed_dir
-    } else {
-        default_config_dir.join(parsed_dir)
-    };
-    Ok(Some((config_dir.clone(), config_dir.join("workspace"))))
-}
-
-pub async fn persist_active_workspace_config_dir(config_dir: &Path) -> Result<()> {
-    persist_active_workspace_config_dir_in(config_dir, &default_config_dir()?).await
-}
-
-/// Inner implementation that accepts the default config directory explicitly,
-/// so callers (including tests) control where the marker is written without
-/// manipulating process-wide environment variables.
-async fn persist_active_workspace_config_dir_in(
-    config_dir: &Path,
-    default_config_dir: &Path,
-) -> Result<()> {
-    let state_path = active_workspace_state_path(default_config_dir);
-
-    // Guard: refuse to write a temp-directory config_dir into a non-temp
-    // default location. This prevents transient test runs or one-off
-    // invocations from hijacking the real user's daemon config resolution.
-    // When both paths are temp (e.g. in tests), the write is harmless.
-    if is_temp_directory(config_dir) && !is_temp_directory(default_config_dir) {
-        tracing::warn!(
-            path = %config_dir.display(),
-            "Refusing to persist temp directory as active workspace marker"
-        );
-        return Ok(());
-    }
-
-    if config_dir == default_config_dir {
-        if state_path.exists() {
-            fs::remove_file(&state_path).await.with_context(|| {
-                format!(
-                    "Failed to clear active workspace marker: {}",
-                    state_path.display()
-                )
-            })?;
-        }
-        return Ok(());
-    }
-
-    fs::create_dir_all(&default_config_dir)
-        .await
-        .with_context(|| {
-            format!(
-                "Failed to create default config directory: {}",
-                default_config_dir.display()
-            )
-        })?;
-
-    let state = ActiveWorkspaceState {
-        config_dir: config_dir.to_string_lossy().into_owned(),
-    };
-    let serialized =
-        toml::to_string_pretty(&state).context("Failed to serialize active workspace marker")?;
-
-    let temp_path = default_config_dir.join(format!(
-        ".{ACTIVE_WORKSPACE_STATE_FILE}.tmp-{}",
-        uuid::Uuid::new_v4()
-    ));
-    fs::write(&temp_path, serialized).await.with_context(|| {
-        format!(
-            "Failed to write temporary active workspace marker: {}",
-            temp_path.display()
-        )
-    })?;
-
-    if let Err(error) = fs::rename(&temp_path, &state_path).await {
-        let _ = fs::remove_file(&temp_path).await;
-        anyhow::bail!(
-            "Failed to atomically persist active workspace marker {}: {error}",
-            state_path.display()
-        );
-    }
-
-    sync_directory(default_config_dir).await?;
-    Ok(())
 }
 
 pub fn resolve_config_dir_for_workspace(workspace_dir: &Path) -> (PathBuf, PathBuf) {
@@ -12355,7 +12156,6 @@ pub async fn resolve_runtime_dirs_for_onboarding() -> Result<(PathBuf, PathBuf)>
 enum ConfigResolutionSource {
     EnvConfigDir,
     EnvWorkspace,
-    ActiveWorkspaceMarker,
     DefaultConfigDir,
 }
 
@@ -12364,7 +12164,6 @@ impl ConfigResolutionSource {
         match self {
             Self::EnvConfigDir => "ZEROCLAW_CONFIG_DIR",
             Self::EnvWorkspace => "ZEROCLAW_WORKSPACE",
-            Self::ActiveWorkspaceMarker => "active_workspace.toml",
             Self::DefaultConfigDir => "default",
         }
     }
@@ -12424,16 +12223,6 @@ async fn resolve_runtime_config_dirs(
             zeroclaw_dir,
             workspace_dir,
             ConfigResolutionSource::EnvWorkspace,
-        ));
-    }
-
-    if let Some((zeroclaw_dir, workspace_dir)) =
-        load_persisted_workspace_dirs(default_zeroclaw_dir).await?
-    {
-        return Ok((
-            zeroclaw_dir,
-            workspace_dir,
-            ConfigResolutionSource::ActiveWorkspaceMarker,
         ));
     }
 
@@ -14802,7 +14591,6 @@ auto_save = true
             tts: TtsConfig::default(),
             mcp: McpConfig::default(),
             nodes: NodesConfig::default(),
-            workspace: WorkspaceConfig::default(),
             onboard_state: OnboardStateConfig::default(),
             notion: NotionConfig::default(),
             jira: JiraConfig::default(),
@@ -15376,7 +15164,6 @@ default_temperature = 0.7
             tts: TtsConfig::default(),
             mcp: McpConfig::default(),
             nodes: NodesConfig::default(),
-            workspace: WorkspaceConfig::default(),
             onboard_state: OnboardStateConfig::default(),
             notion: NotionConfig::default(),
             jira: JiraConfig::default(),
@@ -17037,16 +16824,8 @@ model = "primary-model"
         let default_config_dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
         let default_workspace_dir = default_config_dir.join("workspace");
         let explicit_config_dir = default_config_dir.join("explicit-config");
-        let marker_config_dir = default_config_dir.join("profiles").join("alpha");
-        let state_path = default_config_dir.join(ACTIVE_WORKSPACE_STATE_FILE);
 
         fs::create_dir_all(&default_config_dir).await.unwrap();
-        let state = ActiveWorkspaceState {
-            config_dir: marker_config_dir.to_string_lossy().into_owned(),
-        };
-        fs::write(&state_path, toml::to_string(&state).unwrap())
-            .await
-            .unwrap();
 
         // SAFETY: test-only, single-threaded test runner.
         unsafe { std::env::set_var("ZEROCLAW_CONFIG_DIR", &explicit_config_dir) };
@@ -17067,36 +16846,6 @@ model = "primary-model"
 
         // SAFETY: test-only, single-threaded test runner.
         unsafe { std::env::remove_var("ZEROCLAW_CONFIG_DIR") };
-        let _ = fs::remove_dir_all(default_config_dir).await;
-    }
-
-    #[test]
-    async fn resolve_runtime_config_dirs_uses_active_workspace_marker() {
-        let _env_guard = env_override_lock().await;
-        let default_config_dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
-        let default_workspace_dir = default_config_dir.join("workspace");
-        let marker_config_dir = default_config_dir.join("profiles").join("alpha");
-        let state_path = default_config_dir.join(ACTIVE_WORKSPACE_STATE_FILE);
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("ZEROCLAW_WORKSPACE") };
-        fs::create_dir_all(&default_config_dir).await.unwrap();
-        let state = ActiveWorkspaceState {
-            config_dir: marker_config_dir.to_string_lossy().into_owned(),
-        };
-        fs::write(&state_path, toml::to_string(&state).unwrap())
-            .await
-            .unwrap();
-
-        let (config_dir, resolved_workspace_dir, source) =
-            resolve_runtime_config_dirs(&default_config_dir, &default_workspace_dir)
-                .await
-                .unwrap();
-
-        assert_eq!(source, ConfigResolutionSource::ActiveWorkspaceMarker);
-        assert_eq!(config_dir, marker_config_dir);
-        assert_eq!(resolved_workspace_dir, marker_config_dir.join("workspace"));
-
         let _ = fs::remove_dir_all(default_config_dir).await;
     }
 
@@ -17284,131 +17033,6 @@ default_model = "legacy-model"
             // SAFETY: test-only, single-threaded test runner.
             unsafe { std::env::remove_var("HOME") };
         }
-        let _ = fs::remove_dir_all(temp_home).await;
-    }
-
-    #[test]
-    async fn load_or_init_uses_persisted_active_workspace_marker() {
-        let _env_guard = env_override_lock().await;
-        let temp_home =
-            std::env::temp_dir().join(format!("zeroclaw_test_home_{}", uuid::Uuid::new_v4()));
-        let temp_default_dir = temp_home.join(".zeroclaw");
-        let custom_config_dir = temp_home.join("profiles").join("agent-alpha");
-
-        fs::create_dir_all(&custom_config_dir).await.unwrap();
-        // Pre-create the default dir so is_temp_directory() can canonicalize
-        // the path on macOS (where /var → /private/var symlink requires
-        // the directory to exist for canonicalize to resolve correctly).
-        fs::create_dir_all(&temp_default_dir).await.unwrap();
-        fs::write(
-            custom_config_dir.join("config.toml"),
-            "default_temperature = 0.7\ndefault_model = \"persisted-profile\"\n",
-        )
-        .await
-        .unwrap();
-
-        // Write the marker using the explicit default dir (no HOME manipulation
-        // needed for the persist call itself).
-        persist_active_workspace_config_dir_in(&custom_config_dir, &temp_default_dir)
-            .await
-            .unwrap();
-
-        // Config::load_or_init still reads HOME to find the marker, so we
-        // must override HOME here. The persist above already wrote to the
-        // correct temp location, so no stale marker can leak.
-        let original_home = std::env::var("HOME").ok();
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("HOME", &temp_home) };
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("ZEROCLAW_WORKSPACE") };
-
-        let config = Box::pin(Config::load_or_init()).await.unwrap();
-
-        assert_eq!(config.config_path, custom_config_dir.join("config.toml"));
-        assert_eq!(config.workspace_dir, custom_config_dir.join("workspace"));
-        assert_eq!(
-            config
-                .providers
-                .first_model_provider()
-                .and_then(|e| e.model.as_deref()),
-            Some("persisted-profile")
-        );
-
-        if let Some(home) = original_home {
-            // SAFETY: test-only, single-threaded test runner.
-            unsafe { std::env::set_var("HOME", home) };
-        } else {
-            // SAFETY: test-only, single-threaded test runner.
-            unsafe { std::env::remove_var("HOME") };
-        }
-        let _ = fs::remove_dir_all(temp_home).await;
-    }
-
-    #[test]
-    async fn load_or_init_env_workspace_override_takes_priority_over_marker() {
-        let _env_guard = env_override_lock().await;
-        let temp_home =
-            std::env::temp_dir().join(format!("zeroclaw_test_home_{}", uuid::Uuid::new_v4()));
-        let temp_default_dir = temp_home.join(".zeroclaw");
-        let marker_config_dir = temp_home.join("profiles").join("persisted-profile");
-        let env_workspace_dir = temp_home.join("env-workspace");
-
-        fs::create_dir_all(&marker_config_dir).await.unwrap();
-        fs::write(
-            marker_config_dir.join("config.toml"),
-            "default_temperature = 0.7\ndefault_model = \"marker-model\"\n",
-        )
-        .await
-        .unwrap();
-
-        // Write marker via explicit default dir, then set HOME for load_or_init.
-        persist_active_workspace_config_dir_in(&marker_config_dir, &temp_default_dir)
-            .await
-            .unwrap();
-
-        let original_home = std::env::var("HOME").ok();
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("HOME", &temp_home) };
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("ZEROCLAW_WORKSPACE", &env_workspace_dir) };
-
-        let config = Box::pin(Config::load_or_init()).await.unwrap();
-
-        assert_eq!(config.workspace_dir, env_workspace_dir.join("workspace"));
-        assert_eq!(config.config_path, env_workspace_dir.join("config.toml"));
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("ZEROCLAW_WORKSPACE") };
-        if let Some(home) = original_home {
-            // SAFETY: test-only, single-threaded test runner.
-            unsafe { std::env::set_var("HOME", home) };
-        } else {
-            // SAFETY: test-only, single-threaded test runner.
-            unsafe { std::env::remove_var("HOME") };
-        }
-        let _ = fs::remove_dir_all(temp_home).await;
-    }
-
-    #[test]
-    async fn persist_active_workspace_marker_is_cleared_for_default_config_dir() {
-        let temp_home =
-            std::env::temp_dir().join(format!("zeroclaw_test_home_{}", uuid::Uuid::new_v4()));
-        let default_config_dir = temp_home.join(".zeroclaw");
-        let custom_config_dir = temp_home.join("profiles").join("custom-profile");
-        let marker_path = default_config_dir.join(ACTIVE_WORKSPACE_STATE_FILE);
-
-        // Use the _in variant directly -- no HOME manipulation needed since
-        // this test only exercises persist/clear logic, not Config::load_or_init.
-        persist_active_workspace_config_dir_in(&custom_config_dir, &default_config_dir)
-            .await
-            .unwrap();
-        assert!(marker_path.exists());
-
-        persist_active_workspace_config_dir_in(&default_config_dir, &default_config_dir)
-            .await
-            .unwrap();
-        assert!(!marker_path.exists());
-
         let _ = fs::remove_dir_all(temp_home).await;
     }
 
