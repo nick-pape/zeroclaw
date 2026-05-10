@@ -6,7 +6,6 @@ pub mod migration;
 pub mod util;
 
 pub mod agent;
-pub mod agents;
 pub mod approval;
 pub mod cost;
 pub mod cron;

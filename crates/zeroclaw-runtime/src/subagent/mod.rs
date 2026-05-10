@@ -109,13 +109,29 @@ impl SubAgentSpawn {
     /// Apply `overrides` to the parent's permissions and return a
     /// validated [`SubAgentContext`]. On any escalation, returns
     /// `Err` with the originating violation in the error chain.
+    ///
+    /// When the caller supplies a policy override, the child inherits
+    /// the parent's `PerSenderTracker` so action and cost budgets are
+    /// shared between parent and SubAgent runs. Otherwise a SubAgent
+    /// could be spawned to bypass the parent's `max_actions_per_hour`
+    /// or `max_cost_per_day_cents` ceiling by consuming from a
+    /// fresh-zeroed bucket; the inheritance closes that escape. The
+    /// no-override path already shares the bucket via
+    /// `Arc<SecurityPolicy>` cloning.
     pub fn build(self, overrides: SubAgentOverrides) -> Result<SubAgentContext> {
-        let policy = if let Some(child_policy) = overrides.policy {
+        let policy = if let Some(mut child_policy) = overrides.policy {
             child_policy
                 .ensure_no_escalation_beyond(&self.parent_policy)
                 .map_err(|violation| {
                     anyhow::anyhow!("subagent policy override escalates beyond parent: {violation}")
                 })?;
+            // Share the parent's action/cost tracker. `PerSenderTracker`
+            // is `Clone` (deep-copy of buckets) but the SubAgent must
+            // see the parent's live bucket state, not a frozen
+            // snapshot, so steal the parent's tracker by cloning the
+            // inner `Arc<SecurityPolicy>` once and assigning the
+            // child's `tracker` field from it.
+            child_policy.tracker = self.parent_policy.tracker.clone();
             Arc::new(child_policy)
         } else {
             self.parent_policy.clone()
@@ -257,5 +273,44 @@ mod tests {
             .expect("narrowing to {} is a valid subset");
         assert_eq!(ctx.allowed_agent_ids.len(), 1);
         assert!(ctx.allowed_agent_ids.contains("alpha"));
+    }
+
+    #[test]
+    fn build_with_override_inherits_parent_action_budget() {
+        // SubAgent runs must consume from the parent's action budget
+        // so spawning children cannot bypass `max_actions_per_hour`.
+        // The override path (caller-supplied policy) is the one with
+        // the bug; the inherit-verbatim path is correct by Arc reuse.
+        let config = config_with_agent("alpha");
+        let spawn = SubAgentSpawn::for_agent(&config, "alpha").unwrap();
+        let parent_policy = spawn.parent_policy.clone();
+
+        // Burn the parent's action budget right up to the ceiling so
+        // the child's first record_action would push past it.
+        for _ in 0..parent_policy.max_actions_per_hour {
+            assert!(
+                parent_policy.record_action(),
+                "parent budget should accept records up to its ceiling"
+            );
+        }
+
+        // Build a child policy that's a subset of the parent (no
+        // escalation) but with the default fresh tracker. The fix
+        // copies the parent's tracker into the child so the next
+        // record_action sees the parent's exhausted bucket.
+        let child_policy = (*parent_policy).clone();
+        let ctx = spawn
+            .build(SubAgentOverrides {
+                policy: Some(child_policy),
+                ..SubAgentOverrides::default()
+            })
+            .expect("inheriting policy as a subset must succeed");
+
+        assert!(
+            !ctx.policy.record_action(),
+            "child must inherit parent's exhausted action budget; \
+             a fresh bucket here means the budget is bypass-able by \
+             spawning a SubAgent"
+        );
     }
 }

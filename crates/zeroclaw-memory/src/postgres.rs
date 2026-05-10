@@ -416,35 +416,14 @@ impl Memory for PostgresMemory {
         category: MemoryCategory,
         session_id: Option<&str>,
     ) -> Result<()> {
-        let client = self.client.clone();
-        let qualified_table = self.qualified_table.clone();
-        let key = key.to_string();
-        let content = content.to_string();
-        let category = Self::category_to_str(&category);
-        let sid = session_id.map(str::to_string);
-
-        run_on_os_thread(move || -> Result<()> {
-            let now = Utc::now();
-            let mut client = client.lock();
-            let stmt = format!(
-                "
-                INSERT INTO {qualified_table}
-                    (id, key, content, category, created_at, updated_at, session_id)
-                VALUES
-                    ($1, $2, $3, $4, $5, $6, $7)
-                ON CONFLICT (key) DO UPDATE SET
-                    content = EXCLUDED.content,
-                    category = EXCLUDED.category,
-                    updated_at = EXCLUDED.updated_at,
-                    session_id = EXCLUDED.session_id
-                "
-            );
-
-            let id = Uuid::new_v4().to_string();
-            client.execute(&stmt, &[&id, &key, &content, &category, &now, &now, &sid])?;
-            Ok(())
-        })
-        .await
+        // Trait-level `store` has no agent context. Route through
+        // `store_with_agent` so the row is attributed to the default
+        // agent (the NOT NULL FK on `agent_id` rejects unattributed
+        // inserts; un-attributed callers like the heartbeat memory
+        // path land under the synthesized `default` agent rather than
+        // surfacing a constraint violation).
+        self.store_with_agent(key, content, category, session_id, None, None, None)
+            .await
     }
 
     async fn recall(
@@ -614,6 +593,7 @@ impl Memory for PostgresMemory {
     ) -> Result<()> {
         let client = self.client.clone();
         let qualified_table = self.qualified_table.clone();
+        let qualified_agents = self.qualified_agents.clone();
         let key = key.to_string();
         let content = content.to_string();
         let category = Self::category_to_str(&category);
@@ -623,12 +603,18 @@ impl Memory for PostgresMemory {
         run_on_os_thread(move || -> Result<()> {
             let now = Utc::now();
             let mut client = client.lock();
+            // `agent_id = COALESCE($8, default-agent-uuid)` so callers
+            // without an agent context still satisfy the NOT NULL FK
+            // by attributing to the synthesized default agent. The
+            // subquery is indexed (UNIQUE alias) so the lookup is
+            // metadata-cached after the first call.
             let stmt = format!(
                 "
                 INSERT INTO {qualified_table}
                     (id, key, content, category, created_at, updated_at, session_id, agent_id)
                 VALUES
-                    ($1, $2, $3, $4, $5, $6, $7, $8)
+                    ($1, $2, $3, $4, $5, $6, $7,
+                     COALESCE($8, (SELECT id FROM {qualified_agents} WHERE alias = 'default' LIMIT 1)))
                 ON CONFLICT (key) DO UPDATE SET
                     content = EXCLUDED.content,
                     category = EXCLUDED.category,
@@ -657,56 +643,78 @@ impl Memory for PostgresMemory {
         since: Option<&str>,
         until: Option<&str>,
     ) -> Result<Vec<MemoryEntry>> {
-        // Empty allowlist means "no agent filter" — fall back to plain
-        // recall. The wrapper always includes the bound agent's UUID, so
-        // a non-empty allowlist is the live-runtime case.
+        // Empty allowlist means "no agent filter": fall back to plain
+        // recall. The wrapper always includes the bound agent's UUID,
+        // so a non-empty allowlist is the live-runtime case.
         if allowed_agent_ids.is_empty() {
             return self.recall(query, limit, session_id, since, until).await;
         }
 
-        // Over-fetch so the agent_id filter doesn't undercount the
-        // requested limit. The lookup that follows is a single round-
-        // trip indexed query.
-        let raw = self
-            .recall(query, limit.saturating_mul(4), session_id, since, until)
-            .await?;
-        if raw.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let allowed: std::collections::HashSet<String> =
-            allowed_agent_ids.iter().map(|s| (*s).to_string()).collect();
         let client = self.client.clone();
         let qualified_table = self.qualified_table.clone();
-        let ids: Vec<String> = raw.iter().map(|e| e.id.clone()).collect();
+        let q = normalize_recent_recall_query(query).trim().to_string();
+        let sid = session_id.map(str::to_string);
+        let since_owned = since.map(str::to_string);
+        let until_owned = until.map(str::to_string);
+        let allowed: Vec<String> = allowed_agent_ids.iter().map(|s| (*s).to_string()).collect();
 
-        let agent_id_map: std::collections::HashMap<String, Option<String>> = run_on_os_thread(
-            move || -> Result<std::collections::HashMap<String, Option<String>>> {
-                let mut client = client.lock();
-                let stmt = format!("SELECT id, agent_id FROM {qualified_table} WHERE id = ANY($1)");
-                let rows = client.query(&stmt, &[&ids])?;
-                let mut map = std::collections::HashMap::with_capacity(rows.len());
-                for row in rows {
-                    let id: String = row.get(0);
-                    let aid: Option<String> = row.get(1);
-                    map.insert(id, aid);
+        run_on_os_thread(move || -> Result<Vec<MemoryEntry>> {
+            let mut client = client.lock();
+            let since_ref = since_owned.as_deref();
+            let until_ref = until_owned.as_deref();
+
+            // The agent_id filter lives in the WHERE clause so the
+            // backend never returns a foreign-agent row to the caller;
+            // post-fetch attribution lookups in earlier impls were the
+            // privacy escape Audacity flagged. The NOT NULL FK on
+            // `memories.agent_id` means there are no legacy
+            // unattributed rows to special-case.
+            let time_filter: String = match (since_ref, until_ref) {
+                (Some(_), Some(_)) => {
+                    " AND created_at >= $5::TIMESTAMPTZ AND created_at <= $6::TIMESTAMPTZ".into()
                 }
-                Ok(map)
-            },
-        )
-        .await?;
+                (Some(_), None) => " AND created_at >= $5::TIMESTAMPTZ".into(),
+                (None, Some(_)) => " AND created_at <= $5::TIMESTAMPTZ".into(),
+                (None, None) => String::new(),
+            };
 
-        // Filter: keep entries whose agent_id is on the allowlist, plus
-        // legacy NULL-agent_id rows that pre-date the migration.
-        Ok(raw
-            .into_iter()
-            .filter(|e| match agent_id_map.get(&e.id) {
-                Some(Some(aid)) => allowed.contains(aid),
-                Some(None) => true,
-                None => false,
-            })
-            .take(limit)
-            .collect())
+            let stmt = format!(
+                "
+                SELECT id, key, content, category, created_at, session_id, agent_id,
+                       (
+                         CASE WHEN to_tsvector('simple', key) @@ plainto_tsquery('simple', $1)
+                           THEN ts_rank_cd(to_tsvector('simple', key), plainto_tsquery('simple', $1)) * 2.0
+                           ELSE 0.0 END +
+                         CASE WHEN to_tsvector('simple', content) @@ plainto_tsquery('simple', $1)
+                           THEN ts_rank_cd(to_tsvector('simple', content), plainto_tsquery('simple', $1))
+                           ELSE 0.0 END
+                       ) AS score
+                FROM {qualified_table}
+                WHERE ($2::TEXT IS NULL OR session_id = $2)
+                  AND ($1 = '' OR to_tsvector('simple', key || ' ' || content) @@ plainto_tsquery('simple', $1))
+                  AND agent_id = ANY($4)
+                  {time_filter}
+                ORDER BY score DESC, updated_at DESC
+                LIMIT $3
+                "
+            );
+
+            #[allow(clippy::cast_possible_wrap)]
+            let limit_i64 = limit as i64;
+
+            let rows = match (since_ref, until_ref) {
+                (Some(s), Some(u)) => {
+                    client.query(&stmt, &[&q, &sid, &limit_i64, &allowed, &s, &u])?
+                }
+                (Some(s), None) => client.query(&stmt, &[&q, &sid, &limit_i64, &allowed, &s])?,
+                (None, Some(u)) => client.query(&stmt, &[&q, &sid, &limit_i64, &allowed, &u])?,
+                (None, None) => client.query(&stmt, &[&q, &sid, &limit_i64, &allowed])?,
+            };
+            rows.iter()
+                .map(Self::row_to_entry)
+                .collect::<Result<Vec<MemoryEntry>>>()
+        })
+        .await
     }
 
     async fn ensure_agent_uuid(&self, alias: &str) -> Result<String> {

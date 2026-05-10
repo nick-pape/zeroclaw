@@ -181,11 +181,14 @@ async fn two_sqlite_agents_on_one_install_have_isolated_memory() {
 
 /// Peer-group routing: two agents in a shared peer group on the same
 /// channel resolve each other as peers, see external peers in their
-/// resolved set, and reject inbound from unknown senders. The send
-/// path goes through `SendMessageToPeerTool`'s peer-set check; we
-/// don't actually deliver here (no `DELIVERY_FN` registered in the
-/// hermetic test) — the assertion is that the authorization surface
-/// admits and rejects the right shapes.
+/// resolved set, and reject inbound from unknown senders. Sends to
+/// peer agents are routed in-process via the agent loop (no channel
+/// round-trip; the bot's identity is shared across agents on the
+/// same channel and an outbound would loop the bot's own handle back
+/// inbound). External peers route through the channel registry's
+/// delivery function; the hermetic test does not register one, so
+/// external sends surface as a delivery-layer failure rather than an
+/// authorization failure.
 #[tokio::test]
 async fn peer_group_routes_messages_only_within_resolved_peer_set() {
     use serde_json::json;
@@ -271,9 +274,10 @@ async fn peer_group_routes_messages_only_within_resolved_peer_set() {
         to_gamma.error
     );
 
-    // Sends to beta and to the external peer are authorized by the
-    // peer-set check; delivery itself fails (no DELIVERY_FN registered)
-    // but that's a different layer than authorization.
+    // Sends to beta route in-process (spawn the recipient agent's
+    // process_message and return). The tool returns success
+    // synchronously because the spawn is fire-and-forget; the
+    // recipient processes on its own loop.
     let to_beta = tool
         .execute(json!({
             "channel": "telegram.prod",
@@ -283,12 +287,12 @@ async fn peer_group_routes_messages_only_within_resolved_peer_set() {
         .await
         .expect("execute returns Ok");
     assert!(
-        to_beta
-            .error
-            .as_deref()
-            .map(|e| !e.contains("not on agent"))
-            .unwrap_or(true),
-        "peer-set check must pass for beta; tool error (if any) must be from the delivery layer, got: {:?}",
-        to_beta.error
+        to_beta.success,
+        "in-process peer delivery must return success without blocking the sender, got: {to_beta:?}"
+    );
+    assert!(
+        to_beta.output.contains("in-process"),
+        "in-process delivery output must name its routing path so the agent can reason about delivery semantics, got: {:?}",
+        to_beta.output
     );
 }

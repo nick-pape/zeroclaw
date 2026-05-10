@@ -78,12 +78,18 @@ impl Clone for ActionTracker {
 /// its own independent [`ActionTracker`] bucket. When no sender is in scope
 /// (cron jobs, CLI), the `GLOBAL_KEY` bucket is used.
 ///
+/// The bucket map is shared via `Arc` so a `SubAgent` policy that clones
+/// from its parent observes the same live counts. SubAgent budget
+/// inheritance relies on this: a child run consuming an action sees the
+/// shared bucket update, so the parent's `max_actions_per_hour` ceiling
+/// applies across both runs rather than each getting a fresh allocation.
+///
 /// Note: sender buckets accumulate for the daemon lifetime with no eviction.
 /// This is acceptable for bounded sets of chat IDs; in high-cardinality deployments,
 /// consider periodic cleanup.
 #[derive(Debug)]
 pub struct PerSenderTracker {
-    buckets: parking_lot::Mutex<HashMap<String, ActionTracker>>,
+    buckets: std::sync::Arc<parking_lot::Mutex<HashMap<String, ActionTracker>>>,
 }
 
 impl PerSenderTracker {
@@ -93,7 +99,7 @@ impl PerSenderTracker {
     /// Create an empty tracker with no sender buckets.
     pub fn new() -> Self {
         Self {
-            buckets: parking_lot::Mutex::new(HashMap::new()),
+            buckets: std::sync::Arc::new(parking_lot::Mutex::new(HashMap::new())),
         }
     }
 
@@ -147,10 +153,14 @@ impl PerSenderTracker {
 }
 
 impl Clone for PerSenderTracker {
+    /// Cloning a `PerSenderTracker` shares the bucket map by `Arc`.
+    /// SubAgent runs consume from the same buckets as their parent
+    /// so per-hour and per-day budgets are not bypassed by spawning
+    /// children. Tests that need an isolated tracker construct a
+    /// fresh one via [`Self::new`] rather than cloning.
     fn clone(&self) -> Self {
-        let buckets = self.buckets.lock();
         Self {
-            buckets: parking_lot::Mutex::new(buckets.clone()),
+            buckets: std::sync::Arc::clone(&self.buckets),
         }
     }
 }
@@ -163,16 +173,25 @@ impl Default for PerSenderTracker {
 
 /// Security policy enforced on all tool executions.
 ///
-/// `allowed_roots` is the list of directories the agent can read AND
-/// write under (in addition to its own workspace). `allowed_roots_read_only`
-/// is the list it can only read from. Both are absolute, tilde-expanded
-/// paths populated when the policy is built. The two lists drive the
-/// multi-agent cross-agent allowlist: when agent A grants
-/// `AccessMode::Read` to agent B over B's workspace, B's workspace
-/// path lands in A's `allowed_roots_read_only`; `AccessMode::Write` and
-/// `AccessMode::ReadWrite` land in A's `allowed_roots`. file_read tools
-/// consult the union; file_write and shell-level tools consult only
-/// `allowed_roots`.
+/// Three cross-agent allowlist tiers drive the multi-agent design:
+///
+/// - `allowed_roots`: read AND write. Populated from
+///   `RiskProfileConfig.allowed_roots` and from
+///   `AccessMode::ReadWrite` grants in `agent.workspace.access`.
+/// - `allowed_roots_read_only`: read but NOT write. Populated from
+///   `AccessMode::Read` grants.
+/// - `allowed_roots_write_only`: write but NOT read. Populated from
+///   `AccessMode::Write` grants. The bot can append/overwrite under
+///   the path but `file_read` / `pdf_read` / `glob_search` /
+///   `content_search` reject it.
+///
+/// Read-side tools call [`SecurityPolicy::is_resolved_path_readable`],
+/// which sees `allowed_roots` ∪ `allowed_roots_read_only` plus the
+/// universal POSIX device files. Write-side tools call
+/// [`SecurityPolicy::is_resolved_path_allowed`], which sees
+/// `allowed_roots` ∪ `allowed_roots_write_only`. The two tiers stay
+/// disjoint by construction so `AccessMode::Write` and
+/// `AccessMode::Read` grant exactly what they say.
 #[derive(Debug, Clone)]
 pub struct SecurityPolicy {
     pub autonomy: AutonomyLevel,
@@ -182,14 +201,21 @@ pub struct SecurityPolicy {
     pub forbidden_paths: Vec<String>,
     /// Directories the agent can read AND write under. Includes
     /// `RiskProfileConfig.allowed_roots` plus any cross-agent
-    /// `AccessMode::Write`/`AccessMode::ReadWrite` grants resolved
-    /// from `agent.workspace.access` at policy construction time.
+    /// `AccessMode::ReadWrite` grants resolved from
+    /// `agent.workspace.access` at policy construction time.
     pub allowed_roots: Vec<PathBuf>,
     /// Directories the agent can read but NOT write under. Populated
     /// from cross-agent `AccessMode::Read` grants at policy
     /// construction time. Empty when no read-only cross-agent access
     /// is configured.
     pub allowed_roots_read_only: Vec<PathBuf>,
+    /// Directories the agent can write but NOT read under. Populated
+    /// from cross-agent `AccessMode::Write` grants at policy
+    /// construction time. Empty when no write-only cross-agent access
+    /// is configured. Read-side tools (`file_read`, `pdf_read`,
+    /// `glob_search`, `content_search`) ignore this list; write-side
+    /// tools (`file_write`, `file_edit`, `git_operations`) honor it.
+    pub allowed_roots_write_only: Vec<PathBuf>,
     pub max_actions_per_hour: u32,
     pub max_cost_per_day_cents: u32,
     pub require_approval_for_medium_risk: bool,
@@ -361,6 +387,9 @@ pub enum EscalationViolation {
     /// `child.allowed_roots_read_only` contains a path the parent
     /// cannot read at all (not in parent rw or read-only lists).
     ReadOnlyRootNotInParent { path: PathBuf },
+    /// `child.allowed_roots_write_only` contains a path the parent
+    /// cannot write at all (not in parent rw or write-only lists).
+    WriteOnlyRootNotInParent { path: PathBuf },
     /// `child.allowed_commands` contains a shell command the parent
     /// has no allowance for.
     CommandNotInParent { command: String },
@@ -408,6 +437,10 @@ impl std::fmt::Display for EscalationViolation {
             Self::ReadOnlyRootNotInParent { path } => write!(
                 f,
                 "subagent allowed_roots_read_only entry {path:?} is not contained within the parent's allowed_roots or allowed_roots_read_only"
+            ),
+            Self::WriteOnlyRootNotInParent { path } => write!(
+                f,
+                "subagent allowed_roots_write_only entry {path:?} is not contained within the parent's allowed_roots or allowed_roots_write_only"
             ),
             Self::CommandNotInParent { command } => write!(
                 f,
@@ -461,6 +494,7 @@ impl Default for SecurityPolicy {
             forbidden_paths: default_forbidden_paths(),
             allowed_roots: Vec::new(),
             allowed_roots_read_only: Vec::new(),
+            allowed_roots_write_only: Vec::new(),
             max_actions_per_hour: 20,
             max_cost_per_day_cents: 500,
             require_approval_for_medium_risk: true,
@@ -1532,8 +1566,22 @@ impl SecurityPolicy {
                 .allowed_roots
                 .iter()
                 .any(|root| expanded_path.starts_with(root));
+            // String-level safety check is shared between read and
+            // write side tools, so accept paths under either grant
+            // tier here. The grant-direction enforcement happens at
+            // the resolved-path methods (`is_resolved_path_readable`
+            // / `is_resolved_path_allowed`), which split read-only
+            // and write-only entries into different code paths.
+            let in_read_only_root = self
+                .allowed_roots_read_only
+                .iter()
+                .any(|root| expanded_path.starts_with(root));
+            let in_write_only_root = self
+                .allowed_roots_write_only
+                .iter()
+                .any(|root| expanded_path.starts_with(root));
 
-            if in_workspace || in_allowed_root {
+            if in_workspace || in_allowed_root || in_read_only_root || in_write_only_root {
                 return true;
             }
 
@@ -1556,19 +1604,22 @@ impl SecurityPolicy {
     }
 
     /// Validate that a resolved path is readable by the current
-    /// security policy. Used by read-only tools (`file_read`,
-    /// `glob_search`, `content_search`) that should honor both the
-    /// read-write `allowed_roots` AND the read-only
+    /// security policy. Used by read-side tools (`file_read`,
+    /// `pdf_read`, `glob_search`, `content_search`) that should honor
+    /// the read-write `allowed_roots` AND the read-only
     /// `allowed_roots_read_only` lists, plus the universal POSIX
     /// device files (`/dev/null`, `/dev/zero`, `/dev/random`,
     /// `/dev/urandom`) that operators legitimately use for shell-
     /// idiom CLI commands and standard input/output redirection.
     ///
+    /// Importantly: this method does NOT consult
+    /// `allowed_roots_write_only`. `AccessMode::Write` grants write
+    /// access without read access; surfacing those paths through a
+    /// read-side tool would silently elevate the grant.
+    ///
     /// Write-side tools (`file_write`, `file_edit`,
     /// `git_operations`, `shell` write paths) call
-    /// [`Self::is_resolved_path_allowed`] instead — that method is
-    /// strict-rw and does NOT consult the read-only list or the
-    /// device-file allowlist.
+    /// [`Self::is_resolved_path_allowed`] instead.
     pub fn is_resolved_path_readable(&self, resolved: &Path) -> bool {
         // Universal POSIX device files: any operator running on Linux,
         // macOS, or BSD expects these to be readable. Adding them to
@@ -1582,12 +1633,23 @@ impl SecurityPolicy {
             }
         }
 
-        if self.is_resolved_path_allowed(resolved) {
+        // Workspace + read-write allowlist + read-only allowlist.
+        // Inlined rather than delegating to `is_resolved_path_allowed`
+        // so the write-only allowlist is intentionally NOT in scope
+        // here.
+        let workspace_root = self
+            .workspace_dir
+            .canonicalize()
+            .unwrap_or_else(|_| self.workspace_dir.clone());
+        if resolved.starts_with(&workspace_root) {
             return true;
         }
-
-        // Read-only allowlist — paths the operator explicitly granted
-        // read access to (but not write).
+        for root in &self.allowed_roots {
+            let canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
+            if resolved.starts_with(&canonical) {
+                return true;
+            }
+        }
         for root in &self.allowed_roots_read_only {
             let canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
             if resolved.starts_with(&canonical) {
@@ -1595,11 +1657,28 @@ impl SecurityPolicy {
             }
         }
 
+        // Forbidden paths gate after the explicit allowlists so the
+        // allowlists can coexist with broad default forbidden roots
+        // such as `/home` and `/tmp`.
+        for forbidden in &self.forbidden_paths {
+            let forbidden_path = expand_user_path(forbidden);
+            if resolved.starts_with(&forbidden_path) {
+                return false;
+            }
+        }
+        if !self.workspace_only {
+            return true;
+        }
         false
     }
 
-    /// Validate that a resolved path is inside the workspace or an allowed root.
-    /// Call this AFTER joining `workspace_dir` + relative path and canonicalizing.
+    /// Validate that a resolved path is inside the workspace or an
+    /// allowed root for write-side tools. Call this AFTER joining
+    /// `workspace_dir` + relative path and canonicalizing.
+    ///
+    /// Sees `allowed_roots` (read+write) AND
+    /// `allowed_roots_write_only` (write-only). Read-only allowlist
+    /// entries are NOT honored; that's the read-side tier.
     pub fn is_resolved_path_allowed(&self, resolved: &Path) -> bool {
         // Prefer canonical workspace root so `/a/../b` style config paths don't
         // cause false positives or negatives.
@@ -1615,6 +1694,16 @@ impl SecurityPolicy {
         // forbidden checks so explicit allowlists can coexist with broad
         // default forbidden roots such as `/home` and `/tmp`.
         for root in &self.allowed_roots {
+            let canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
+            if resolved.starts_with(&canonical) {
+                return true;
+            }
+        }
+
+        // Write-only cross-agent grants land here. The bot can write
+        // under these paths but `is_resolved_path_readable` does not
+        // see them — `AccessMode::Write` is one-way by design.
+        for root in &self.allowed_roots_write_only {
             let canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
             if resolved.starts_with(&canonical) {
                 return true;
@@ -1762,14 +1851,16 @@ impl SecurityPolicy {
         }
     }
 
-    /// Check whether the given raw path (before canonicalization) falls under
-    /// an `allowed_roots` entry. Tilde expansion is applied to the path
-    /// before comparison. This is useful for tool-level pre-checks that want
-    /// to allow absolute paths that are explicitly permitted by policy.
+    /// Check whether the given raw path (before canonicalization)
+    /// falls under an `allowed_roots` (read+write) OR
+    /// `allowed_roots_write_only` entry. Tilde expansion is applied to
+    /// the path before comparison. This is useful for tool-level
+    /// pre-checks that want to allow absolute paths the policy
+    /// explicitly permits to write.
     ///
-    /// **Read+write semantics.** Use this from write-side tools
-    /// (`file_write`, `git_operations`, shell). Read-side tools should
-    /// use [`Self::is_under_any_allowed_root`] so a cross-agent
+    /// **Write-side semantics.** Use this from write-side tools
+    /// (`file_write`, `git_operations`, shell). Read-side tools
+    /// should use [`Self::is_under_any_allowed_root`] so a cross-agent
     /// `AccessMode::Read` grant allows the read.
     pub fn is_under_allowed_root(&self, path: &str) -> bool {
         let expanded = expand_user_path(path);
@@ -1777,6 +1868,7 @@ impl SecurityPolicy {
             return false;
         }
         roots_contain(&self.allowed_roots, &expanded)
+            || roots_contain(&self.allowed_roots_write_only, &expanded)
     }
 
     /// Check whether the given raw path falls under a read-only allowed
@@ -1795,11 +1887,15 @@ impl SecurityPolicy {
         roots_contain(&self.allowed_roots_read_only, &expanded)
     }
 
-    /// Check whether the given raw path falls under EITHER an
-    /// `allowed_roots` (rw) OR an `allowed_roots_read_only` entry.
-    /// Read-side tools (`file_read`, `glob_search`, `content_search`)
-    /// should call this; write-side tools must use the rw-only
-    /// [`Self::is_under_allowed_root`].
+    /// Check whether the given raw path falls under
+    /// `allowed_roots` (rw), `allowed_roots_read_only`, OR
+    /// `allowed_roots_write_only`. Read-side tools (`file_read`,
+    /// `pdf_read`, `glob_search`, `content_search`) call
+    /// [`Self::is_resolved_path_readable`] for the resolved-path form,
+    /// which intentionally excludes the write-only tier. This raw-path
+    /// helper is the union of all three, used where read+write tools
+    /// share an entry point and the resolved-path check splits the
+    /// directionality afterward.
     #[must_use]
     pub fn is_under_any_allowed_root(&self, path: &str) -> bool {
         self.is_under_allowed_root(path) || self.is_under_read_only_allowed_root(path)
@@ -1861,6 +1957,16 @@ impl SecurityPolicy {
                 .any(|p| path_contains(p, root));
             if !in_parent_rw && !in_parent_ro {
                 return Err(EscalationViolation::ReadOnlyRootNotInParent { path: root.clone() });
+            }
+        }
+        for root in &self.allowed_roots_write_only {
+            let in_parent_rw = parent.allowed_roots.iter().any(|p| path_contains(p, root));
+            let in_parent_wo = parent
+                .allowed_roots_write_only
+                .iter()
+                .any(|p| path_contains(p, root));
+            if !in_parent_rw && !in_parent_wo {
+                return Err(EscalationViolation::WriteOnlyRootNotInParent { path: root.clone() });
             }
         }
         for cmd in &self.allowed_commands {
@@ -1966,11 +2072,14 @@ impl SecurityPolicy {
                     }
                 })
                 .collect(),
-            // RiskProfileConfig has no read-only-roots concept; the
-            // multi-agent runtime populates this list when it builds
-            // a per-agent policy from the workspace.access map,
-            // turning AccessMode::Read entries into read-only roots.
+            // RiskProfileConfig has no read-only or write-only roots
+            // concept; the multi-agent runtime populates these lists
+            // when it builds a per-agent policy from the
+            // workspace.access map, turning `AccessMode::Read` and
+            // `AccessMode::Write` entries into the corresponding
+            // tiers.
             allowed_roots_read_only: Vec::new(),
+            allowed_roots_write_only: Vec::new(),
             max_actions_per_hour: risk_profile.max_actions_per_hour,
             max_cost_per_day_cents: risk_profile.max_cost_per_day_cents,
             require_approval_for_medium_risk: risk_profile.require_approval_for_medium_risk,
@@ -2009,8 +2118,10 @@ impl SecurityPolicy {
                     crate::multi_agent::AccessMode::Read => {
                         policy.allowed_roots_read_only.push(sibling_dir);
                     }
-                    crate::multi_agent::AccessMode::Write
-                    | crate::multi_agent::AccessMode::ReadWrite => {
+                    crate::multi_agent::AccessMode::Write => {
+                        policy.allowed_roots_write_only.push(sibling_dir);
+                    }
+                    crate::multi_agent::AccessMode::ReadWrite => {
                         policy.allowed_roots.push(sibling_dir);
                     }
                 }
@@ -3517,8 +3628,15 @@ mod tests {
         let readonly_sibling_dir = cfg.agent_workspace_dir("readonly_sibling");
 
         assert!(
-            policy.allowed_roots.contains(&writable_sibling_dir),
-            "AccessMode::Write must land in allowed_roots; got {:?}",
+            policy
+                .allowed_roots_write_only
+                .contains(&writable_sibling_dir),
+            "AccessMode::Write must land in allowed_roots_write_only; got {:?}",
+            policy.allowed_roots_write_only
+        );
+        assert!(
+            !policy.allowed_roots.contains(&writable_sibling_dir),
+            "AccessMode::Write must NOT land in allowed_roots (read+write tier); got {:?}",
             policy.allowed_roots
         );
         assert!(
@@ -3535,9 +3653,42 @@ mod tests {
             "Write-mode entry must NOT also appear on the read-only list"
         );
         assert!(
+            !policy
+                .allowed_roots_write_only
+                .contains(&readonly_sibling_dir),
+            "Read-mode entry must NOT also appear on the write-only list"
+        );
+        assert!(
             policy.workspace_only,
             "unrestricted_filesystem stays default-false → workspace_only stays true"
         );
+    }
+
+    #[test]
+    fn write_only_root_blocks_reads_and_admits_writes() {
+        // AccessMode::Write grants write access without read access.
+        // is_resolved_path_allowed (write-side) must accept paths under
+        // a write-only root; is_resolved_path_readable (read-side) must
+        // refuse them.
+        let mut policy = SecurityPolicy::default();
+        let write_only_root =
+            std::env::temp_dir().join(format!("zeroclaw_wo_root_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&write_only_root).unwrap();
+        let canonical = write_only_root.canonicalize().unwrap();
+        policy.allowed_roots_write_only.push(canonical.clone());
+        policy.workspace_only = false;
+
+        let target = canonical.join("write_only_target.txt");
+        assert!(
+            policy.is_resolved_path_allowed(&target),
+            "write-only root must be writable via is_resolved_path_allowed"
+        );
+        assert!(
+            !policy.is_resolved_path_readable(&target),
+            "write-only root must NOT be readable via is_resolved_path_readable"
+        );
+
+        let _ = std::fs::remove_dir_all(canonical);
     }
 
     #[test]

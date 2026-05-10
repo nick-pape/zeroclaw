@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use chrono::Local;
 use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension, params};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -1535,17 +1535,13 @@ impl Memory for SqliteMemory {
         since: Option<&str>,
         until: Option<&str>,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
-        // Empty allowlist means "no agent filter" — fall back to plain
-        // recall without the WHERE agent_id IN clause. (The wrapper
-        // always includes the bound agent's UUID, so a non-empty
-        // allowlist is the live-runtime case.)
+        // Empty allowlist means "no agent filter": fall back to plain
+        // recall. The wrapper always includes the bound agent's UUID,
+        // so a non-empty allowlist is the live-runtime case.
         if allowed_agent_ids.is_empty() {
             return self.recall(query, limit, session_id, since, until).await;
         }
 
-        // Over-fetch so the agent_id filter doesn't undercount the
-        // requested limit. The lookup that follows is a single round-
-        // trip indexed query, so the extra rows are cheap.
         let raw = self
             .recall(query, limit.saturating_mul(4), session_id, since, until)
             .await?;
@@ -1553,50 +1549,55 @@ impl Memory for SqliteMemory {
             return Ok(Vec::new());
         }
 
-        let allowed: HashSet<String> = allowed_agent_ids.iter().map(|s| (*s).to_string()).collect();
         let conn = self.conn.clone();
         let ids: Vec<String> = raw.iter().map(|e| e.id.clone()).collect();
+        let allowed: Vec<String> = allowed_agent_ids.iter().map(|s| (*s).to_string()).collect();
 
-        let agent_id_map: HashMap<String, Option<String>> = tokio::task::spawn_blocking(
-            move || -> anyhow::Result<HashMap<String, Option<String>>> {
+        // Single SQL pass that returns only the candidate IDs whose
+        // agent_id is on the allowlist. Legacy NULL-agent_id rows do
+        // not match (the V3 migration backfills `default`, and the
+        // NOT NULL FK rejects new NULLs), so cross-agent leakage of
+        // unattributed rows that an earlier post-fetch fall-through
+        // would have allowed is closed at the query boundary.
+        let kept: HashSet<String> =
+            tokio::task::spawn_blocking(move || -> anyhow::Result<HashSet<String>> {
                 let conn = conn.lock();
-                let placeholders: String = (1..=ids.len())
+                let id_placeholders: String = (1..=ids.len())
                     .map(|i| format!("?{i}"))
                     .collect::<Vec<_>>()
                     .join(", ");
-                let sql = format!("SELECT id, agent_id FROM memories WHERE id IN ({placeholders})");
+                let agent_placeholders: String = (ids.len() + 1..=ids.len() + allowed.len())
+                    .map(|i| format!("?{i}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let sql = format!(
+                    "SELECT id FROM memories \
+                     WHERE id IN ({id_placeholders}) \
+                       AND agent_id IN ({agent_placeholders})"
+                );
                 let mut stmt = conn.prepare(&sql)?;
-                let id_params: Vec<Box<dyn rusqlite::types::ToSql>> = ids
-                    .iter()
-                    .cloned()
-                    .map(|i| Box::new(i) as Box<dyn rusqlite::types::ToSql>)
-                    .collect();
-                let params_ref: Vec<&dyn rusqlite::types::ToSql> =
-                    id_params.iter().map(AsRef::as_ref).collect();
-                let rows = stmt.query_map(params_ref.as_slice(), |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
-                })?;
-                let mut map = HashMap::new();
-                for row in rows {
-                    let (id, aid) = row?;
-                    map.insert(id, aid);
+                let mut params: Vec<Box<dyn rusqlite::types::ToSql>> =
+                    Vec::with_capacity(ids.len() + allowed.len());
+                for id in &ids {
+                    params.push(Box::new(id.clone()) as Box<dyn rusqlite::types::ToSql>);
                 }
-                Ok(map)
-            },
-        )
-        .await??;
+                for aid in &allowed {
+                    params.push(Box::new(aid.clone()) as Box<dyn rusqlite::types::ToSql>);
+                }
+                let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+                    params.iter().map(AsRef::as_ref).collect();
+                let rows = stmt.query_map(params_ref.as_slice(), |row| row.get::<_, String>(0))?;
+                let mut set = HashSet::new();
+                for row in rows {
+                    set.insert(row?);
+                }
+                Ok(set)
+            })
+            .await??;
 
-        // Filter: keep entries whose agent_id is on the allowlist, plus
-        // legacy NULL-agent_id rows. The backfill stamps existing rows
-        // as the default agent, so NULLs only appear on installs that
-        // pre-date the multi-agent migration entirely.
         Ok(raw
             .into_iter()
-            .filter(|e| match agent_id_map.get(&e.id) {
-                Some(Some(aid)) => allowed.contains(aid),
-                Some(None) => true,
-                None => false,
-            })
+            .filter(|e| kept.contains(&e.id))
             .take(limit)
             .collect())
     }

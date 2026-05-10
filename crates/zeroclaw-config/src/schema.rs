@@ -2820,8 +2820,11 @@ impl Config {
     /// `<install>/workspace/` is migrated into the default agent's
     /// slot on first boot. Per-agent code paths (identity-file load,
     /// `SecurityPolicy::for_agent`, the memory factory) consult this
-    /// method rather than `config.workspace_dir`, which stays as the
-    /// install's legacy primary workspace anchor.
+    /// method directly. `config.workspace_dir` points at the
+    /// default agent's per-agent workspace (the same path this method
+    /// returns for `"default"`) so legacy install-wide callers that
+    /// have not yet migrated to `agent_workspace_dir(alias)` read the
+    /// live agent workspace rather than an orphaned legacy path.
     #[must_use]
     pub fn agent_workspace_dir(&self, agent_alias: &str) -> std::path::PathBuf {
         if let Some(cfg) = self.agents.get(agent_alias)
@@ -12059,12 +12062,12 @@ impl Default for Config {
 
 fn default_config_and_workspace_dirs() -> Result<(PathBuf, PathBuf)> {
     let config_dir = default_config_dir()?;
-    // `config.workspace_dir` is the install's primary workspace dir.
-    // Per-agent workspaces live at `<install>/agents/<alias>/workspace/`
-    // and are resolved on demand by
-    // `Config::agent_workspace_dir(alias)`, not from this function.
-    // The legacy path stays as a stable install-wide anchor for tools
-    // that aren't yet agent-aware.
+    // The second value is the legacy single-workspace path. It is
+    // input to the V3 filesystem migration (which moves its contents
+    // into `<install>/agents/default/workspace/`) and to the
+    // `resolve_runtime_dirs_for_onboarding` API. After
+    // `Config::load_or_init` completes, `config.workspace_dir` points
+    // at the per-agent default-agent workspace, not this legacy path.
     Ok((config_dir.clone(), config_dir.join("workspace")))
 }
 
@@ -12410,29 +12413,46 @@ impl Config {
     pub async fn load_or_init() -> Result<Self> {
         let (default_zeroclaw_dir, default_workspace_dir) = default_config_and_workspace_dirs()?;
 
+        // Resolve env overrides FIRST so the migration runs against
+        // the install root the operator actually uses. Running the
+        // migration against `default_zeroclaw_dir` would silently skip
+        // any install reached via `ZEROCLAW_CONFIG_DIR` or
+        // `ZEROCLAW_WORKSPACE`.
+        let (zeroclaw_dir, _legacy_workspace_dir, resolution_source) =
+            resolve_runtime_config_dirs(&default_zeroclaw_dir, &default_workspace_dir).await?;
+
         // One-time, upgrade-only move of `<install>/workspace/` into
         // `<install>/agents/default/workspace/` so legacy single-
         // workspace installs land in the per-agent layout. The
-        // "default" alias is the transition bridge — V3 schema
+        // "default" alias is the transition bridge: V3 schema
         // migration synthesizes the matching `agents.default` config
         // entry, so the moved dir always lines up with a real agent.
         // Idempotent: no-op on fresh installs and on already-migrated
-        // installs. Per-agent runtime code paths resolve their own
-        // workspace dir via `Config::agent_workspace_dir(alias)`, not
-        // from `config.workspace_dir`.
-        if default_zeroclaw_dir.is_dir()
+        // installs.
+        if zeroclaw_dir.is_dir()
             && let Err(e) =
-                crate::migration::migrate_legacy_workspace_to_default_agent(&default_zeroclaw_dir)
+                crate::migration::migrate_legacy_workspace_to_default_agent(&zeroclaw_dir)
         {
             tracing::warn!(
                 "[system] filesystem migration failed (continuing with legacy layout): {e}"
             );
         }
 
-        let (zeroclaw_dir, workspace_dir, resolution_source) =
-            resolve_runtime_config_dirs(&default_zeroclaw_dir, &default_workspace_dir).await?;
-
         let config_path = zeroclaw_dir.join("config.toml");
+
+        // V3 default-agent workspace anchor. Per-agent code paths
+        // (identity load, `SecurityPolicy::for_agent`, the memory
+        // factory) resolve via `Config::agent_workspace_dir(alias)`;
+        // legacy install-wide callers (`cost::CostTracker`,
+        // `plugins::PluginHost`, `sop`, `skills`, `memory CLI`) read
+        // `config.workspace_dir`, which now points at the migrated
+        // default-agent workspace so a freshly opened SQLite memory
+        // file lands in the same place the migration deposited the
+        // legacy DB.
+        let workspace_dir = zeroclaw_dir
+            .join("agents")
+            .join("default")
+            .join("workspace");
 
         fs::create_dir_all(&zeroclaw_dir)
             .await
@@ -16885,7 +16905,16 @@ model = "primary-model"
 
         let config = Box::pin(Config::load_or_init()).await.unwrap();
 
-        assert_eq!(config.workspace_dir, workspace_dir.join("workspace"));
+        // V3: config.workspace_dir is the per-agent default workspace
+        // under the resolved install root, not the legacy
+        // <install>/workspace/.
+        assert_eq!(
+            config.workspace_dir,
+            workspace_dir
+                .join("agents")
+                .join("default")
+                .join("workspace")
+        );
         assert_eq!(config.config_path, workspace_dir.join("config.toml"));
         assert!(workspace_dir.join("config.toml").exists());
 
@@ -16907,7 +16936,8 @@ model = "primary-model"
         let temp_home =
             std::env::temp_dir().join(format!("zeroclaw_test_home_{}", uuid::Uuid::new_v4()));
         let workspace_dir = temp_home.join("workspace");
-        let legacy_config_path = temp_home.join(".zeroclaw").join("config.toml");
+        let legacy_config_dir = temp_home.join(".zeroclaw");
+        let legacy_config_path = legacy_config_dir.join("config.toml");
 
         let original_home = std::env::var("HOME").ok();
         // SAFETY: test-only, single-threaded test runner.
@@ -16917,7 +16947,19 @@ model = "primary-model"
 
         let config = Box::pin(Config::load_or_init()).await.unwrap();
 
-        assert_eq!(config.workspace_dir, workspace_dir);
+        // V3: config.workspace_dir is the default agent's per-agent
+        // workspace under the resolved config dir. The
+        // ZEROCLAW_WORKSPACE env var resolved the install root via
+        // `resolve_config_dir_for_workspace`; the legacy
+        // <workspace_dir>/ path is the migration's input, not the
+        // post-load workspace anchor.
+        assert_eq!(
+            config.workspace_dir,
+            legacy_config_dir
+                .join("agents")
+                .join("default")
+                .join("workspace")
+        );
         assert_eq!(config.config_path, legacy_config_path);
         assert!(config.config_path.exists());
 
@@ -16960,7 +17002,16 @@ default_model = "legacy-model"
 
         let config = Box::pin(Config::load_or_init()).await.unwrap();
 
-        assert_eq!(config.workspace_dir, workspace_dir);
+        // V3: config.workspace_dir resolves to the default agent's
+        // per-agent workspace under the legacy config dir, regardless
+        // of the ZEROCLAW_WORKSPACE override.
+        assert_eq!(
+            config.workspace_dir,
+            legacy_config_dir
+                .join("agents")
+                .join("default")
+                .join("workspace")
+        );
         assert_eq!(config.config_path, legacy_config_path);
         assert_eq!(
             config
@@ -17077,7 +17128,15 @@ default_model = "persisted-profile"
         drop(guard);
         let logs = capture.captured();
 
-        assert_eq!(config.workspace_dir, workspace_dir.join("workspace"));
+        // V3: per-agent default-agent workspace under the resolved
+        // install root.
+        assert_eq!(
+            config.workspace_dir,
+            workspace_dir
+                .join("agents")
+                .join("default")
+                .join("workspace")
+        );
         assert_eq!(config.config_path, config_path);
         assert_eq!(
             config
