@@ -9,14 +9,12 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, Utc};
 use parking_lot::Mutex;
 use rusqlite::{Connection, params};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use zeroclaw_api::model_provider::ChatMessage;
 
 /// SQLite-backed session store with FTS5 and WAL mode.
 pub struct SqliteSessionBackend {
     conn: Mutex<Connection>,
-    #[allow(dead_code)]
-    db_path: PathBuf,
 }
 
 impl SqliteSessionBackend {
@@ -110,7 +108,6 @@ impl SqliteSessionBackend {
 
         Ok(Self {
             conn: Mutex::new(conn),
-            db_path,
         })
     }
 

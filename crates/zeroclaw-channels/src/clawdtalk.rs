@@ -23,9 +23,6 @@ pub struct ClawdTalkChannel {
     allowed_destinations: Vec<String>,
     /// HTTP client for Telnyx API
     client: Client,
-    /// Webhook secret for verifying incoming calls (used during webhook verification)
-    #[allow(dead_code)]
-    webhook_secret: Option<String>,
 }
 
 impl ClawdTalkChannel {
@@ -40,7 +37,6 @@ impl ClawdTalkChannel {
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
                 .unwrap_or_else(|_| Client::new()),
-            webhook_secret: config.webhook_secret,
         }
     }
 

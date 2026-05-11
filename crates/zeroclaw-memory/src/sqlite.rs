@@ -8,7 +8,7 @@ use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::HashSet;
 use std::fmt::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::mpsc;
 use std::thread;
@@ -33,8 +33,6 @@ const CURRENT_SCHEMA_VERSION: i64 = 1;
 /// - **Safe Reindex**: temp DB → seed → sync → atomic swap → rollback
 pub struct SqliteMemory {
     conn: Arc<Mutex<Connection>>,
-    #[allow(dead_code)] // stored for potential future use (e.g., reindex, diagnostics)
-    db_path: PathBuf,
     embedder: Arc<dyn EmbeddingProvider>,
     vector_weight: f32,
     keyword_weight: f32,
@@ -78,7 +76,6 @@ impl SqliteMemory {
         Self::migrate_multi_agent(&db_path, &conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
-            db_path,
             embedder: Arc::new(super::embeddings::NoopEmbedding),
             vector_weight: 0.7,
             keyword_weight: 0.3,
@@ -132,7 +129,6 @@ impl SqliteMemory {
 
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
-            db_path,
             embedder,
             vector_weight,
             keyword_weight,

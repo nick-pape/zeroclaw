@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use chrono::Local;
 use parking_lot::Mutex;
 use rusqlite::{Connection, params};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 /// Audit log entry operations.
@@ -40,8 +40,6 @@ impl std::fmt::Display for AuditOp {
 pub struct AuditedMemory<M: Memory> {
     inner: M,
     audit_conn: Arc<Mutex<Connection>>,
-    #[allow(dead_code)]
-    db_path: PathBuf,
 }
 
 impl<M: Memory> AuditedMemory<M> {
@@ -71,7 +69,6 @@ impl<M: Memory> AuditedMemory<M> {
         Ok(Self {
             inner,
             audit_conn: Arc::new(Mutex::new(conn)),
-            db_path,
         })
     }
 
