@@ -10,11 +10,13 @@
 //! step that performs the transform is broken, the test fails.
 
 use zeroclaw_config::migration::{
-    CURRENT_SCHEMA_VERSION, MigrateReport, detect_version, ensure_disk_at_current_version,
-    migrate_file, migrate_file_in_place, migrate_to_current,
+    CURRENT_SCHEMA_VERSION, GenerateOptions, MigrateReport, detect_version,
+    ensure_disk_at_current_version, generate, migrate_file, migrate_file_in_place,
+    migrate_to_current,
 };
 use zeroclaw_config::schema::Config;
 use zeroclaw_config::schema::v2::V2Config;
+use zeroclaw_config::secrets::SecretStore;
 
 const V1_FIXTURE: &str = include_str!("../fixtures/v1.toml");
 
@@ -1912,4 +1914,319 @@ enabled = false
             .is_none_or(str::is_empty),
         "heartbeat.agent must stay empty when heartbeat is disabled"
     );
+}
+
+// ─────────────────────────────────────────────────────────────
+// `zeroclaw config generate <version>` end-to-end regression
+// guards.
+//
+// These tests run the same `generate()` function the CLI invokes,
+// then push the output through the typed migration chain and the
+// V3 schema validator. A break in any of the following surfaces
+// fails one of these tests:
+//
+// - V1Config / V2Config typed lens drifts away from real V1/V2 TOML
+// - V2→V3 migration starts dropping or mistyping a section
+// - A new required V3 schema field lands without a default and
+//   without a corresponding migration synthesis step
+// - V3 `Config::validate()` grows a new check that the V1 fixture
+//   doesn't satisfy
+// - `encrypt_secret_strings` stops covering a known secret key name
+//
+// Lower bounds (section counts, presence of named sections) are
+// preferred over exact equality so adding new sections or aliases
+// doesn't break the suite — only removals / regressions do.
+// ─────────────────────────────────────────────────────────────
+
+#[test]
+fn generate_every_version_migrates_and_validates() {
+    for target in 1..=CURRENT_SCHEMA_VERSION {
+        let raw = generate(target, &GenerateOptions::default())
+            .unwrap_or_else(|e| panic!("generate({target}) failed: {e:#}"));
+        let cfg = migrate_to_current(&raw).unwrap_or_else(|e| {
+            panic!("generate({target}) output failed to migrate to current schema: {e:#}")
+        });
+        // Validation rejects dangling references and structural mismatches.
+        // A green load here means the typed chain plus the V3 validator
+        // accept the generated config end-to-end. We tolerate `Err` only
+        // when validate() surfaces a known-by-design fixture artifact
+        // (the V1 fixture intentionally has an empty
+        // `[model_providers.claude-code]` block, which Config::validate
+        // does NOT reject — it just warns at load time).
+        cfg.validate()
+            .unwrap_or_else(|e| panic!("generate({target}) output fails Config::validate: {e:#}"));
+    }
+}
+
+#[test]
+fn generate_current_emits_at_current_schema_version() {
+    let raw = generate(CURRENT_SCHEMA_VERSION, &GenerateOptions::default())
+        .expect("generate current succeeds");
+    let parsed: toml::Value = toml::from_str(&raw).expect("generated output parses as TOML");
+    assert_eq!(
+        parsed
+            .get("schema_version")
+            .and_then(toml::Value::as_integer),
+        Some(i64::from(CURRENT_SCHEMA_VERSION)),
+        "generate(CURRENT) must stamp the current schema_version"
+    );
+}
+
+#[test]
+fn generate_v1_is_v1_shape() {
+    let raw = generate(1, &GenerateOptions::default()).expect("generate v1 succeeds");
+    let parsed: toml::Value = toml::from_str(&raw).expect("v1 parses");
+    let table = parsed.as_table().expect("root is a table");
+    // V1 had no `schema_version` key — the absence is how V1 is detected.
+    assert!(
+        !table.contains_key("schema_version"),
+        "V1 output must not carry a schema_version key (V1 predates the field)"
+    );
+    // V1 lives in `channels_config`; V2 renames to `channels`.
+    assert!(
+        table.contains_key("channels_config"),
+        "V1 output uses the V1 channel-section name `channels_config`"
+    );
+    assert!(
+        !table.contains_key("channels"),
+        "V1 output must not carry the V2+ `channels` name yet"
+    );
+    // V1 stores provider entries flat at `[model_providers.<id>]`.
+    let mp = table
+        .get("model_providers")
+        .and_then(toml::Value::as_table)
+        .expect("V1 has [model_providers] at top level");
+    assert!(
+        mp.contains_key("anthropic"),
+        "V1 model_providers carries the anthropic entry"
+    );
+}
+
+#[test]
+fn generate_v2_is_v2_shape() {
+    let raw = generate(2, &GenerateOptions::default()).expect("generate v2 succeeds");
+    let parsed: toml::Value = toml::from_str(&raw).expect("v2 parses");
+    let table = parsed.as_table().expect("root is a table");
+    assert_eq!(
+        table
+            .get("schema_version")
+            .and_then(toml::Value::as_integer),
+        Some(2),
+        "V2 output stamps schema_version = 2"
+    );
+    // V2 renamed channels_config → channels.
+    assert!(
+        table.contains_key("channels"),
+        "V2 output uses `channels` (renamed from V1 `channels_config`)"
+    );
+    assert!(
+        !table.contains_key("channels_config"),
+        "V2 must not carry the V1 channel-section name"
+    );
+    // V2 nests model_providers under `[providers.models]`; V3 hoists them.
+    let providers = table
+        .get("providers")
+        .and_then(toml::Value::as_table)
+        .expect("V2 has top-level [providers] block");
+    assert!(
+        providers.contains_key("models"),
+        "V2 nests provider entries under providers.models"
+    );
+    assert!(
+        !table.contains_key("model_providers"),
+        "V2 has not hoisted model_providers to top level yet (V3 does that)"
+    );
+}
+
+#[test]
+fn generate_v3_covers_every_v3_top_level_section() {
+    // Lower-bound presence check: each section listed here is one a
+    // real install will have populated and that the V1 fixture is
+    // expected to migrate through. Adding new sections to V3 is fine —
+    // only removing one of these (or breaking its migration) fails.
+    let cfg = migrate_to_current(
+        &generate(CURRENT_SCHEMA_VERSION, &GenerateOptions::default())
+            .expect("generate current succeeds"),
+    )
+    .expect("generated current schema migrates");
+
+    assert!(
+        cfg.agents.contains_key("simple_agent"),
+        "agents.simple_agent synthesized from V1 inline-brain agent"
+    );
+    assert!(
+        cfg.agents.contains_key("complex_agent"),
+        "agents.complex_agent synthesized from V1 inline-brain agent"
+    );
+    assert!(
+        cfg.risk_profiles.contains_key("default"),
+        "[autonomy] migrated to [risk_profiles.default]"
+    );
+    assert!(
+        cfg.runtime_profiles.contains_key("default"),
+        "[agent] migrated to [runtime_profiles.default]"
+    );
+    assert!(
+        cfg.cron.contains_key("morning_digest"),
+        "cron job migrated from V1 cron.jobs[].name to [cron.<alias>] keyed entry"
+    );
+    assert!(
+        cfg.scheduler.enabled,
+        "[scheduler] populated from V1 [cron] subsystem knobs"
+    );
+    assert!(
+        !cfg.tts_providers.openai.is_empty(),
+        "tts.openai promoted to tts_providers.openai.default"
+    );
+    assert!(
+        !cfg.transcription_providers.groq.is_empty(),
+        "[transcription] Groq fields promoted to transcription_providers.groq.default"
+    );
+    assert!(
+        !cfg.storage.qdrant.is_empty(),
+        "[memory.qdrant] promoted to [storage.qdrant.default]"
+    );
+    assert!(
+        !cfg.storage.postgres.is_empty(),
+        "[memory.postgres] vector fields promoted to [storage.postgres.default]"
+    );
+    assert!(
+        !cfg.peer_groups.is_empty(),
+        "channel allow-list fields fold into peer_groups during V2→V3"
+    );
+    // Comprehensive-fixture markers: each of these is a top-level V3
+    // section the fixture covers. Drop one and the regression suite
+    // surfaces it.
+    assert!(cfg.gateway.require_pairing, "gateway block carried through");
+    assert!(cfg.backup.enabled, "backup block carried through");
+    assert!(cfg.heartbeat.enabled, "heartbeat block carried through");
+    assert!(cfg.web_search.enabled, "web_search block carried through");
+    assert!(cfg.mcp.enabled, "mcp block carried through");
+    assert!(cfg.trust.initial_score > 0.0, "trust block carried through");
+}
+
+#[test]
+fn generate_v3_channel_breadth_lower_bound() {
+    // The V1 fixture covers a wide channel surface. Lower-bound count
+    // catches accidental loss of a whole channel during migration.
+    // Raise the bound only when adding more channels to the fixture.
+    const MIN_CHANNEL_ALIASES: usize = 25;
+
+    let cfg = migrate_to_current(
+        &generate(CURRENT_SCHEMA_VERSION, &GenerateOptions::default())
+            .expect("generate current succeeds"),
+    )
+    .expect("generated V3 migrates");
+
+    let alias_count = cfg.channels.telegram.len()
+        + cfg.channels.discord.len()
+        + cfg.channels.slack.len()
+        + cfg.channels.mattermost.len()
+        + cfg.channels.webhook.len()
+        + cfg.channels.imessage.len()
+        + cfg.channels.matrix.len()
+        + cfg.channels.signal.len()
+        + cfg.channels.whatsapp.len()
+        + cfg.channels.linq.len()
+        + cfg.channels.wati.len()
+        + cfg.channels.nextcloud_talk.len()
+        + cfg.channels.mqtt.len()
+        + cfg.channels.irc.len()
+        + cfg.channels.lark.len()
+        + cfg.channels.line.len()
+        + cfg.channels.dingtalk.len()
+        + cfg.channels.wecom.len()
+        + cfg.channels.wechat.len()
+        + cfg.channels.qq.len()
+        + cfg.channels.twitter.len()
+        + cfg.channels.mochat.len()
+        + cfg.channels.reddit.len()
+        + cfg.channels.bluesky.len()
+        + cfg.channels.email.len()
+        + cfg.channels.gmail_push.len()
+        + cfg.channels.clawdtalk.len()
+        + cfg.channels.voice_call.len();
+
+    assert!(
+        alias_count >= MIN_CHANNEL_ALIASES,
+        "generate(V3) channel breadth dropped: expected ≥ {MIN_CHANNEL_ALIASES} \
+         channel aliases across all types, got {alias_count}. Most likely \
+         cause: a V1 channel block got silently dropped during migration."
+    );
+}
+
+#[test]
+fn generate_with_encrypt_produces_enc2_ciphertext_at_every_version() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let store = SecretStore::new(tmp.path(), true);
+
+    for target in 1..=CURRENT_SCHEMA_VERSION {
+        let raw = generate(
+            target,
+            &GenerateOptions {
+                encrypt_secrets: true,
+                secret_store_dir: Some(tmp.path()),
+            },
+        )
+        .unwrap_or_else(|e| panic!("generate({target}) --encrypt failed: {e:#}"));
+
+        // The output must contain enc2: ciphertext (at least one secret
+        // was encrypted) and must not contain any of the well-known
+        // plaintext fixture secrets.
+        assert!(
+            raw.contains("enc2:"),
+            "generate({target}) --encrypt produced no enc2: ciphertext"
+        );
+        for plaintext in &[
+            "sk-v1-test-global",
+            "matrix-bot-token",
+            "discord-bot-token-v1",
+            "telegram-bot-token-v1",
+            "bsky-app-password",
+            "qdrant-api-key",
+            "pg-password",
+        ] {
+            assert!(
+                !raw.contains(plaintext),
+                "generate({target}) --encrypt leaked plaintext secret {plaintext:?}"
+            );
+        }
+
+        // Round-trip a known leaf back through decrypt to prove the
+        // ciphertext is real (not just a literal `enc2:` prefix).
+        let parsed: toml::Value = toml::from_str(&raw).expect("encrypted output parses");
+        let api_key_ciphertext = find_first_string_at_key(&parsed, "api_key")
+            .unwrap_or_else(|| panic!("generate({target}) has no api_key leaf to decrypt"));
+        assert!(
+            api_key_ciphertext.starts_with("enc2:"),
+            "generate({target}) api_key leaf must be enc2: ciphertext, got {api_key_ciphertext:?}"
+        );
+        let plaintext = store
+            .decrypt(&api_key_ciphertext)
+            .unwrap_or_else(|e| panic!("generate({target}) api_key failed to decrypt: {e:#}"));
+        assert!(
+            !plaintext.is_empty(),
+            "generate({target}) api_key decrypted to empty string"
+        );
+    }
+}
+
+/// Walk a `toml::Value` and return the first string leaf whose key
+/// matches `key`. Helper for encrypt round-trip assertions.
+fn find_first_string_at_key(value: &toml::Value, key: &str) -> Option<String> {
+    match value {
+        toml::Value::Table(t) => {
+            if let Some(toml::Value::String(s)) = t.get(key) {
+                return Some(s.clone());
+            }
+            for child in t.values() {
+                if let Some(found) = find_first_string_at_key(child, key) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        toml::Value::Array(items) => items.iter().find_map(|v| find_first_string_at_key(v, key)),
+        _ => None,
+    }
 }
