@@ -964,41 +964,66 @@ pub async fn run_gateway(
         }
     }
 
-    // Resolve web_dist_dir: explicit config → auto-detect common locations
-    let web_dist_dir: Option<std::path::PathBuf> = config
+    // Resolve web_dist_dir: explicit config (when valid) → auto-detect.
+    // Treat the configured path as advisory — if it doesn't contain
+    // index.html on this machine (stale/leaked path from another host,
+    // typo, missing build), fall back to auto-detect rather than hard-
+    // failing every dashboard request. We log the demotion so the
+    // operator can spot a misconfigured path.
+    let auto_detect_web_dist = || -> Option<std::path::PathBuf> {
+        let mut candidates = vec![
+            // Relative to CWD (development: running from repo root)
+            std::path::PathBuf::from("web/dist"),
+            // Relative to binary (installed alongside binary)
+            std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.join("web/dist")))
+                .unwrap_or_default(),
+            // Docker / packaged layout
+            std::path::PathBuf::from("/zeroclaw-data/web/dist"),
+            // AUR / system package
+            std::path::PathBuf::from("/usr/share/zeroclawlabs/web/dist"),
+        ];
+        // XDG data home (prebuilt binary installer)
+        if let Some(data_dir) = dirs_data_local() {
+            candidates.push(data_dir.join("zeroclaw/web/dist"));
+        }
+        candidates
+            .into_iter()
+            .find(|p| !p.as_os_str().is_empty() && p.join("index.html").is_file())
+    };
+
+    let web_dist_dir: Option<std::path::PathBuf> = match config
         .gateway
         .web_dist_dir
         .as_ref()
         .map(std::path::PathBuf::from)
-        .or_else(|| {
-            // Auto-detect: check common locations relative to the binary and CWD
-            let mut candidates = vec![
-                // Relative to CWD (development: running from repo root)
-                std::path::PathBuf::from("web/dist"),
-                // Relative to binary (installed alongside binary)
-                std::env::current_exe()
-                    .ok()
-                    .and_then(|p| p.parent().map(|d| d.join("web/dist")))
-                    .unwrap_or_default(),
-                // Docker / packaged layout
-                std::path::PathBuf::from("/zeroclaw-data/web/dist"),
-                // AUR / system package
-                std::path::PathBuf::from("/usr/share/zeroclawlabs/web/dist"),
-            ];
-            // XDG data home (prebuilt binary installer)
-            if let Some(data_dir) = dirs_data_local() {
-                candidates.push(data_dir.join("zeroclaw/web/dist"));
-            }
-            candidates
-                .into_iter()
-                .find(|p| !p.as_os_str().is_empty() && p.join("index.html").is_file())
-        });
+    {
+        Some(explicit) if explicit.join("index.html").is_file() => Some(explicit),
+        Some(stale) => {
+            tracing::warn!(
+                configured = %stale.display(),
+                "gateway.web_dist_dir points at a path that doesn't contain index.html on \
+                 this machine; falling back to auto-detect. Update or remove the setting in \
+                 config.toml to silence this warning."
+            );
+            auto_detect_web_dist()
+        }
+        None => auto_detect_web_dist(),
+    };
 
     if let Some(ref dir) = web_dist_dir {
         tracing::info!("Web dashboard: serving from {}", dir.display());
+    } else if config.gateway.web_dist_dir.is_some() {
+        tracing::info!(
+            "Web dashboard: not available — configured gateway.web_dist_dir is missing on \
+             this machine and no fallback location was found. Build with `cargo web build` \
+             and point gateway.web_dist_dir at the resulting web/dist directory."
+        );
     } else {
         tracing::info!(
-            "Web dashboard: not available (set gateway.web_dist_dir or ZEROCLAW_WEB_DIST_DIR)"
+            "Web dashboard: not available — no web/dist found. Build with `cargo web build` \
+             and point gateway.web_dist_dir at the resulting web/dist directory."
         );
     }
 
