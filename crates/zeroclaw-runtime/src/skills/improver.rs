@@ -1,13 +1,20 @@
-// Skill self-improvement: atomically updates existing skill documents
-// after the agent uses them successfully.
+// Skill self-improvement: atomic writer + history-scanning helpers for the
+// background review fork (see `agent::loop_` post-turn hook + `tools::skill_manage`).
 //
-// in `src/skills/mod.rs`.
+// This module owns:
+// - `SkillImprover` — atomic temp+validate+rename for SKILL.toml plus cooldown
+//   tracking (in-memory and durable on-disk via the `updated_at` field).
+// - `extract_skill_executions_from_history` / `looks_like_failure` — surface a
+//   list of failed skill slugs from history that the review prompt can pass
+//   along as a hint ("these skills failed this run"), without those failures
+//   *gating* whether the fork runs.
 
 use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Instant;
 use zeroclaw_config::schema::SkillImprovementConfig;
+use zeroclaw_providers::ChatMessage;
 
 /// Manages skill self-improvement with cooldown tracking.
 pub struct SkillImprover {
@@ -26,33 +33,65 @@ impl SkillImprover {
     }
 
     /// Check whether a skill is eligible for improvement (enabled + cooldown expired).
+    ///
+    /// Combines an in-memory cooldown (fast path, per-process) with a durable
+    /// on-disk cooldown (`updated_at` field in `SKILL.toml`) so cooldowns survive
+    /// process restarts.
     pub fn should_improve_skill(&self, slug: &str) -> bool {
         if !self.config.enabled {
             return false;
         }
         if let Some(last) = self.cooldowns.get(slug) {
             let elapsed = Instant::now().saturating_duration_since(*last);
-            elapsed.as_secs() >= self.config.cooldown_secs
-        } else {
-            true
+            if elapsed.as_secs() < self.config.cooldown_secs {
+                return false;
+            }
         }
+        if self.is_on_disk_cooldown(slug) {
+            return false;
+        }
+        true
+    }
+
+    // SKILL.toml `updated_at` is bumped on every successful improvement, so its
+    // age is a durable proxy for "improved recently."
+    fn is_on_disk_cooldown(&self, slug: &str) -> bool {
+        let toml_path = self.skills_dir().join(slug).join("SKILL.toml");
+        let Ok(content) = std::fs::read_to_string(&toml_path) else {
+            return false;
+        };
+        let Ok(parsed) = content.parse::<toml::Table>() else {
+            return false;
+        };
+        let Some(updated_at) = parsed
+            .get("skill")
+            .and_then(|v| v.as_table())
+            .and_then(|t| t.get("updated_at"))
+            .and_then(|v| v.as_str())
+        else {
+            return false;
+        };
+        let Ok(ts) = chrono::DateTime::parse_from_rfc3339(updated_at) else {
+            return false;
+        };
+        let elapsed = chrono::Utc::now().signed_duration_since(ts);
+        elapsed.num_seconds() < self.config.cooldown_secs as i64
     }
 
     /// Improve an existing skill file atomically.
     ///
     /// Writes to a temp file first, validates, then renames over the original.
-    /// Returns `Ok(Some(slug))` if the skill was improved, `Ok(None)` if skipped
-    /// (disabled, cooldown active, or validation failed).
+    /// Returns `Ok(Some(slug))` if the skill was improved.
+    ///
+    /// **Caller-gated:** this does NOT check `should_improve_skill` — callers
+    /// must check that themselves before invoking, so they can also skip the
+    /// (expensive) LLM call that produces `improved_content`.
     pub async fn improve_skill(
         &mut self,
         slug: &str,
         improved_content: &str,
         improvement_reason: &str,
     ) -> Result<Option<String>> {
-        if !self.should_improve_skill(slug) {
-            return Ok(None);
-        }
-
         // Validate the improved content before writing.
         validate_skill_content(improved_content)?;
 
@@ -121,6 +160,130 @@ impl SkillImprover {
     }
 }
 
+/// Heuristic: does tool-result content look like a failure?
+///
+/// Catches the common shapes — explicit error/failure strings, panics,
+/// exceptions, "not found", and shell exit-code lines.
+fn looks_like_failure(content: &str) -> bool {
+    let lower = content.to_lowercase();
+    lower.contains("error")
+        || lower.contains("failed")
+        || lower.contains("panic")
+        || lower.contains("exception")
+        || lower.contains("not found")
+        || lower.starts_with("exit code")
+}
+
+/// Extract skill tool executions from conversation history.
+///
+/// Returns `(skill_slug, succeeded)` pairs, one per dotted tool-result found.
+/// Handles two emission formats:
+/// - XML: `<tool_result name="slug.tool">…content…</tool_result>` (prompt-guided
+///   tool-calling)
+/// - Native: a `tool`-role message preceded by an `assistant` message whose
+///   content embeds a JSON tool-call with a dotted `"name": "slug.tool"`
+///
+/// Deduplicates on `(slug, succeeded)` so the same skill can appear twice if
+/// it both succeeded and failed within the same window.
+pub fn extract_skill_executions_from_history(history: &[ChatMessage]) -> Vec<(String, bool)> {
+    let mut results: Vec<(String, bool)> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for (i, msg) in history.iter().enumerate() {
+        let content = &msg.content;
+
+        // Format 1: XML <tool_result name="slug.tool">…</tool_result>.
+        let open_marker = "<tool_result name=\"";
+        let close_marker = "</tool_result>";
+        let mut pos = 0;
+        while pos < content.len() {
+            let Some(start) = content[pos..].find(open_marker) else {
+                break;
+            };
+            let abs = pos + start + open_marker.len();
+            let Some(end) = content[abs..].find('"') else {
+                break;
+            };
+            let name = &content[abs..abs + end];
+            if let Some(dot_pos) = name.find('.') {
+                let slug = name[..dot_pos].to_string();
+                let after_tag = abs + end + 1;
+                let body_start = content[after_tag..].find('>').map(|p| after_tag + p + 1);
+                let body_end = content[after_tag..].find(close_marker);
+                let body = match (body_start, body_end) {
+                    (Some(s), Some(e)) if s <= after_tag + e => &content[s..after_tag + e],
+                    _ => "",
+                };
+                let succeeded = !looks_like_failure(body);
+                let key = (slug.clone(), succeeded);
+                if seen.insert(key) {
+                    results.push((slug, succeeded));
+                }
+            }
+            pos = abs + end + 1;
+        }
+
+        // Format 2: native tool-role message preceded by an assistant message
+        // whose JSON tool-call carries a dotted `"name": "slug.tool"`.
+        if msg.role == "tool" && i > 0 {
+            let prev = &history[i - 1];
+            if prev.role == "assistant" {
+                let prev_content = &prev.content;
+                let name_marker = "\"name\"";
+                let mut pos = 0;
+                while pos < prev_content.len() {
+                    let Some(start) = prev_content[pos..].find(name_marker) else {
+                        break;
+                    };
+                    let after = pos + start + name_marker.len();
+                    let rest = prev_content[after..].trim_start();
+                    let Some(rest) = rest.strip_prefix(':') else {
+                        pos = after + 1;
+                        continue;
+                    };
+                    let rest = rest.trim_start();
+                    let Some(rest) = rest.strip_prefix('"') else {
+                        pos = after + 1;
+                        continue;
+                    };
+                    let Some(end) = rest.find('"') else {
+                        break;
+                    };
+                    let name = &rest[..end];
+                    if let Some(dot_pos) = name.find('.') {
+                        let slug = name[..dot_pos].to_string();
+                        let succeeded = !looks_like_failure(content);
+                        let key = (slug.clone(), succeeded);
+                        if seen.insert(key) {
+                            results.push((slug, succeeded));
+                        }
+                    }
+                    // Advance past this name occurrence.
+                    let consumed = prev_content.len() - rest.len() + end + 1;
+                    pos = consumed;
+                }
+            }
+        }
+    }
+
+    results
+}
+
+/// Unique skill slugs seen in `history`, regardless of success/failure.
+pub fn extract_skill_slugs_from_history(history: &[ChatMessage]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    extract_skill_executions_from_history(history)
+        .into_iter()
+        .filter_map(|(slug, _)| {
+            if seen.insert(slug.clone()) {
+                Some(slug)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 /// Validate skill content: must be non-empty, valid UTF-8 (already a &str),
 /// and contain parseable TOML front-matter with a `[skill]` section.
 pub fn validate_skill_content(content: &str) -> Result<()> {
@@ -159,13 +322,16 @@ fn append_improvement_metadata(content: &str, timestamp: &str, reason: &str) -> 
         None => (content, ""),
     };
 
-    // Check if updated_at already exists; if so, replace it.
-    let skill_section = if skill_section.contains("updated_at") {
+    // Strip any existing `updated_at` / `improvement_reason` keys to avoid
+    // emitting them twice (TOML rejects duplicate keys, so leaving the old
+    // lines in place would break parsing on the next read).
+    let skill_section = {
         let mut lines: Vec<&str> = skill_section.lines().collect();
-        lines.retain(|line| !line.trim_start().starts_with("updated_at"));
+        lines.retain(|line| {
+            let trimmed = line.trim_start();
+            !trimmed.starts_with("updated_at") && !trimmed.starts_with("improvement_reason")
+        });
         lines.join("\n") + "\n"
-    } else {
-        skill_section.to_string()
     };
 
     let escaped_reason = reason.replace('"', "\\\"").replace('\n', " ");
@@ -370,7 +536,11 @@ version = "0.1.0"
     }
 
     #[tokio::test]
-    async fn improve_skill_cooldown_returns_none() {
+    async fn improve_skill_writes_when_cooldown_not_checked_by_caller() {
+        // `improve_skill` is caller-gated: it writes whenever given valid
+        // content, even if `should_improve_skill` would return false. This
+        // mirrors how the agent loop must check cooldown itself before
+        // paying for the LLM call.
         let dir = tempfile::tempdir().unwrap();
         let skill_dir = dir.path().join("skills").join("test-skill");
         tokio::fs::create_dir_all(&skill_dir).await.unwrap();
@@ -388,7 +558,6 @@ version = "0.1.0"
                 cooldown_secs: 9999,
             },
         );
-        // Record a recent cooldown.
         improver
             .cooldowns
             .insert("test-skill".to_string(), Instant::now());
@@ -401,7 +570,7 @@ version = "0.1.0"
             )
             .await
             .unwrap();
-        assert!(result.is_none());
+        assert_eq!(result, Some("test-skill".to_string()));
     }
 
     // ── Metadata appending ──────────────────────────────────
@@ -457,5 +626,157 @@ name = "test"
         let content = "[skill]\nname = \"test\"\n";
         let trail = extract_audit_trail(content);
         assert!(trail.is_empty());
+    }
+
+    // ── Duplicate-key handling on repeat improvements ───────
+
+    #[test]
+    fn append_metadata_replaces_existing_improvement_reason() {
+        // A previously-improved skill carries both `updated_at` and
+        // `improvement_reason`. Appending again must strip both before
+        // emitting new values so the resulting TOML stays valid.
+        let already_improved = r#"[skill]
+name = "test"
+description = "A skill"
+version = "0.1.0"
+updated_at = "2025-12-01T00:00:00Z"
+improvement_reason = "first pass"
+"#;
+        let result = append_improvement_metadata(
+            already_improved,
+            "2026-01-01T00:00:00Z",
+            "second pass",
+        );
+        let new_section = result.split("[[tools]]").next().unwrap_or(&result);
+        assert_eq!(new_section.matches("updated_at").count(), 1);
+        assert_eq!(new_section.matches("improvement_reason").count(), 1);
+        assert!(new_section.contains("2026-01-01T00:00:00Z"));
+        assert!(new_section.contains("second pass"));
+        assert!(!new_section.contains("first pass"));
+        // The rewritten section must still parse as TOML.
+        let parsed: Result<toml::Table, _> = new_section.parse();
+        assert!(parsed.is_ok(), "rewritten section should be valid TOML");
+    }
+
+    // ── Failure heuristic ───────────────────────────────────
+
+    #[test]
+    fn looks_like_failure_detects_common_shapes() {
+        assert!(looks_like_failure("Error: file not found"));
+        assert!(looks_like_failure("Command failed with status 1"));
+        assert!(looks_like_failure("thread 'main' panicked at ..."));
+        assert!(looks_like_failure("Exception in user code"));
+        assert!(looks_like_failure("not found"));
+        assert!(looks_like_failure("exit code 137"));
+    }
+
+    #[test]
+    fn looks_like_failure_passes_clean_output() {
+        assert!(!looks_like_failure("Done. Wrote 12 lines."));
+        assert!(!looks_like_failure("ok"));
+        assert!(!looks_like_failure(""));
+    }
+
+    // ── History extraction ──────────────────────────────────
+
+    #[test]
+    fn extract_executions_xml_marks_failure() {
+        let history = vec![
+            ChatMessage::user("run my-skill"),
+            ChatMessage::assistant(
+                "<tool_result name=\"my-skill.run\">Error: command not found</tool_result>",
+            ),
+        ];
+        let executions = extract_skill_executions_from_history(&history);
+        assert_eq!(executions, vec![("my-skill".to_string(), false)]);
+    }
+
+    #[test]
+    fn extract_executions_xml_marks_success() {
+        let history = vec![
+            ChatMessage::user("run my-skill"),
+            ChatMessage::assistant(
+                "<tool_result name=\"my-skill.run\">Done. Wrote 3 files.</tool_result>",
+            ),
+        ];
+        let executions = extract_skill_executions_from_history(&history);
+        assert_eq!(executions, vec![("my-skill".to_string(), true)]);
+    }
+
+    #[test]
+    fn extract_executions_native_format() {
+        let history = vec![
+            ChatMessage::user("run it"),
+            ChatMessage::assistant(
+                "{\"tool_calls\": [{\"name\": \"deploy.run\", \"args\": {}}]}",
+            ),
+            ChatMessage {
+                role: "tool".into(),
+                content: "Error: connection refused".into(),
+            },
+        ];
+        let executions = extract_skill_executions_from_history(&history);
+        assert_eq!(executions, vec![("deploy".to_string(), false)]);
+    }
+
+    #[test]
+    fn extract_slugs_dedupes() {
+        let history = vec![
+            ChatMessage::user("run my-skill"),
+            ChatMessage::assistant(
+                "<tool_result name=\"my-skill.run\">ok</tool_result>\
+                 <tool_result name=\"my-skill.run\">Error</tool_result>",
+            ),
+        ];
+        let slugs = extract_skill_slugs_from_history(&history);
+        assert_eq!(slugs, vec!["my-skill".to_string()]);
+    }
+
+    // ── On-disk cooldown ────────────────────────────────────
+
+    #[tokio::test]
+    async fn should_improve_blocks_when_updated_at_recent() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join("skills").join("test-skill");
+        tokio::fs::create_dir_all(&skill_dir).await.unwrap();
+        let recent = chrono::Utc::now().to_rfc3339();
+        tokio::fs::write(
+            skill_dir.join("SKILL.toml"),
+            format!("[skill]\nname = \"test-skill\"\nupdated_at = \"{recent}\"\n"),
+        )
+        .await
+        .unwrap();
+
+        let improver = SkillImprover::new(
+            dir.path().to_path_buf(),
+            SkillImprovementConfig {
+                enabled: true,
+                cooldown_secs: 9999,
+            },
+        );
+        assert!(!improver.should_improve_skill("test-skill"));
+    }
+
+    #[tokio::test]
+    async fn should_improve_allows_when_updated_at_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join("skills").join("test-skill");
+        tokio::fs::create_dir_all(&skill_dir).await.unwrap();
+        let stale = (chrono::Utc::now() - chrono::Duration::seconds(10_000)).to_rfc3339();
+        tokio::fs::write(
+            skill_dir.join("SKILL.toml"),
+            format!("[skill]\nname = \"test-skill\"\nupdated_at = \"{stale}\"\n"),
+        )
+        .await
+        .unwrap();
+
+        let improver = SkillImprover::new(
+            dir.path().to_path_buf(),
+            SkillImprovementConfig {
+                enabled: true,
+                cooldown_secs: 3600,
+            },
+        );
+        assert!(improver.should_improve_skill("test-skill"));
     }
 }
