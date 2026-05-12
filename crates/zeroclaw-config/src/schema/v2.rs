@@ -1941,14 +1941,10 @@ fn fold_v2_tts_into_providers(passthrough: &mut toml::Table, new_providers: &mut
         }
     }
 
-    if let Some(toml::Value::String(s)) = tts_table.get_mut("default_provider")
-        && !s.is_empty()
-        && !s.contains('.')
-    {
-        *s = format!("{s}.default");
+    if tts_table.remove("default_provider").is_some() {
         tracing::info!(
             target: "migration",
-            "tts.default_provider rewritten as dotted alias"
+            "[tts].default_provider dropped (V3 has no global default-provider; set agent.<X>.tts_provider instead)"
         );
     }
 
