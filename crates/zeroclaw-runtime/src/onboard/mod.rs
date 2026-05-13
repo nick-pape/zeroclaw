@@ -276,6 +276,23 @@ fn find_default<'a>(defaults: &'a [FieldDefault], path: &str) -> Option<&'a str>
         .map(|d| d.display.as_str())
 }
 
+/// Multi-line pretty form of a JSON-shaped Object scalar for `$EDITOR`
+/// hand-off. Returns `None` when the input doesn't parse as JSON so the
+/// caller falls through to the raw value (e.g. when the field is still
+/// a placeholder string).
+fn pretty_print_object(value: &str) -> Option<String> {
+    let parsed: serde_json::Value = serde_json::from_str(value.trim()).ok()?;
+    serde_json::to_string_pretty(&parsed).ok()
+}
+
+/// Compact form of an Object scalar suitable for `set_prop`. Round-trips
+/// through `serde_json` so trailing whitespace, comments, and blank lines
+/// the user added during editing are normalised away.
+fn compact_object(edited: &str) -> Option<String> {
+    let parsed: serde_json::Value = serde_json::from_str(edited.trim()).ok()?;
+    serde_json::to_string(&parsed).ok()
+}
+
 /// True when `input` parses as the same `Vec<String>` form `config.toml`
 /// emits. Lets the StringArray prompt accept the bracketed display form
 /// bidirectionally.
@@ -525,19 +542,28 @@ async fn prompt_field(
             }
         }
         PropKind::Object => {
-            // Struct-shaped scalar (e.g. model_providers.<id>.pricing).
-            // Same TUI fallback as ObjectArray: edit as raw JSON; the
-            // dashboard renders a proper sub-form.
-            let (prefill, placeholder) = if is_set {
-                (Some(current.as_str()), None)
+            // Struct-shaped scalar (e.g. agents.<a>.workspace.access — a
+            // BTreeMap<AgentAlias, AccessMode>; or model_providers.<id>.pricing).
+            // Maps and structs are awkward as single-line input, so hand
+            // them to $EDITOR via the OnboardUi editor surface. RatatuiUi
+            // suspends, spawns $EDITOR with the current JSON value
+            // pretty-printed, and resumes on save — same key/value flow as
+            // editing any config file by hand. The dashboard renders a
+            // proper structured form via PropKind::Object.
+            let initial = if is_set {
+                pretty_print_object(&current).unwrap_or_else(|| current.clone())
             } else {
-                (None, default)
+                default.map(str::to_string).unwrap_or_default()
             };
-            match ui.string(prompt, prefill, placeholder).await? {
+            let hint = format!(
+                "Editing {name}. Save and exit to apply, or quit without saving to keep the current value."
+            );
+            match ui.editor(&hint, &initial).await? {
                 Answer::Back => return Ok(Nav::Back),
                 Answer::Value(new) => {
-                    if (is_set || !new.is_empty()) && new != current {
-                        persist(cfg, name, &new).await?;
+                    let normalized = compact_object(&new).unwrap_or_else(|| new.trim().to_string());
+                    if (is_set || !normalized.is_empty()) && normalized != current {
+                        persist(cfg, name, &normalized).await?;
                     }
                 }
             }
