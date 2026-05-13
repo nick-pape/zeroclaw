@@ -54,6 +54,13 @@ interface FieldFormProps {
    *  drifted field renders an inline `in-memory: [...] / on-disk: [...]`
    *  comparison next to its label. Empty / undefined when nothing drifted. */
   drift?: DriftEntry[];
+  /** Filter for which entries this form renders. Returning false hides
+   *  the entry. Used to partition a section's fields across tabs (e.g.
+   *  Model providers: Connection / Model / Advanced). The form still
+   *  fetches every entry under `prefix`; the predicate only gates
+   *  rendering, so saves still validate against the full server-side
+   *  config. */
+  includePath?: (path: string) => boolean;
 }
 
 /** Imperative handle the parent uses to flush unsaved changes before
@@ -310,7 +317,7 @@ function agentAliasJumpPath(
 }
 
 const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(function FieldForm(
-  { prefix, onSaved, showDelete = true, title, drift },
+  { prefix, onSaved, showDelete = true, title, drift, includePath },
   ref,
 ) {
   const configDraft = useConfigDraft();
@@ -500,9 +507,12 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(function FieldForm
   // Empty query falls through to the full sorted list. Matches the
   // pattern SectionPicker uses so behavior is consistent across views.
   const visibleEntries = useMemo(() => {
-    if (!filter.trim()) return sortedEntries;
-    return fuzzyFilter(sortedEntries, filter, (e) => `${fieldShortLabel(e)} ${e.path}`);
-  }, [sortedEntries, filter]);
+    const filtered = includePath
+      ? sortedEntries.filter((e) => includePath(e.path))
+      : sortedEntries;
+    if (!filter.trim()) return filtered;
+    return fuzzyFilter(filtered, filter, (e) => `${fieldShortLabel(e)} ${e.path}`);
+  }, [sortedEntries, filter, includePath]);
 
   // Count of fields whose draft value differs from the saved display value.
   // Drives the unsaved-changes counter in the sticky save bar. Must be

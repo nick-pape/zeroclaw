@@ -30,6 +30,7 @@ import FieldForm from '../components/onboard/FieldForm';
 import PersonalityEditor from '../components/onboard/PersonalityEditor';
 import ReloadDaemonButton from '../components/onboard/ReloadDaemonButton';
 import SectionPicker from '../components/onboard/SectionPicker';
+import SectionTabs, { type SectionTabSpec } from '../components/onboard/SectionTabs';
 
 // Display order for the curated sidebar groups. Each `SectionInfo.group`
 // from the gateway lands in one of these buckets (anything else falls
@@ -193,6 +194,15 @@ export default function Config() {
     if (!activeSection) return null;
 
     if (!activeSection.has_picker) {
+      const tabs = sectionTabsForDirectForm(activeSection.key, {
+        reloadKey,
+        title: activeSection.label,
+        onSaved: fetchDrift,
+        drifted,
+      });
+      if (tabs) {
+        return <SectionTabs tabs={tabs} />;
+      }
       return (
         <FieldForm
           key={reloadKey}
@@ -211,6 +221,12 @@ export default function Config() {
           ? `channels.${typeParam}.${aliasParam}`
           : `${activeSection.key}.${typeParam}.${aliasParam}`
         : typeParam;
+      const tabs = sectionTabsForAliasForm(activeSection.key, fieldsPrefix, {
+        reloadKey,
+        title: `${typeParam} / ${aliasParam}`,
+        onSaved: fetchDrift,
+        drifted,
+      });
       return (
         <div className="flex flex-col gap-3">
           <button
@@ -221,13 +237,17 @@ export default function Config() {
             <ArrowLeft className="h-4 w-4" />
             Back
           </button>
-          <FieldForm
-            key={`${reloadKey}-${fieldsPrefix}`}
-            prefix={fieldsPrefix}
-            title={`${typeParam} / ${aliasParam}`}
-            onSaved={fetchDrift}
-            drift={drifted}
-          />
+          {tabs ? (
+            <SectionTabs tabs={tabs} />
+          ) : (
+            <FieldForm
+              key={`${reloadKey}-${fieldsPrefix}`}
+              prefix={fieldsPrefix}
+              title={`${typeParam} / ${aliasParam}`}
+              onSaved={fetchDrift}
+              drift={drifted}
+            />
+          )}
         </div>
       );
     }
@@ -237,6 +257,34 @@ export default function Config() {
     if (typeParam && isOneTierAliasSection) {
       const fieldsPrefix = `${activeSection.key}.${typeParam}`;
       const isAgent = activeSection.key === 'agents';
+      const settingsTab = (
+        <FieldForm
+          key={`${reloadKey}-${fieldsPrefix}`}
+          prefix={fieldsPrefix}
+          title={typeParam}
+          onSaved={fetchDrift}
+          drift={drifted}
+        />
+      );
+      const body = isAgent ? (
+        <SectionTabs
+          tabs={[
+            { key: 'settings', label: 'Settings', render: () => settingsTab },
+            {
+              key: 'personality',
+              label: 'Personality',
+              render: () => (
+                <PersonalityEditor
+                  key={`${reloadKey}-${typeParam}-personality`}
+                  agent={typeParam}
+                />
+              ),
+            },
+          ]}
+        />
+      ) : (
+        settingsTab
+      );
       return (
         <div className="flex flex-col gap-3">
           <button
@@ -247,19 +295,7 @@ export default function Config() {
             <ArrowLeft className="h-4 w-4" />
             Back to {activeSection.label}
           </button>
-          <FieldForm
-            key={`${reloadKey}-${fieldsPrefix}`}
-            prefix={fieldsPrefix}
-            title={typeParam}
-            onSaved={fetchDrift}
-            drift={drifted}
-          />
-          {isAgent && (
-            <PersonalityEditor
-              key={`${reloadKey}-${typeParam}-personality`}
-              agent={typeParam}
-            />
-          )}
+          {body}
         </div>
       );
     }
@@ -671,6 +707,130 @@ function AliasListView({
   );
 }
 
+
+// Per-section tab partition for top-level DirectForm sections (e.g.
+// MCP: Settings vs Servers). Returns null when the section doesn't
+// need tabs.
+function sectionTabsForDirectForm(
+  sectionKey: string,
+  ctx: {
+    reloadKey: number;
+    title: string;
+    onSaved: () => void;
+    drifted: DriftEntry[];
+  },
+): SectionTabSpec[] | null {
+  const makeForm = (filter: (path: string) => boolean) => (
+    <FieldForm
+      key={`${ctx.reloadKey}-${sectionKey}`}
+      prefix={sectionKey}
+      title={ctx.title}
+      onSaved={ctx.onSaved}
+      drift={ctx.drifted}
+      includePath={filter}
+    />
+  );
+
+  if (sectionKey === 'mcp') {
+    return [
+      {
+        key: 'settings',
+        label: 'Settings',
+        render: () => makeForm((p) => p !== 'mcp.servers'),
+      },
+      {
+        key: 'servers',
+        label: 'Servers',
+        render: () => makeForm((p) => p === 'mcp.servers'),
+      },
+    ];
+  }
+  return null;
+}
+
+// Per-section tab partition for `<type>.<alias>` alias forms. Returns
+// `null` when the section doesn't need tabs (falls back to a single
+// FieldForm). The partition is name-based against the kebab leaf
+// segment of each prop path under `fieldsPrefix`.
+function sectionTabsForAliasForm(
+  sectionKey: string,
+  fieldsPrefix: string,
+  ctx: {
+    reloadKey: number;
+    title: string;
+    onSaved: () => void;
+    drifted: DriftEntry[];
+  },
+): SectionTabSpec[] | null {
+  const leaf = (path: string): string => {
+    const rest = path.startsWith(`${fieldsPrefix}.`) ? path.slice(fieldsPrefix.length + 1) : path;
+    return rest.split('.', 1)[0] ?? '';
+  };
+
+  const makeForm = (filter: (path: string) => boolean) => (
+    <FieldForm
+      key={`${ctx.reloadKey}-${fieldsPrefix}`}
+      prefix={fieldsPrefix}
+      title={ctx.title}
+      onSaved={ctx.onSaved}
+      drift={ctx.drifted}
+      includePath={filter}
+    />
+  );
+
+  if (sectionKey === 'providers.models') {
+    const connection = new Set(['api-key', 'uri', 'requires-openai-auth', 'extra-headers']);
+    const model = new Set(['model', 'temperature', 'max-tokens', 'top-p', 'timeout-secs']);
+    return [
+      { key: 'connection', label: 'Connection', render: () => makeForm((p) => connection.has(leaf(p))) },
+      { key: 'model', label: 'Model', render: () => makeForm((p) => model.has(leaf(p))) },
+      {
+        key: 'advanced',
+        label: 'Advanced',
+        render: () => makeForm((p) => !connection.has(leaf(p)) && !model.has(leaf(p))),
+      },
+    ];
+  }
+  if (sectionKey === 'channels') {
+    const connection = new Set([
+      'api-key',
+      'bot-token',
+      'access-token',
+      'webhook-secret',
+      'password',
+      'app-secret',
+      'allowed-rooms',
+      'allowed-users',
+      'allowed-chats',
+      'homeserver',
+      'user-id',
+      'device-id',
+      'recovery-key',
+    ]);
+    const behavior = new Set([
+      'enabled',
+      'reply-in-thread',
+      'mention-only',
+      'interrupt-on-new-message',
+      'stream-mode',
+      'draft-update-interval-ms',
+      'multi-message-delay-ms',
+      'approval-timeout-secs',
+      'ack-reactions',
+      'excluded-tools',
+    ]);
+    return [
+      { key: 'connection', label: 'Connection', render: () => makeForm((p) => connection.has(leaf(p))) },
+      { key: 'behavior', label: 'Behavior', render: () => makeForm((p) => behavior.has(leaf(p))) },
+      {
+        key: 'advanced',
+        label: 'Advanced',
+        render: () => makeForm((p) => !connection.has(leaf(p)) && !behavior.has(leaf(p))),
+      },
+    ];
+  }
+  return null;
+}
 
 function AliasRow({
   alias,
