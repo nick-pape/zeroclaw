@@ -747,6 +747,31 @@ export interface MapKeyResponse {
   created: boolean;
 }
 
+// ── Shared workspace browse ────────────────────────────────────────
+// Hard-scoped to `<install>/shared/`. The gateway adapter at
+// `crates/zeroclaw-gateway/src/api_browse.rs` defers all containment
+// checks and walking to `zeroclaw_runtime::browse::list_directory`,
+// so the path is interpreted relative to `shared/` here too.
+
+export interface BrowseEntry {
+  name: string;
+  /** `"dir"` or `"file"`. */
+  kind: 'dir' | 'file';
+  /** Bytes; absent for directories. */
+  size?: number;
+}
+
+export interface BrowseResponse {
+  /** Echoed cleaned path relative to `<install>/shared/`. */
+  path: string;
+  entries: BrowseEntry[];
+}
+
+export function browseShared(path = ''): Promise<BrowseResponse> {
+  const q = path ? `?path=${encodeURIComponent(path)}` : '';
+  return apiFetch<BrowseResponse>(`/api/browse${q}`);
+}
+
 /**
  * Create a new entry under a map-keyed or list-shaped section. For Map
  * kinds the `key` is the new HashMap key; for List kinds it's the new

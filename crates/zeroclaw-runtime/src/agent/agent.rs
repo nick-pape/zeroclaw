@@ -778,7 +778,10 @@ impl Agent {
 
         // Load skills and register them as callable tools so WebSocket/daemon
         // sessions can execute them (not just describe them in the prompt).
-        let skills = crate::skills::load_skills_with_config(&config.data_dir, config);
+        // Bundle-aware so `[agents.<alias>].skill_bundles` aliases resolve
+        // through to `[skill_bundles.<alias>].directory` (defaulting to
+        // `<install>/shared/skills/<alias>/`).
+        let skills = crate::skills::load_skills_for_agent(&config.data_dir, config, agent_alias);
         tools::register_skill_tools(&mut tools, &skills, security.clone());
 
         let approval_manager = if approval_backchannel {

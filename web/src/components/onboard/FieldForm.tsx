@@ -20,7 +20,8 @@
 
 import { forwardRef, useEffect, useImperativeHandle, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { ExternalLink, List as ListIcon, Plus, Save, Trash2, Type as TypeIcon } from 'lucide-react';
+import { ExternalLink, FolderOpen, List as ListIcon, Plus, Save, Trash2, Type as TypeIcon } from 'lucide-react';
+import DirectoryPicker from './DirectoryPicker';
 import {
   ApiError,
   descriptionForPath,
@@ -735,11 +736,13 @@ function FieldRow({ entry, value, onChange, comment, onCommentChange, error, onD
   // the legacy snake form `skill_bundles.<alias>.directory`). When unset
   // the runtime falls back to `<install>/shared/skills/<alias>/`; render
   // that resolved default as a placeholder so operators see the path
-  // their bundle will actually use.
+  // their bundle will actually use. Also gets a directory-picker button
+  // wired to `GET /api/browse` (scoped to `<install>/shared/`).
   const skillBundleAlias = (() => {
     const m = entry.path.match(/^skill[-_]bundles\.([^.]+)\.directory$/);
     return m ? m[1] : null;
   })();
+  const [pickerOpen, setPickerOpen] = useState(false);
 
   // Agent-form alias pickers. Each `agents.<alias>.<field>` row that
   // references another section's aliases (channels, model_provider, etc.)
@@ -1016,6 +1019,41 @@ function FieldRow({ entry, value, onChange, comment, onCommentChange, error, onD
             onChange={(e) => onChange(e.target.value)}
             className="input-electric w-full px-3 py-2 text-sm"
           />
+        ) : skillBundleAlias ? (
+          <div className="relative">
+            <div className="flex items-center gap-2">
+              <input
+                id={entry.path}
+                type="text"
+                value={value}
+                onChange={(e) => onChange(e.target.value)}
+                className="input-electric flex-1 px-3 py-2 text-sm"
+                placeholder={`shared/skills/${skillBundleAlias}/ (default — leave empty)`}
+              />
+              <button
+                type="button"
+                onClick={() => setPickerOpen((open) => !open)}
+                className="btn-secondary inline-flex items-center gap-1.5 text-sm px-3 py-2 flex-shrink-0"
+                title="Browse shared/ for a directory"
+                aria-expanded={pickerOpen}
+              >
+                <FolderOpen className="h-4 w-4" />
+                Browse
+              </button>
+            </div>
+            {pickerOpen && (
+              <div className="absolute z-20 right-0 mt-2 w-[min(28rem,calc(100vw-3rem))]">
+                <DirectoryPicker
+                  value={value}
+                  onSelect={(path) => {
+                    onChange(path);
+                    setPickerOpen(false);
+                  }}
+                  onClose={() => setPickerOpen(false)}
+                />
+              </div>
+            )}
+          </div>
         ) : (
           <input
             id={entry.path}
@@ -1028,9 +1066,7 @@ function FieldRow({ entry, value, onChange, comment, onCommentChange, error, onD
                 ? entry.populated
                   ? 'Leave blank to keep current value'
                   : 'Enter value'
-                : skillBundleAlias
-                  ? `shared/skills/${skillBundleAlias}/ (default — leave empty)`
-                  : ''
+                : ''
             }
           />
         )}

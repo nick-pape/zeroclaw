@@ -199,6 +199,79 @@ pub fn load_skills_with_config(
     skills
 }
 
+/// Per-agent skill discovery. Walks `[agents.<agent_alias>].skill_bundles`,
+/// resolves each bundle's directory via the shared
+/// [`zeroclaw_config::skill_bundles::resolve_directory`] helper, and unions
+/// the skills under each bundle with whatever
+/// [`load_skills_with_config`] would return for the install (workspace
+/// skills, open-skills, plugin skills). Empty `skill_bundles` falls back
+/// to the install-wide set — keeps freshly-migrated agents working until
+/// the operator assigns a bundle.
+pub fn load_skills_for_agent(
+    workspace_dir: &Path,
+    config: &zeroclaw_config::schema::Config,
+    agent_alias: &str,
+) -> Vec<Skill> {
+    let mut skills = load_skills_with_config(workspace_dir, config);
+    let Some(agent) = config.agent(agent_alias) else {
+        return skills;
+    };
+    if agent.skill_bundles.is_empty() {
+        return skills;
+    }
+    let install_root = config.install_root_dir();
+    let allow_scripts = config.skills.allow_scripts;
+    let mut seen: std::collections::HashSet<String> =
+        skills.iter().map(|s| s.name.clone()).collect();
+    for bundle_alias in &agent.skill_bundles {
+        let bundle = match config.skill_bundles.get(bundle_alias) {
+            Some(b) => b,
+            None => {
+                tracing::warn!(
+                    agent = %agent_alias,
+                    bundle = %bundle_alias,
+                    "skipping skill bundle: [skill_bundles.{bundle_alias}] is not configured"
+                );
+                continue;
+            }
+        };
+        let dir = match zeroclaw_config::skill_bundles::resolve_directory(
+            config,
+            &install_root,
+            bundle_alias,
+        ) {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!(
+                    agent = %agent_alias,
+                    bundle = %bundle_alias,
+                    "skipping skill bundle: {e}"
+                );
+                continue;
+            }
+        };
+        let include: std::collections::HashSet<&str> =
+            bundle.include.iter().map(String::as_str).collect();
+        let exclude: std::collections::HashSet<&str> =
+            bundle.exclude.iter().map(String::as_str).collect();
+        for skill in load_skills_from_directory(&dir, allow_scripts) {
+            if !include.is_empty() && !include.contains(skill.name.as_str()) {
+                continue;
+            }
+            if exclude.contains(skill.name.as_str()) {
+                continue;
+            }
+            // First-write wins so workspace skills override bundle skills
+            // with the same name (legacy agents who edited a workspace
+            // copy keep their override after a bundle is assigned).
+            if seen.insert(skill.name.clone()) {
+                skills.push(skill);
+            }
+        }
+    }
+    skills
+}
+
 /// Load skills using explicit open-skills settings.
 pub fn load_skills_with_open_skills_settings(
     workspace_dir: &Path,

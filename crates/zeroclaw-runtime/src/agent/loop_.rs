@@ -2458,7 +2458,7 @@ pub async fn run(
     crate::i18n::init(&i18n_locale);
 
     // ── Build system prompt from workspace MD files (OpenClaw framework) ──
-    let skills = crate::skills::load_skills_with_config(&config.data_dir, &config);
+    let skills = crate::skills::load_skills_for_agent(&config.data_dir, &config, agent_alias);
 
     // Register skill-defined tools as callable tool specs in the tool registry
     // so the LLM can invoke them via native function calling, not just XML prompts.
@@ -3468,7 +3468,7 @@ pub async fn process_message(
         .unwrap_or_else(crate::i18n::detect_locale);
     crate::i18n::init(&i18n_locale);
 
-    let skills = crate::skills::load_skills_with_config(&config.data_dir, &config);
+    let skills = crate::skills::load_skills_for_agent(&config.data_dir, &config, agent_alias);
 
     // Register skill-defined tools as callable tool specs (process_message path).
     tools::register_skill_tools(&mut tools_registry, &skills, security.clone());
