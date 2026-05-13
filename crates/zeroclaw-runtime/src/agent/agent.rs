@@ -1782,9 +1782,12 @@ pub async fn run(
         // When a model_provider override is specified, ensure that model_provider type exists
         // in models and is set as the first (and only) entry for routing purposes.
         if let Some((type_key, alias_key)) = p.split_once('.') {
-            effective_config.model_providers.ensure(type_key, alias_key);
+            effective_config
+                .providers
+                .models
+                .ensure(type_key, alias_key);
         } else {
-            effective_config.model_providers.ensure(&p, "default");
+            effective_config.providers.models.ensure(&p, "default");
         }
     }
     if let Some(entry) = effective_config.first_model_provider_mut() {
@@ -2658,7 +2661,8 @@ mod tests {
             // operator URL goes in the `uri` field (post-Phase 6
             // operators no longer put URLs in the outer type key).
             let entry = config
-                .model_providers
+                .providers
+                .models
                 .ensure("custom", "default")
                 .expect("custom model_provider type slot");
             entry.api_key = Some("test-key".to_string());

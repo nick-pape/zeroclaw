@@ -1755,12 +1755,13 @@ async fn run_gateway_chat_with_tools(
         // also lets us read out this turn's tokens / cost after the scope
         // exits without racing concurrent webhook traffic that shares the
         // same tracker. Pricing comes from the V3 per-provider shape
-        // (`config.model_providers[*][*].pricing`), keyed as
+        // (`config.providers.models[*][*].pricing`), keyed as
         // `<type>.<alias>` to match how the channels orchestrator builds
         // its `ModelProviderPricing`.
         let cost_tracking_context = state.cost_tracker.as_ref().map(|tracker| {
             let pricing: zeroclaw_runtime::agent::cost::ModelProviderPricing = config
-                .model_providers
+                .providers
+                .models
                 .iter_entries()
                 .filter(|(_, _, base)| !base.pricing.is_empty())
                 .map(|(type_k, alias_k, base)| {

@@ -617,7 +617,8 @@ pub fn model_provider_runtime_options_from_model_provider_entry(
         .filter(|u| !u.is_empty())
         .and_then(|active_uri| {
             config
-                .model_providers
+                .providers
+                .models
                 .iter_entries()
                 .map(|(_, _, base)| base)
                 .find(|p| {
@@ -677,14 +678,14 @@ pub fn provider_runtime_options_for_agent(
         // `for_each_model_provider_slot!`). Operator-set `base.uri` already
         // populated above wins over the family default.
         if options.provider_api_url.is_none()
-            && let Some(uri) = config.model_providers.resolved_endpoint_uri(family, alias)
+            && let Some(uri) = config.providers.models.resolved_endpoint_uri(family, alias)
         {
             options.provider_api_url = Some(uri.to_string());
         }
         // Family-specific typed extras (Azure resource, kilocli/gemini_cli
         // binary_path, Gemini OAuth client credentials, OpenAI Codex
         // auth-routing, etc.) are read directly by the factory branches
-        // from `config.model_providers.<family>.<alias>` — no flat
+        // from `config.providers.models.<family>.<alias>` — no flat
         // dumping ground here.
     }
 
@@ -897,7 +898,7 @@ pub fn create_model_provider_with_url(
 /// Factory: create model_provider with full alias context.
 ///
 /// `(config, family, alias)` lets each family branch read its own typed
-/// alias config (`config.model_providers.<family>.get(alias)`) directly
+/// alias config (`config.providers.models.<family>.get(alias)`) directly
 /// — no flat per-family extras dumping ground. Production callers with
 /// agent context (delegate, llm_task, model routing, gateway) use this.
 pub fn create_model_provider_for_alias(
@@ -2105,7 +2106,7 @@ mod tests {
         // `first_model_provider()`.
         use zeroclaw_config::schema::{GroqModelProviderConfig, ModelProviderConfig};
         let mut config = zeroclaw_config::schema::Config::default();
-        config.model_providers.groq.insert(
+        config.providers.models.groq.insert(
             "default".to_string(),
             GroqModelProviderConfig {
                 base: ModelProviderConfig {
@@ -2604,11 +2605,13 @@ mod tests {
             },
         };
         config
-            .model_providers
+            .providers
+            .models
             .anthropic
             .insert("default".to_string(), default_alias);
         config
-            .model_providers
+            .providers
+            .models
             .anthropic
             .insert("work".to_string(), work_alias);
         let work_agent = AliasedAgentConfig {

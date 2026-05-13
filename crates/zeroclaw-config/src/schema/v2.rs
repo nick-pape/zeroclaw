@@ -255,16 +255,22 @@ impl V2Config {
         fold_v2_tts_into_providers(&mut passthrough, &mut new_providers);
         fold_v2_transcription_into_providers(&mut passthrough, &mut new_providers);
 
-        // Hoist providers.{models,tts,transcription,*_routes} to the
-        // kind-qualified top-level keys V3 uses.
+        // V3 collapses model/tts/transcription providers under a single
+        // top-level `[providers]` table, with one sub-key per category.
+        // Hoist providers.{models,tts,transcription} into a shared
+        // `providers` table; *_routes stay top-level.
+        let mut v3_providers = toml::Table::new();
         if let Some(models) = new_providers.remove("models") {
-            passthrough.insert("model_providers".to_string(), models);
+            v3_providers.insert("models".to_string(), models);
         }
         if let Some(tts) = new_providers.remove("tts") {
-            passthrough.insert("tts_providers".to_string(), tts);
+            v3_providers.insert("tts".to_string(), tts);
         }
         if let Some(transcription) = new_providers.remove("transcription") {
-            passthrough.insert("transcription_providers".to_string(), transcription);
+            v3_providers.insert("transcription".to_string(), transcription);
+        }
+        if !v3_providers.is_empty() {
+            passthrough.insert("providers".to_string(), toml::Value::Table(v3_providers));
         }
         if let Some(routes) = new_providers.remove("model_routes") {
             passthrough.insert("model_routes".to_string(), routes);
@@ -1401,15 +1407,22 @@ fn synthesize_agent_brains(
             if let Some(t) = temperature {
                 entry.insert("temperature".to_string(), t);
             }
-            let model_providers_value = passthrough
-                .entry("model_providers".to_string())
+            // V3 keeps every provider category under `[providers]`:
+            // `[providers.models.<type>.<alias>]` is the destination.
+            let providers_value = passthrough
+                .entry("providers".to_string())
                 .or_insert_with(|| toml::Value::Table(toml::Table::new()));
-            if let Some(models_table) = model_providers_value.as_table_mut() {
-                let provider_value = models_table
-                    .entry(provider_type.clone())
+            if let Some(providers_table) = providers_value.as_table_mut() {
+                let models_value = providers_table
+                    .entry("models".to_string())
                     .or_insert_with(|| toml::Value::Table(toml::Table::new()));
-                if let Some(provider_table) = provider_value.as_table_mut() {
-                    provider_table.insert(provider_alias.clone(), toml::Value::Table(entry));
+                if let Some(models_table) = models_value.as_table_mut() {
+                    let provider_value = models_table
+                        .entry(provider_type.clone())
+                        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+                    if let Some(provider_table) = provider_value.as_table_mut() {
+                        provider_table.insert(provider_alias.clone(), toml::Value::Table(entry));
+                    }
                 }
             }
             agent_table.insert(
@@ -1418,7 +1431,7 @@ fn synthesize_agent_brains(
             );
             tracing::info!(
                 target: "migration",
-                "agents.{alias}: inline brain → model_providers.{provider_type}.{provider_alias}"
+                "agents.{alias}: inline brain → providers.models.{provider_type}.{provider_alias}"
             );
         } else if let Some(other) = provider {
             agent_table.insert("provider".to_string(), other);
@@ -1841,8 +1854,12 @@ fn lift_top_level_identity_into_agents(passthrough: &mut toml::Table) {
 /// `passthrough` is read (not mutated) — the synthesized agent is returned so
 /// the caller decides whether to install it under `agents`.
 fn synthesize_default_agent_if_needed(passthrough: &toml::Table) -> toml::Table {
+    // V3 keeps every provider category under `[providers]`:
+    // `[providers.models.<type>.<alias>]`. Walk in via the new path.
     let models = match passthrough
-        .get("model_providers")
+        .get("providers")
+        .and_then(toml::Value::as_table)
+        .and_then(|providers| providers.get("models"))
         .and_then(toml::Value::as_table)
     {
         Some(t) => t,

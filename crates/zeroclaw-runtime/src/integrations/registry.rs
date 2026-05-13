@@ -61,7 +61,8 @@ fn evaluate_model_provider_activation(
 ) -> IntegrationStatus {
     bool_to_status(
         config
-            .model_providers
+            .providers
+            .models
             .contains_model_provider_type(info.name),
     )
 }
@@ -451,7 +452,8 @@ mod tests {
             let mut config = Config::default();
             assert!(
                 config
-                    .model_providers
+                    .providers
+                    .models
                     .ensure(info.name, "default")
                     .is_some(),
                 "ModelProviderInfo {:?} must correspond to a typed slot \

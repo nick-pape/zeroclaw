@@ -400,7 +400,8 @@ impl ModelRoutingConfigTool {
                 .unwrap_or_else(|| (model_provider.clone(), "default".to_string())),
             MaybeSet::Null | MaybeSet::Unset => {
                 // Update whichever entry is already first, or create a placeholder.
-                cfg.model_providers
+                cfg.providers
+                    .models
                     .iter_entries()
                     .next()
                     .map(|(t, a, _)| (t.to_string(), a.to_string()))
@@ -408,7 +409,8 @@ impl ModelRoutingConfigTool {
             }
         };
         let entry = cfg
-            .model_providers
+            .providers
+            .models
             .ensure(&type_k, &alias_k)
             .ok_or_else(|| {
                 anyhow::anyhow!(
@@ -457,7 +459,7 @@ impl ModelRoutingConfigTool {
                 // restore cycle because we only ever mutated baseline fields
                 // (model, temperature, api_key) above.
                 if let Some(prev_entry) = previous_first_model_provider
-                    && let Some(slot) = cfg.model_providers.ensure(&type_k, &alias_k)
+                    && let Some(slot) = cfg.providers.models.ensure(&type_k, &alias_k)
                 {
                     *slot = prev_entry;
                 }
@@ -733,7 +735,7 @@ impl ModelRoutingConfigTool {
         let agent_model_provider_ref = format!("{model_provider_family}.{name}");
         {
             let provider_entry =
-                cfg.model_providers
+                cfg.providers.models
                     .ensure(&model_provider_family, &name)
                     .ok_or_else(|| {
                         anyhow::anyhow!(

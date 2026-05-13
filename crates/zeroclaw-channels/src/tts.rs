@@ -579,7 +579,7 @@ impl TtsManager {
         // Typed dispatch over the TtsProviders container's named slots. The
         // unknown-type warn-and-skip arm is gone — the typed container can't
         // hold an unrecognized family.
-        for (family, alias, instance) in config.tts_providers.iter_entries() {
+        for (family, alias, instance) in config.providers.tts.iter_entries() {
             let dotted = format!("{family}.{alias}");
             let result: Result<Box<dyn TtsProvider>> = match family {
                 "openai" => OpenAiTtsProvider::new(instance).map(|p| Box::new(p) as _),
@@ -708,7 +708,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        cfg.tts_providers.edge.insert(
+        cfg.providers.tts.edge.insert(
             "default".to_string(),
             zeroclaw_config::schema::EdgeTtsProviderConfig {
                 base: TtsProviderConfig {
@@ -729,7 +729,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        cfg.tts_providers.piper.insert(
+        cfg.providers.tts.piper.insert(
             "default".to_string(),
             zeroclaw_config::schema::PiperTtsProviderConfig {
                 base: TtsProviderConfig {

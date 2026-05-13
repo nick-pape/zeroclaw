@@ -108,9 +108,10 @@ async fn scheduled_run_does_not_leak_conversation_memory_into_provider_request()
     // The test's `default` agent points at `custom.default` so `agent::run`
     // resolves the mock provider through the same codepath production
     // daemons use.
-    let mut model_providers = ModelProviders::default();
+    let mut providers = zeroclaw_config::providers::Providers::default();
     {
-        let base = model_providers
+        let base = providers
+            .models
             .ensure(provider_type, "default")
             .expect("`custom` slot must exist on ModelProviders");
         base.api_key = Some("test-key".to_string());
@@ -135,7 +136,7 @@ async fn scheduled_run_does_not_leak_conversation_memory_into_provider_request()
     let mut config = Config {
         data_dir: workspace_dir.clone(),
         config_path: tmp.path().join("config.toml"),
-        model_providers,
+        providers,
         agents,
         risk_profiles,
         ..Config::default()

@@ -884,7 +884,7 @@ fn runtime_defaults_from_config(
 ) -> anyhow::Result<ChannelRuntimeDefaults> {
     let dotted = model_provider.split_once('.');
     let entry = dotted
-        .and_then(|(type_key, alias_key)| config.model_providers.find(type_key, alias_key))
+        .and_then(|(type_key, alias_key)| config.providers.models.find(type_key, alias_key))
         .or_else(|| config.first_model_provider());
     let default_model_provider = dotted
         .map(|(t, _)| t.to_string())
@@ -980,12 +980,12 @@ async fn load_runtime_defaults_from_config_file(
             decrypt_optional_secret_for_runtime_reload(
                 &store,
                 &mut fallback_entry.api_key,
-                "config.model_providers.api_key",
+                "config.providers.models.api_key",
             )?;
         }
         // Decrypt TTS model_provider API keys for runtime reload (typed slots).
-        for (family, alias, instance) in parsed.tts_providers.iter_entries_mut() {
-            let label = format!("config.tts_providers.{family}.{alias}.api_key");
+        for (family, alias, instance) in parsed.providers.tts.iter_entries_mut() {
+            let label = format!("config.providers.tts.{family}.{alias}.api_key");
             decrypt_optional_secret_for_runtime_reload(&store, &mut instance.api_key, &label)?;
         }
     }
@@ -6477,7 +6477,8 @@ pub async fn start_channels(
         )
         .map(|tracker| {
             let pricing: zeroclaw_runtime::agent::cost::ModelProviderPricing = config
-                .model_providers
+                .providers
+                .models
                 .iter_entries()
                 .map(|(type_k, alias_k, profile)| {
                     (format!("{type_k}.{alias_k}"), profile.pricing.clone())

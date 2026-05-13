@@ -1345,7 +1345,7 @@ mod tests {
     fn with_test_agent(
         mut config: zeroclaw_config::schema::Config,
     ) -> zeroclaw_config::schema::Config {
-        config.model_providers.openrouter.insert(
+        config.providers.models.openrouter.insert(
             "default".to_string(),
             zeroclaw_config::schema::OpenRouterModelProviderConfig::default(),
         );

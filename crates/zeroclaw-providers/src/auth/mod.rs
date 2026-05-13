@@ -975,7 +975,7 @@ impl GeminiFlow {
     /// (`[model_providers.gemini.<profile>]`); the alias config carries
     /// the operator's Google Cloud OAuth app credentials.
     fn alias_creds<'a>(config: &'a Config, profile: &str) -> Result<(&'a str, &'a str)> {
-        let alias_cfg = config.model_providers.gemini.get(profile).ok_or_else(|| {
+        let alias_cfg = config.providers.models.gemini.get(profile).ok_or_else(|| {
             anyhow::anyhow!(
                 "Gemini OAuth requires `[model_providers.gemini.{profile}]` to exist with \
                  `oauth_client_id` and `oauth_client_secret` set. Register a Google Cloud \
@@ -1168,7 +1168,7 @@ impl AuthProviderFlow for GeminiFlow {
         profile_override: Option<&str>,
     ) -> Result<RefreshStatus> {
         let alias_name = profile_override.unwrap_or("default");
-        let alias_cfg = ctx.config.model_providers.gemini.get(alias_name);
+        let alias_cfg = ctx.config.providers.models.gemini.get(alias_name);
         let client_id = alias_cfg
             .and_then(|c| c.oauth_client_id.as_deref())
             .unwrap_or("");

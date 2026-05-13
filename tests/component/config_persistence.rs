@@ -18,7 +18,7 @@ fn config_default_has_expected_provider() {
     let config = Config::default();
     // Default config has no model_provider until configured
     assert!(
-        config.model_providers.is_empty() || !config.model_providers.is_empty(),
+        config.providers.models.is_empty() || !config.providers.models.is_empty(),
         "default config should be constructible"
     );
 }
@@ -131,7 +131,7 @@ fn memory_config_default_vector_keyword_weights_sum_to_one() {
 fn config_toml_roundtrip_preserves_provider() {
     use zeroclaw::config::{DeepseekModelProviderConfig, ModelProviderConfig};
     let mut config = Config::default();
-    config.model_providers.deepseek.insert(
+    config.providers.models.deepseek.insert(
         "default".to_string(),
         DeepseekModelProviderConfig {
             base: ModelProviderConfig {
@@ -212,7 +212,7 @@ fn config_file_write_read_roundtrip() {
     let config_path = tmp.path().join("config.toml");
 
     let mut config = Config::default();
-    config.model_providers.mistral.insert(
+    config.providers.models.mistral.insert(
         "default".to_string(),
         MistralModelProviderConfig {
             base: ModelProviderConfig {

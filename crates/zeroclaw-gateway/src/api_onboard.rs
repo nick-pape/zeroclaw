@@ -204,7 +204,7 @@ pub async fn handle_onboard_status(State(state): State<AppState>, headers: Heade
     let cfg = state.config.read().clone();
 
     let has_completed = !cfg.onboard_state.completed_sections.is_empty();
-    let has_model_provider = !cfg.model_providers.is_empty();
+    let has_model_provider = !cfg.providers.models.is_empty();
 
     let (needs_onboarding, reason) = if has_completed {
         (false, "has_completed_sections")
@@ -622,7 +622,7 @@ fn providers_picker(cfg: &zeroclaw_config::schema::Config) -> Vec<PickerItem> {
     zeroclaw_providers::list_model_providers()
         .into_iter()
         .map(|p| {
-            let configured = cfg.model_providers.contains_model_provider_type(p.name);
+            let configured = cfg.providers.models.contains_model_provider_type(p.name);
             PickerItem {
                 key: p.name.to_string(),
                 label: p.display_name.to_string(),

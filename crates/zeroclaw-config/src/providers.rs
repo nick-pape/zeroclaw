@@ -148,9 +148,9 @@ macro_rules! define_provider_ref {
     };
 }
 
-define_provider_ref!(ModelProviderRef, "model_providers");
-define_provider_ref!(TtsProviderRef, "tts_providers");
-define_provider_ref!(TranscriptionProviderRef, "transcription_providers");
+define_provider_ref!(ModelProviderRef, "providers.models");
+define_provider_ref!(TtsProviderRef, "providers.tts");
+define_provider_ref!(TranscriptionProviderRef, "providers.transcription");
 define_provider_ref!(ChannelRef, "channels");
 
 /// Macro that expands to a single source of truth for the per-provider-type
@@ -253,7 +253,7 @@ macro_rules! emit_model_providers_struct {
         /// every helper picks up the new slot automatically.
         #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
         #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-        #[prefix = "model_providers"]
+        #[prefix = "providers.models"]
         pub struct ModelProviders {
             $(
                 #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -434,7 +434,7 @@ impl ModelProviders {
 /// openai, elevenlabs, google, edge, piper). No catch-all needed.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "tts_providers"]
+#[prefix = "providers.tts"]
 pub struct TtsProviders {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
@@ -534,7 +534,7 @@ impl TtsProviders {
 /// groq, openai, deepgram, assemblyai, google, local_whisper.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "transcription_providers"]
+#[prefix = "providers.transcription"]
 pub struct TranscriptionProviders {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
@@ -590,4 +590,41 @@ impl TranscriptionProviders {
         }
         out.into_iter()
     }
+}
+
+/// Top-level wrapper for every provider category. TOML root sees a
+/// single `[providers]` table with one sub-key per category:
+///
+/// ```toml
+/// [providers.models.anthropic.default]
+/// api_key = "..."
+///
+/// [providers.tts.openai.default]
+/// api_key = "..."
+///
+/// [providers.transcription.groq.default]
+/// api_key = "..."
+/// ```
+///
+/// Each category keeps its own typed-slot internals (so per-family
+/// endpoints and extras stay validated at the type level); this
+/// wrapper just gives them a shared top-level home.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers"]
+pub struct Providers {
+    /// Model providers — `[providers.models.<type>.<alias>]`.
+    #[serde(default)]
+    #[nested]
+    pub models: ModelProviders,
+
+    /// Text-to-speech providers — `[providers.tts.<type>.<alias>]`.
+    #[serde(default)]
+    #[nested]
+    pub tts: TtsProviders,
+
+    /// Transcription / speech-to-text providers — `[providers.transcription.<type>.<alias>]`.
+    #[serde(default)]
+    #[nested]
+    pub transcription: TranscriptionProviders,
 }

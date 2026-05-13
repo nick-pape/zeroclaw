@@ -1540,12 +1540,16 @@ async fn main() -> Result<()> {
                 });
                 if let Some(p) = &model_provider {
                     // Upsert the requested model_provider type under "default" alias.
-                    let entry = config.model_providers.ensure(p, "default").ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "Unknown model_provider family: {p}. \
+                    let entry = config
+                        .providers
+                        .models
+                        .ensure(p, "default")
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "Unknown model_provider family: {p}. \
                              Run `zeroclaw onboard model_providers` to see configured options."
-                        )
-                    })?;
+                            )
+                        })?;
                     if let Some(m) = &model {
                         entry.model = Some(m.clone());
                     }
@@ -3939,7 +3943,8 @@ mod tests {
         // bottoming out at 0.7.
         let mut config = Config::default();
         config
-            .model_providers
+            .providers
+            .models
             .ensure("openai", "default")
             .expect("known family")
             .temperature = Some(1.5);

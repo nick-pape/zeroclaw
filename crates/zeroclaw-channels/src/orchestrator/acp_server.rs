@@ -1297,9 +1297,9 @@ mod tests {
         let cwd = tempfile::tempdir().unwrap();
         let mut config = Config {
             data_dir: cwd.path().to_path_buf(),
-            model_providers: {
-                let mut m = zeroclaw_config::providers::ModelProviders::default();
-                m.openrouter.insert(
+            providers: {
+                let mut p = zeroclaw_config::providers::Providers::default();
+                p.models.openrouter.insert(
                     "default".to_string(),
                     zeroclaw_config::schema::OpenRouterModelProviderConfig {
                         base: zeroclaw_config::schema::ModelProviderConfig {
@@ -1308,7 +1308,7 @@ mod tests {
                         },
                     },
                 );
-                m
+                p
             },
             mcp: zeroclaw_config::schema::McpConfig {
                 enabled: true,
@@ -1442,7 +1442,7 @@ mod tests {
     fn handle_initialize_default_model_reflects_configured_provider() {
         use zeroclaw_config::schema::{ModelProviderConfig, OllamaModelProviderConfig};
         let mut config = Config::default();
-        config.model_providers.ollama.insert(
+        config.providers.models.ollama.insert(
             "default".to_string(),
             OllamaModelProviderConfig {
                 base: ModelProviderConfig {
@@ -1627,9 +1627,9 @@ mod tests {
         let cwd = tempfile::tempdir().unwrap();
         let mut config = Config {
             data_dir: cwd.path().to_path_buf(),
-            model_providers: {
-                let mut m = zeroclaw_config::providers::ModelProviders::default();
-                m.anthropic.insert(
+            providers: {
+                let mut p = zeroclaw_config::providers::Providers::default();
+                p.models.anthropic.insert(
                     "default".to_string(),
                     zeroclaw_config::schema::AnthropicModelProviderConfig {
                         base: zeroclaw_config::schema::ModelProviderConfig {
@@ -1638,7 +1638,7 @@ mod tests {
                         },
                     },
                 );
-                m
+                p
             },
             ..Default::default()
         };
@@ -1702,7 +1702,7 @@ mod tests {
             data_dir: cwd.to_path_buf(),
             ..Default::default()
         };
-        cfg.model_providers.anthropic.insert(
+        cfg.providers.models.anthropic.insert(
             "default".to_string(),
             zeroclaw_config::schema::AnthropicModelProviderConfig {
                 base: zeroclaw_config::schema::ModelProviderConfig {

@@ -86,7 +86,8 @@ temperature = 99.0
     // Out-of-range temperature is stored but caught by validate().
     assert!(
         config
-            .model_providers
+            .providers
+            .models
             .find("openai", "default")
             .expect("entry exists")
             .temperature
@@ -103,7 +104,8 @@ temperature = -0.5
     let config: Config = toml::from_str(toml_str).expect("parses");
     assert!(
         config
-            .model_providers
+            .providers
+            .models
             .find("openai", "default")
             .expect("entry exists")
             .temperature

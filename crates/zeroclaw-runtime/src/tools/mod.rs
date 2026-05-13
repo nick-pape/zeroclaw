@@ -959,7 +959,7 @@ pub fn all_tools_with_runtime(
                 String,
                 std::collections::HashMap<String, zeroclaw_config::schema::ModelProviderConfig>,
             > = std::collections::HashMap::new();
-            for (t, a, base) in root_config.model_providers.iter_entries() {
+            for (t, a, base) in root_config.providers.models.iter_entries() {
                 m.entry(t.to_string())
                     .or_default()
                     .insert(a.to_string(), base.clone());

@@ -220,7 +220,8 @@ fn doctor_model_targets(config: &Config, provider_override: Option<&str>) -> Vec
     }
 
     config
-        .model_providers
+        .providers
+        .models
         .iter_entries()
         .map(|(type_k, alias_k, _)| format!("{type_k}.{alias_k}"))
         .collect()
@@ -1075,7 +1076,8 @@ mod tests {
         // produce a coin-flip first pick).
         let mut config = Config::default();
         config
-            .model_providers
+            .providers
+            .models
             .ensure("openrouter", "default")
             .expect("known model_provider type")
             .temperature = Some(5.0);
@@ -1090,7 +1092,8 @@ mod tests {
     fn config_validation_accepts_valid_temperature() {
         let mut config = Config::default();
         config
-            .model_providers
+            .providers
+            .models
             .ensure("openrouter", "default")
             .expect("known model_provider type")
             .temperature = Some(0.7);

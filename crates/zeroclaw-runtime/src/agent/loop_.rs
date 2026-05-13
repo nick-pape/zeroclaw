@@ -2619,7 +2619,8 @@ pub async fn run(
         crate::cost::CostTracker::get_or_init_global(config.cost.clone(), &config.data_dir).map(
             |tracker| {
                 let pricing: crate::agent::cost::ModelProviderPricing = config
-                    .model_providers
+                    .providers
+                    .models
                     .iter_entries()
                     .map(|(type_k, alias_k, profile)| {
                         (format!("{type_k}.{alias_k}"), profile.pricing.clone())

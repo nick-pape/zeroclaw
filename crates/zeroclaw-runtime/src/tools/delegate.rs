@@ -2700,7 +2700,7 @@ mod tests {
         let mut config = zeroclaw_config::schema::Config::default();
         // model_provider must reference a real entry under
         // providers.models — the validator (correctly) rejects dangling refs.
-        config.model_providers.ollama.insert(
+        config.providers.models.ollama.insert(
             "default".into(),
             zeroclaw_config::schema::OllamaModelProviderConfig::default(),
         );

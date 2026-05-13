@@ -151,7 +151,7 @@ pub fn dispatch_family_factory(
                 $(
                     $type_str => {
                         let default_cfg: $cfg_ty;
-                        let cfg: &$cfg_ty = match config.and_then(|c| c.model_providers.$field.get(alias)) {
+                        let cfg: &$cfg_ty = match config.and_then(|c| c.providers.models.$field.get(alias)) {
                             Some(c) => c,
                             None => {
                                 default_cfg = <$cfg_ty>::default();

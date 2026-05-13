@@ -1126,7 +1126,8 @@ fn record_turn_cost(
     // `<type>.<alias>` key shape.
     let config = state.config.read();
     let pricing_map = config
-        .model_providers
+        .providers
+        .models
         .iter_entries()
         .filter(|(_, _, base)| !base.pricing.is_empty())
         .map(|(type_k, alias_k, base)| (format!("{type_k}.{alias_k}"), base.pricing.clone()))
@@ -1312,7 +1313,7 @@ mod tests {
     #[test]
     fn needs_onboarding_ws_error_uses_current_configured_model() {
         let mut config = zeroclaw_config::schema::Config::default();
-        config.model_providers.openai.insert(
+        config.providers.models.openai.insert(
             "default".to_string(),
             zeroclaw_config::schema::OpenAIModelProviderConfig {
                 base: zeroclaw_config::schema::ModelProviderConfig {
