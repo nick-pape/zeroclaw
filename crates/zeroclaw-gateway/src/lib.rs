@@ -9,6 +9,7 @@
 
 pub mod acp;
 pub mod api;
+pub mod api_browse;
 pub mod api_config;
 pub mod api_onboard;
 pub mod api_pairing;
@@ -1253,6 +1254,7 @@ pub async fn run_gateway(
             "/api/personality/{filename}",
             get(api_personality::handle_get).put(api_personality::handle_put),
         )
+        .route("/api/browse", get(api_browse::handle_browse))
         .route("/api/skills/bundles", get(api_skills::handle_list_bundles))
         .route(
             "/api/skills/bundles/{alias}/skills",

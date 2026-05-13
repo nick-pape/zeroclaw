@@ -10,6 +10,7 @@ pub mod helpers;
 pub mod migration;
 pub mod multi_agent;
 pub mod pairing;
+pub mod paths;
 pub mod platform;
 pub mod policy;
 pub mod provider_aliases;

@@ -248,6 +248,8 @@ mod commands;
 mod rag {
     pub use zeroclaw::rag::*;
 }
+#[cfg(feature = "agent-runtime")]
+mod browse;
 mod config;
 #[cfg(feature = "agent-runtime")]
 mod cost;
@@ -295,7 +297,6 @@ mod security;
 mod service;
 #[cfg(feature = "agent-runtime")]
 mod skillforge;
-#[cfg(feature = "agent-runtime")]
 mod skills;
 #[cfg(feature = "agent-runtime")]
 mod sop;
@@ -642,6 +643,23 @@ Examples:
     Skills {
         #[command(subcommand)]
         skill_command: SkillCommands,
+    },
+
+    /// Browse the shared workspace one directory at a time
+    #[command(long_about = "\
+List children of a directory under <install>/shared/. Paths are relative \
+to the shared workspace root; `..` traversal that escapes the root is \
+rejected. Used by the dashboard's skill-bundle directory picker and by \
+operators who want to inspect what's installed.
+
+Examples:
+  zeroclaw browse                  # list shared/ root
+  zeroclaw browse skills           # list shared/skills/
+  zeroclaw browse skills/coding    # list shared/skills/coding/")]
+    Browse {
+        /// Path relative to `<install>/shared/`. Empty = root.
+        #[arg(default_value = "")]
+        path: String,
     },
 
     /// Manage standard operating procedures (SOPs)
@@ -2241,6 +2259,8 @@ async fn main() -> Result<()> {
         } => integrations::handle_command(integration_command, &config),
 
         Commands::Skills { skill_command } => skills::handle_command(skill_command, &config),
+
+        Commands::Browse { path } => browse::handle_browse(path, &config),
 
         Commands::Sop { sop_command } => sop::handle_command(sop_command, &config),
 

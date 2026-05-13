@@ -12,6 +12,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::paths::normalize_lexical;
 use crate::schema::Config;
 
 /// Canonical default directory for a bundle: `<install>/shared/skills/<alias>/`.
@@ -58,8 +59,8 @@ pub fn resolve_directory(
 /// and inside [`crate::schema::Config::validate`].
 pub fn validate_directory(path: &Path, install_root: &Path) -> Result<(), BundleDirectoryError> {
     let shared = install_root.join("shared");
-    let normalized = normalize_path(path);
-    let shared_normalized = normalize_path(&shared);
+    let normalized = normalize_lexical(path);
+    let shared_normalized = normalize_lexical(&shared);
     if !normalized.starts_with(&shared_normalized) {
         return Err(BundleDirectoryError::EscapesShared {
             path: normalized.display().to_string(),
@@ -77,7 +78,7 @@ pub fn validate_uniqueness(
     let mut seen: Vec<(String, PathBuf)> = Vec::with_capacity(config.skill_bundles.len());
     for alias in config.skill_bundles.keys() {
         let dir = resolve_directory(config, install_root, alias)?;
-        let normalized = normalize_path(&dir);
+        let normalized = normalize_lexical(&dir);
         if let Some((other, _)) = seen.iter().find(|(_, p)| p == &normalized) {
             return Err(BundleDirectoryError::DirectoryCollision {
                 path: normalized.display().to_string(),
@@ -88,24 +89,6 @@ pub fn validate_uniqueness(
         seen.push((alias.clone(), normalized));
     }
     Ok(())
-}
-
-/// Lexical normalization that resolves `.` and `..` without touching the
-/// filesystem. Sufficient for "stays inside `shared/`" reasoning where the
-/// path may not yet exist on disk.
-fn normalize_path(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for component in path.components() {
-        use std::path::Component;
-        match component {
-            Component::ParentDir => {
-                out.pop();
-            }
-            Component::CurDir => {}
-            other => out.push(other.as_os_str()),
-        }
-    }
-    out
 }
 
 #[derive(Debug, thiserror::Error)]

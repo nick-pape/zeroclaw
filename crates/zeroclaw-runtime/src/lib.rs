@@ -7,6 +7,7 @@ pub mod util;
 
 pub mod agent;
 pub mod approval;
+pub mod browse;
 pub mod cost;
 pub mod cron;
 pub mod daemon;
