@@ -1501,14 +1501,33 @@ fn synthesize_agent_brains(
         }
 
         // skills_directory → synthesize a per-agent skill_bundle and
-        // append its alias to agent.skill_bundles. V3
-        // SkillBundleConfig.directory carries the V2 path verbatim.
+        // append its alias to agent.skill_bundles. V3 confines bundle
+        // directories to `<install>/shared/skills/<bundle_alias>/`, so
+        // V2 paths inside `shared/` survive verbatim; everything else
+        // (absolute paths, paths above `shared/`) drops the explicit
+        // directory and falls back to the default. The operator's
+        // V2 skills need to be copied into the new location after
+        // migration — surface a warning naming what was dropped.
         if let Some(toml::Value::String(skills_dir)) = agent_table.remove("skills_directory")
             && !skills_dir.is_empty()
         {
             let bundle_alias = format!("agent_{}", alias);
             let mut bundle_entry = toml::Table::new();
-            bundle_entry.insert("directory".to_string(), toml::Value::String(skills_dir));
+            let trimmed = skills_dir.trim().trim_start_matches("./");
+            let stays_inside_shared = !std::path::Path::new(trimmed).is_absolute()
+                && (trimmed == "shared" || trimmed.starts_with("shared/"));
+            if stays_inside_shared {
+                bundle_entry.insert("directory".to_string(), toml::Value::String(skills_dir));
+            } else {
+                tracing::warn!(
+                    target: "migration",
+                    "agents.{alias}.skills_directory = \"{skills_dir}\" lies outside \
+                     <install>/shared/. V3 confines skill-bundles to \
+                     <install>/shared/skills/<alias>/; the path was dropped and the bundle \
+                     falls back to the default. Copy the V2 skill files into \
+                     <install>/shared/skills/{bundle_alias}/ to restore them."
+                );
+            }
             install_profile_entry(passthrough, "skill_bundles", &bundle_alias, bundle_entry);
             // V3 AliasedAgentConfig.skill_bundles is Vec<String> of aliases.
             // Append our synthesized bundle alias (preserve any user-set list).
@@ -1709,7 +1728,7 @@ fn rewrite_dangling_peer_group_agents(passthrough: &mut toml::Table) {
         alias
     };
 
-    let mut rewritten_channels: Vec<String> = Vec::new();
+    let mut rewritten_channel_types: Vec<String> = Vec::new();
     {
         let Some(toml::Value::Table(peer_groups)) = passthrough.get_mut("peer_groups") else {
             return;
@@ -1730,7 +1749,7 @@ fn rewrite_dangling_peer_group_agents(passthrough: &mut toml::Table) {
                 toml::Value::Array(vec![toml::Value::String(replacement_alias.clone())]),
             );
             if let Some(toml::Value::String(channel_ref)) = group_table.get("channel") {
-                rewritten_channels.push(channel_ref.clone());
+                rewritten_channel_types.push(channel_ref.clone());
             }
             tracing::info!(
                 target: "migration",
@@ -1739,9 +1758,35 @@ fn rewrite_dangling_peer_group_agents(passthrough: &mut toml::Table) {
         }
     }
 
-    if rewritten_channels.is_empty() {
+    if rewritten_channel_types.is_empty() {
         return;
     }
+
+    // Resolve each bare channel type back to the full set of
+    // `<type>.<alias>` ChannelRefs that exist in `[channels.<type>.*]`.
+    // peer_groups now bind to a type only, but agents.<X>.channels
+    // requires dotted form. The V1/V2 single-agent fold assigned every
+    // alias of that type to the bridge agent.
+    let mut resolved_refs: Vec<String> = Vec::new();
+    if let Some(toml::Value::Table(channels_table)) = passthrough.get("channels") {
+        for channel_type in &rewritten_channel_types {
+            let aliases = channels_table
+                .get(channel_type)
+                .and_then(toml::Value::as_table)
+                .map(|t| t.keys().cloned().collect::<Vec<_>>())
+                .unwrap_or_default();
+            for alias in aliases {
+                let dotted = format!("{channel_type}.{alias}");
+                if !resolved_refs.contains(&dotted) {
+                    resolved_refs.push(dotted);
+                }
+            }
+        }
+    }
+    if resolved_refs.is_empty() {
+        return;
+    }
+
     let Some(toml::Value::Table(agents_table)) = passthrough.get_mut("agents") else {
         return;
     };
@@ -1755,7 +1800,7 @@ fn rewrite_dangling_peer_group_agents(passthrough: &mut toml::Table) {
         return;
     };
     let mut added: Vec<String> = Vec::new();
-    for ch in &rewritten_channels {
+    for ch in &resolved_refs {
         let present = channels_arr.iter().any(|v| v.as_str() == Some(ch.as_str()));
         if !present {
             channels_arr.push(toml::Value::String(ch.clone()));

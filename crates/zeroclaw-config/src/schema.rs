@@ -14175,8 +14175,13 @@ impl Config {
                     "peer_groups.{group_name}.channel must name a channel type (e.g. \"discord\")",
                 );
             }
+            // `get_map_keys` stores section names in kebab form (the schema
+            // macro converts snake idents via `snake_to_kebab`); convert
+            // before the lookup so underscored channel types like
+            // `nextcloud_talk` resolve correctly.
+            let group_channel_kebab = group_channel.replace('_', "-");
             if self
-                .get_map_keys(&format!("channels.{group_channel}"))
+                .get_map_keys(&format!("channels.{group_channel_kebab}"))
                 .is_none()
             {
                 validation_bail!(

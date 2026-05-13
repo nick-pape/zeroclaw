@@ -893,15 +893,16 @@ fn t14d_skills_directory_synthesizes_per_agent_skill_bundle() {
         agent.skill_bundles
     );
 
-    // The bundle entry exists with the V2 directory captured.
+    // The bundle entry exists, but the absolute V2 path is outside
+    // <install>/shared/ — V3 drops it and the bundle resolves to the
+    // default <install>/shared/skills/<alias>/ at runtime.
     let bundle = cfg
         .skill_bundles
         .get("agent_complex_agent")
         .expect("skill_bundles.agent_complex_agent synthesized from V2 skills_directory");
     assert_eq!(
-        bundle.directory.as_deref(),
-        Some("/opt/zeroclaw/skills"),
-        "V2 skills_directory value must land at skill_bundles.agent_<id>.directory"
+        bundle.directory, None,
+        "V2 skills_directory outside <install>/shared/ must drop to default, not carry the V2 path"
     );
 
     // skills_directory must not survive on the V3 agent (V3 schema has
@@ -1622,14 +1623,14 @@ allowed_users = ["@oncall"]
         .expect("discord allow-list folds into [peer_groups.discord_default]");
     assert_eq!(
         discord_group.get("channel").and_then(toml::Value::as_str),
-        Some("discord.default"),
+        Some("discord"),
     );
     let discord_peers: Vec<&str> = discord_group
         .get("external_peers")
         .and_then(toml::Value::as_array)
         .unwrap()
         .iter()
-        .filter_map(|v| v.get("username").and_then(toml::Value::as_str))
+        .filter_map(toml::Value::as_str)
         .collect();
     assert_eq!(discord_peers, vec!["alice", "bob"]);
 
@@ -1639,7 +1640,7 @@ allowed_users = ["@oncall"]
         .expect("slack allow-list folds into [peer_groups.slack_default]");
     assert_eq!(
         slack_group.get("channel").and_then(toml::Value::as_str),
-        Some("slack.default"),
+        Some("slack"),
     );
 }
 
@@ -1785,9 +1786,8 @@ allowed_senders = ["ops@example"]
             .and_then(toml::Value::as_array)
             .unwrap()
             .first()
-            .and_then(|v| v.get("username"))
             .and_then(toml::Value::as_str)
-            .unwrap_or_else(|| panic!("external_peers[0].username for {channel_type}"));
+            .unwrap_or_else(|| panic!("external_peers[0] for {channel_type}"));
         assert_eq!(peer, expected_user, "{channel_type} username");
 
         let channel_alias = channels
@@ -1828,7 +1828,7 @@ allowed_rooms = ["!ops:matrix.org"]
         .and_then(toml::Value::as_array)
         .unwrap()
         .iter()
-        .filter_map(|v| v.get("username").and_then(toml::Value::as_str))
+        .filter_map(toml::Value::as_str)
         .collect();
     assert_eq!(peers, vec!["@alice:matrix.org", "@bob:matrix.org"]);
 
