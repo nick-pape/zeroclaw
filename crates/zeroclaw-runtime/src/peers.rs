@@ -33,7 +33,7 @@ pub struct ResolvedPeers {
     /// never present (an agent is not its own peer).
     pub agent_peers: BTreeMap<ChannelRef, BTreeSet<String>>,
     /// Channel → external-peer usernames (case-folded, `@` prefix
-    /// stripped at load time by `PeerExternal` deserialization).
+    /// stripped at load time by `PeerUsername` deserialization).
     pub external_peers: BTreeMap<ChannelRef, BTreeSet<String>>,
 }
 
@@ -161,17 +161,13 @@ pub fn resolve_peer_set(config: &Config, agent_alias: &str) -> ResolvedPeers {
 
         let ext_set = resolved.external_peers.entry(channel.clone()).or_default();
         for ext in &group.external_peers {
-            // PeerExternal's username is already case-folded and `@`
-            // stripped at deserialization (multi_agent.rs).
-            ext_set.insert(ext.username.as_str().to_ascii_lowercase());
+            // PeerUsername is already case-folded and `@`-stripped at
+            // deserialization (multi_agent.rs).
+            ext_set.insert(ext.as_str().to_ascii_lowercase());
         }
 
-        // Apply the per-group ignore subtraction. `ignore` entries
-        // are matched against the same case-folded form on both
-        // sides.
         for ignored in &group.ignore {
             let needle = ignored
-                .username
                 .as_str()
                 .trim_start_matches('@')
                 .to_ascii_lowercase();
@@ -186,7 +182,7 @@ pub fn resolve_peer_set(config: &Config, agent_alias: &str) -> ResolvedPeers {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zeroclaw_config::multi_agent::{AgentAlias, PeerExternal, PeerGroupConfig, PeerUsername};
+    use zeroclaw_config::multi_agent::{AgentAlias, PeerGroupConfig, PeerUsername};
     use zeroclaw_config::providers::ChannelRef;
     use zeroclaw_config::schema::{AliasedAgentConfig, Config, RiskProfileConfig};
 
@@ -205,9 +201,7 @@ mod tests {
         let group = PeerGroupConfig {
             channel: ChannelRef::from("telegram.prod"),
             agents: vec![AgentAlias::from("alpha"), AgentAlias::from("beta")],
-            external_peers: vec![PeerExternal {
-                username: PeerUsername::from("operator"),
-            }],
+            external_peers: vec![PeerUsername::from("operator")],
             ignore: vec![],
         };
         cfg.peer_groups.insert("research".to_string(), group);
@@ -260,9 +254,7 @@ mod tests {
         // Drop "operator" from the external set via the group's
         // ignore list; should disappear from the resolved set.
         let group = cfg.peer_groups.get_mut("research").unwrap();
-        group.ignore.push(PeerExternal {
-            username: PeerUsername::from("operator"),
-        });
+        group.ignore.push(PeerUsername::from("operator"));
 
         let resolved = resolve_peer_set(&cfg, "alpha");
         let alpha_ext = resolved
@@ -305,7 +297,7 @@ mod tests {
         let cfg = make_config_with_two_agents_in_one_group();
         let resolved = resolve_peer_set(&cfg, "alpha");
         let channel = ChannelRef::from("telegram.prod");
-        // PeerExternal stores the username case-folded with no `@`;
+        // PeerUsername stores the username case-folded with no `@`;
         // inbound handles often have `@` prefixes and mixed case.
         assert!(
             resolved.allows_inbound(&channel, "@Operator"),

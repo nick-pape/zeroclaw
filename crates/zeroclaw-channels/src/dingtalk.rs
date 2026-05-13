@@ -410,11 +410,7 @@ allowed_users = ["user1", "*"]
             .get("dingtalk_default")
             .expect("dingtalk allow-list synthesizes [peer_groups.dingtalk_default]");
         assert_eq!(group.channel.as_str(), "dingtalk.default");
-        let peers: Vec<&str> = group
-            .external_peers
-            .iter()
-            .map(|p| p.username.as_str())
-            .collect();
+        let peers: Vec<&str> = group.external_peers.iter().map(|p| p.as_str()).collect();
         assert_eq!(peers, vec!["user1"]);
     }
 

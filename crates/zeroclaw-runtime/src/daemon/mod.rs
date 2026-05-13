@@ -1319,7 +1319,7 @@ mod tests {
 
     #[test]
     fn auto_detect_telegram_when_configured() {
-        use zeroclaw_config::multi_agent::{PeerExternal, PeerGroupConfig, PeerUsername};
+        use zeroclaw_config::multi_agent::{PeerGroupConfig, PeerUsername};
         use zeroclaw_config::providers::ChannelRef;
 
         let mut config = Config::default();
@@ -1345,9 +1345,7 @@ mod tests {
             "telegram_default".to_string(),
             PeerGroupConfig {
                 channel: ChannelRef::new("telegram.default"),
-                external_peers: vec![PeerExternal {
-                    username: PeerUsername::new("user123"),
-                }],
+                external_peers: vec![PeerUsername::new("user123")],
                 ..PeerGroupConfig::default()
             },
         );

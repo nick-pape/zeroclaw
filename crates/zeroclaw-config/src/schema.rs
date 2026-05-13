@@ -8522,10 +8522,6 @@ pub struct RuntimeProfileConfig {
     pub model_provider: Option<String>,
     /// Model identifier.
     pub model: Option<String>,
-    /// API key override for this profile.
-    #[secret]
-    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
-    pub api_key: Option<String>,
     /// Sampling temperature override.
     pub temperature: Option<f64>,
     /// Maximum tokens to generate.
@@ -12768,7 +12764,7 @@ impl Config {
                 continue;
             }
             for peer in &group.external_peers {
-                let username = peer.username.as_str().to_string();
+                let username = peer.as_str().to_string();
                 if seen.insert(username.clone()) {
                     out.push(username);
                 }
@@ -16342,11 +16338,7 @@ allowed_contacts = ["+1234567890", "user@icloud.com"]
             .get("imessage_default")
             .expect("V2 imessage.allowed_contacts must fold into peer_groups.imessage_default");
         assert_eq!(group.channel.as_str(), "imessage.default");
-        let usernames: Vec<&str> = group
-            .external_peers
-            .iter()
-            .map(|p| p.username.as_str())
-            .collect();
+        let usernames: Vec<&str> = group.external_peers.iter().map(|p| p.as_str()).collect();
         assert_eq!(usernames, vec!["+1234567890", "user@icloud.com"]);
     }
 
@@ -16609,11 +16601,7 @@ allowed_users = ["111", "222"]
             .get("discord_default")
             .expect("V2 discord.allowed_users must fold into peer_groups.discord_default");
         assert_eq!(group.channel.as_str(), "discord.default");
-        let usernames: Vec<&str> = group
-            .external_peers
-            .iter()
-            .map(|p| p.username.as_str())
-            .collect();
+        let usernames: Vec<&str> = group.external_peers.iter().map(|p| p.as_str()).collect();
         assert_eq!(usernames, vec!["111", "222"]);
     }
 
@@ -16633,11 +16621,7 @@ allowed_users = ["U111"]
             .get("slack_default")
             .expect("V2 slack.allowed_users must fold into peer_groups.slack_default");
         assert_eq!(group.channel.as_str(), "slack.default");
-        let usernames: Vec<&str> = group
-            .external_peers
-            .iter()
-            .map(|p| p.username.as_str())
-            .collect();
+        let usernames: Vec<&str> = group.external_peers.iter().map(|p| p.as_str()).collect();
         assert_eq!(usernames, vec!["U111"]);
     }
 
@@ -16835,11 +16819,7 @@ allowed_numbers = ["+1", "+2"]
             .get("whatsapp_default")
             .expect("V2 whatsapp.allowed_numbers must fold into peer_groups.whatsapp_default");
         assert_eq!(group.channel.as_str(), "whatsapp.default");
-        let usernames: Vec<&str> = group
-            .external_peers
-            .iter()
-            .map(|p| p.username.as_str())
-            .collect();
+        let usernames: Vec<&str> = group.external_peers.iter().map(|p| p.as_str()).collect();
         assert_eq!(usernames, vec!["+1", "+2"]);
     }
 
@@ -18380,11 +18360,7 @@ allowed_users = ["user_alpha", "user_beta"]
             .get("lark_default")
             .expect("V2 lark.allowed_users must fold into peer_groups.lark_default");
         assert_eq!(group.channel.as_str(), "lark.default");
-        let usernames: Vec<&str> = group
-            .external_peers
-            .iter()
-            .map(|p| p.username.as_str())
-            .collect();
+        let usernames: Vec<&str> = group.external_peers.iter().map(|p| p.as_str()).collect();
         assert_eq!(usernames, vec!["user_alpha", "user_beta"]);
     }
 
@@ -18464,11 +18440,7 @@ allowed_users = ["Uabc123", "Udef456"]
             .peer_groups
             .get("line_default")
             .expect("V2 line.allowed_users must fold into peer_groups.line_default");
-        let usernames: Vec<&str> = group
-            .external_peers
-            .iter()
-            .map(|p| p.username.as_str())
-            .collect();
+        let usernames: Vec<&str> = group.external_peers.iter().map(|p| p.as_str()).collect();
         assert_eq!(usernames, vec!["Uabc123", "Udef456"]);
     }
 

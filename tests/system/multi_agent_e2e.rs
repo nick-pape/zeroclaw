@@ -211,7 +211,7 @@ async fn peer_group_routes_messages_only_within_resolved_peer_set() {
     use serde_json::json;
     use std::sync::Arc;
     use zeroclaw_api::tool::Tool;
-    use zeroclaw_config::multi_agent::{AgentAlias, PeerExternal, PeerGroupConfig, PeerUsername};
+    use zeroclaw_config::multi_agent::{AgentAlias, PeerGroupConfig, PeerUsername};
     use zeroclaw_config::providers::ChannelRef;
     use zeroclaw_config::schema::{AliasedAgentConfig, Config, RiskProfileConfig};
     use zeroclaw_runtime::peers::resolve_peer_set;
@@ -235,9 +235,7 @@ async fn peer_group_routes_messages_only_within_resolved_peer_set() {
             // Only alpha + beta are in the group; gamma listens on the
             // channel but is not a peer.
             agents: vec![AgentAlias::from("alpha"), AgentAlias::from("beta")],
-            external_peers: vec![PeerExternal {
-                username: PeerUsername::from("operator"),
-            }],
+            external_peers: vec![PeerUsername::from("operator")],
             ignore: vec![],
         },
     );

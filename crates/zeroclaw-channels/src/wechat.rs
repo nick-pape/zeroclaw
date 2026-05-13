@@ -741,7 +741,7 @@ impl WeChatChannel {
     }
 
     async fn persist_allowed_identity(&self, identity: &str) -> anyhow::Result<()> {
-        use zeroclaw_config::multi_agent::{PeerExternal, PeerGroupConfig, PeerUsername};
+        use zeroclaw_config::multi_agent::{PeerGroupConfig, PeerUsername};
         use zeroclaw_config::providers::ChannelRef;
 
         let Some(config) = &self.persist else {
@@ -774,13 +774,11 @@ impl WeChatChannel {
             if group
                 .external_peers
                 .iter()
-                .any(|p| p.username.as_str() == normalized)
+                .any(|p| p.as_str() == normalized)
             {
                 return Ok(());
             }
-            group.external_peers.push(PeerExternal {
-                username: PeerUsername::new(normalized),
-            });
+            group.external_peers.push(PeerUsername::new(normalized));
             cfg.clone()
         };
         snapshot

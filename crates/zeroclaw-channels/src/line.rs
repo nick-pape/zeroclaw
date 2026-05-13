@@ -166,7 +166,7 @@ fn is_line_user_allowed(state: &LineState, user_id: &str) -> bool {
 /// No-op-with-warn when `state.persist` is unset (test fixtures).
 async fn persist_line_paired_identity(state: &LineState, user_id: &str) -> anyhow::Result<()> {
     use anyhow::Context;
-    use zeroclaw_config::multi_agent::{PeerExternal, PeerGroupConfig, PeerUsername};
+    use zeroclaw_config::multi_agent::{PeerGroupConfig, PeerUsername};
     use zeroclaw_config::providers::ChannelRef;
 
     let Some(config) = &state.persist else {
@@ -194,13 +194,11 @@ async fn persist_line_paired_identity(state: &LineState, user_id: &str) -> anyho
         if group
             .external_peers
             .iter()
-            .any(|p| p.username.as_str() == normalized)
+            .any(|p| p.as_str() == normalized)
         {
             return Ok(());
         }
-        group.external_peers.push(PeerExternal {
-            username: PeerUsername::new(normalized),
-        });
+        group.external_peers.push(PeerUsername::new(normalized));
         cfg.clone()
     };
     snapshot

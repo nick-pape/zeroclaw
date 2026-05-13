@@ -4128,7 +4128,7 @@ fn normalize_telegram_identity(value: &str) -> String {
 }
 
 pub async fn bind_telegram_identity(config: &Config, identity: &str) -> Result<()> {
-    use zeroclaw_config::multi_agent::{PeerExternal, PeerGroupConfig, PeerUsername};
+    use zeroclaw_config::multi_agent::{PeerGroupConfig, PeerUsername};
     use zeroclaw_config::providers::ChannelRef;
 
     let normalized = normalize_telegram_identity(identity);
@@ -4162,15 +4162,15 @@ pub async fn bind_telegram_identity(config: &Config, identity: &str) -> Result<(
     if group
         .external_peers
         .iter()
-        .any(|p| normalize_telegram_identity(p.username.as_str()) == normalized)
+        .any(|p| normalize_telegram_identity(p.as_str()) == normalized)
     {
         println!("✅ Telegram identity already bound: {normalized}");
         return Ok(());
     }
 
-    group.external_peers.push(PeerExternal {
-        username: PeerUsername::new(normalized.clone()),
-    });
+    group
+        .external_peers
+        .push(PeerUsername::new(normalized.clone()));
     updated.save().await?;
     println!("✅ Bound Telegram identity: {normalized}");
     println!("   Saved to {}", updated.config_path.display());

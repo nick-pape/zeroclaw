@@ -233,7 +233,7 @@ impl Tool for SendMessageToPeerTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zeroclaw_config::multi_agent::{AgentAlias, PeerExternal, PeerGroupConfig, PeerUsername};
+    use zeroclaw_config::multi_agent::{AgentAlias, PeerGroupConfig, PeerUsername};
     use zeroclaw_config::schema::{AliasedAgentConfig, Config, RiskProfileConfig};
 
     fn config_with_two_agents_and_one_peer_group() -> Config {
@@ -254,9 +254,7 @@ mod tests {
             PeerGroupConfig {
                 channel: ChannelRef::from("telegram.prod"),
                 agents: vec![AgentAlias::from("alpha"), AgentAlias::from("beta")],
-                external_peers: vec![PeerExternal {
-                    username: PeerUsername::from("operator"),
-                }],
+                external_peers: vec![PeerUsername::from("operator")],
                 ignore: vec![],
             },
         );

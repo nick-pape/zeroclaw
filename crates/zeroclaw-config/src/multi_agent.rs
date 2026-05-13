@@ -33,21 +33,6 @@ pub enum AccessMode {
     ReadWrite,
 }
 
-/// Single non-agent member of a peer group: a human or an external bot reachable
-/// at `username` on the group's `channel`. The channel ref lives on the group,
-/// so the entry only carries the username.
-///
-/// Lifted into `[[peer_groups.<name>.external_peers]]` and
-/// `[[peer_groups.<name>.ignore]]` arrays.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-pub struct PeerExternal {
-    /// The on-channel username, formatted as the channel kind expects (e.g.
-    /// `@beta_bot` for Telegram, `Audacity#0001` for Discord). Validation lives
-    /// in `Config::validate()` once the channel kind is known.
-    pub username: PeerUsername,
-}
-
 /// Per-agent memory backend selector.
 ///
 /// Closed set; the schema is law. The enum mirrors the storage-instance
@@ -157,11 +142,14 @@ pub struct PeerGroupConfig {
     /// Member agents by alias. Mutual membership with another agent in
     /// the same group makes them peers.
     pub agents: Vec<AgentAlias>,
-    /// Non-agent members on the group's channel.
-    pub external_peers: Vec<PeerExternal>,
+    /// Non-agent members on the group's channel. Each entry is a
+    /// channel-native username (e.g. `@beta_bot` for Telegram,
+    /// `Audacity#0001` for Discord); validation lives in
+    /// `Config::validate()` once the channel kind is known.
+    pub external_peers: Vec<PeerUsername>,
     /// Group-wide blocklist. Matching usernames are subtracted from the
     /// resolved peer set every member sees.
-    pub ignore: Vec<PeerExternal>,
+    pub ignore: Vec<PeerUsername>,
 }
 
 #[cfg(test)]
@@ -196,34 +184,18 @@ mod tests {
     }
 
     #[test]
-    fn peer_external_round_trips() {
-        let entry = PeerExternal {
-            username: PeerUsername::new("@beta_bot"),
-        };
-        let json = serde_json::to_string(&entry).unwrap();
-        let back: PeerExternal = serde_json::from_str(&json).unwrap();
-        assert_eq!(entry, back);
-    }
-
-    #[test]
-    fn peer_external_round_trips_through_toml_array() {
-        // Real-world shape: peer_groups.<name>.external_peers is an array of
-        // tables. Validate the typed shape parses cleanly from that form.
+    fn external_peers_round_trip_as_inline_string_array() {
         let toml_input = r#"
-[[external_peers]]
-username = "@user_1"
-
-[[external_peers]]
-username = "@user_2"
+external_peers = ["@user_1", "@user_2"]
 "#;
         #[derive(Deserialize)]
         struct Wrapper {
-            external_peers: Vec<PeerExternal>,
+            external_peers: Vec<PeerUsername>,
         }
         let parsed: Wrapper = toml::from_str(toml_input).unwrap();
         assert_eq!(parsed.external_peers.len(), 2);
-        assert_eq!(parsed.external_peers[0].username, "@user_1");
-        assert_eq!(parsed.external_peers[1].username, "@user_2");
+        assert_eq!(parsed.external_peers[0].as_str(), "@user_1");
+        assert_eq!(parsed.external_peers[1].as_str(), "@user_2");
     }
 
     #[test]
@@ -309,15 +281,8 @@ gamma = "read_write"
         let toml_input = r#"
 channel = "telegram.prod"
 agents = ["alpha", "beta"]
-
-[[external_peers]]
-username = "@user_1"
-
-[[external_peers]]
-username = "@user_2"
-
-[[ignore]]
-username = "@known_spammer"
+external_peers = ["@user_1", "@user_2"]
+ignore = ["@known_spammer"]
 "#;
         let parsed: PeerGroupConfig = toml::from_str(toml_input).unwrap();
         assert_eq!(parsed.channel, "telegram.prod");
@@ -325,9 +290,9 @@ username = "@known_spammer"
         assert_eq!(parsed.agents[0], "alpha");
         assert_eq!(parsed.agents[1], "beta");
         assert_eq!(parsed.external_peers.len(), 2);
-        assert_eq!(parsed.external_peers[0].username, "@user_1");
+        assert_eq!(parsed.external_peers[0].as_str(), "@user_1");
         assert_eq!(parsed.ignore.len(), 1);
-        assert_eq!(parsed.ignore[0].username, "@known_spammer");
+        assert_eq!(parsed.ignore[0].as_str(), "@known_spammer");
     }
 
     #[test]
