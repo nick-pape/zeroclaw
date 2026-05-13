@@ -665,10 +665,7 @@ pub struct ReloadStatusResponse {
 
 /// `GET /api/config/reload-status` — pending-reload flag for the dashboard's
 /// reload banner. Goes true on any config write, false on `/admin/reload`.
-pub async fn handle_reload_status(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Response {
+pub async fn handle_reload_status(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }

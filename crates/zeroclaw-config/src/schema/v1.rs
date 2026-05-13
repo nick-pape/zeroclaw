@@ -166,10 +166,7 @@ impl V1Config {
                 providers.insert("models".to_string(), toml::Value::Table(models_table));
             }
             if !model_routes.is_empty() {
-                providers.insert(
-                    "model_routes".to_string(),
-                    toml::Value::Array(model_routes),
-                );
+                providers.insert("model_routes".to_string(), toml::Value::Array(model_routes));
             }
             if !embedding_routes.is_empty() {
                 providers.insert(

@@ -797,17 +797,32 @@ pub async fn handle_api_memory_delete(
     }
 }
 
-/// GET /api/cost — cost summary
+/// Query parameters for `GET /api/cost`. When `agent` is set, the
+/// returned summary filters to records attributed to that alias.
+#[derive(Debug, Deserialize)]
+pub struct CostQuery {
+    #[serde(default)]
+    pub agent: Option<String>,
+}
+
+/// GET /api/cost — cost summary. Pass `?agent=<alias>` for per-agent
+/// rollup; omit it for the global summary which also embeds a
+/// `by_agent` map when per-agent tracking is enabled.
 pub async fn handle_api_cost(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(query): Query<CostQuery>,
 ) -> impl IntoResponse {
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
 
     if let Some(ref tracker) = state.cost_tracker {
-        match tracker.get_summary() {
+        let result = match query.agent.as_deref().filter(|s| !s.is_empty()) {
+            Some(alias) => tracker.get_summary_for_agent(alias),
+            None => tracker.get_summary(),
+        };
+        match result {
             Ok(summary) => Json(serde_json::json!({"cost": summary})).into_response(),
             Err(e) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -824,6 +839,7 @@ pub async fn handle_api_cost(
                 "total_tokens": 0,
                 "request_count": 0,
                 "by_model": {},
+                "by_agent": {},
             }
         }))
         .into_response()
@@ -919,6 +935,7 @@ pub async fn handle_api_sessions_list(
                 "created_at": meta.created_at.to_rfc3339(),
                 "last_activity": meta.last_activity.to_rfc3339(),
                 "message_count": meta.message_count,
+                "agent_alias": meta.agent_alias,
             });
             if let Some(name) = meta.name {
                 entry["name"] = serde_json::Value::String(name);

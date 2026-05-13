@@ -2627,6 +2627,7 @@ pub async fn run(
                     .filter(|(_, p)| !p.is_empty())
                     .collect();
                 ToolLoopCostTrackingContext::new(tracker, Arc::new(pricing))
+                    .with_agent_alias(agent_alias)
             });
 
     // ── Execute ──────────────────────────────────────────────────

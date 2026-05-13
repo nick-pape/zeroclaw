@@ -1151,7 +1151,7 @@ pub async fn run_gateway(
         web_dist_dir,
         canvas_store,
         cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         #[cfg(feature = "webauthn")]
         webauthn: if config.security.webauthn.enabled {
             let secret_store = Arc::new(zeroclaw_runtime::security::SecretStore::new(
@@ -1773,6 +1773,7 @@ async fn run_gateway_chat_with_tools(
                 tracker.clone(),
                 std::sync::Arc::new(pricing),
             )
+            .with_agent_alias(&agent_alias)
         });
         let captured_usage = cost_tracking_context
             .as_ref()

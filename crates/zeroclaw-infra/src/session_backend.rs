@@ -20,6 +20,10 @@ pub struct SessionMetadata {
     pub last_activity: DateTime<Utc>,
     /// Total number of messages in the session.
     pub message_count: usize,
+    /// Alias of the agent that owned this session (HashMap key in
+    /// `config.agents`). `None` for sessions persisted before per-agent
+    /// attribution landed, or for backends that don't track it.
+    pub agent_alias: Option<String>,
 }
 
 /// Query parameters for listing sessions.
@@ -74,6 +78,7 @@ pub trait SessionBackend: Send + Sync {
                     created_at: Utc::now(),
                     last_activity: Utc::now(),
                     message_count: messages.len(),
+                    agent_alias: None,
                 }
             })
             .collect()
@@ -123,6 +128,22 @@ pub trait SessionBackend: Send + Sync {
         Ok(None)
     }
 
+    /// Record the agent alias that owns a session. Called on WebSocket
+    /// handshake when the alias is known. No-op for backends that don't
+    /// track per-agent attribution.
+    fn set_session_agent_alias(
+        &self,
+        _session_key: &str,
+        _agent_alias: &str,
+    ) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    /// Get the agent alias associated with a session, if recorded.
+    fn get_session_agent_alias(&self, _session_key: &str) -> std::io::Result<Option<String>> {
+        Ok(None)
+    }
+
     /// Look up metadata for a single session by key.
     ///
     /// The default impl loads all messages to derive the count and calls
@@ -140,6 +161,7 @@ pub trait SessionBackend: Send + Sync {
             created_at: Utc::now(),
             last_activity: Utc::now(),
             message_count: messages.len(),
+            agent_alias: None,
         })
     }
 
@@ -193,6 +215,7 @@ mod tests {
             created_at: Utc::now(),
             last_activity: Utc::now(),
             message_count: 5,
+            agent_alias: None,
         };
         assert_eq!(meta.key, "test");
         assert_eq!(meta.message_count, 5);

@@ -77,15 +77,35 @@ pub struct CostRecord {
     pub usage: TokenUsage,
     /// Session identifier (for grouping)
     pub session_id: String,
+    /// Alias of the agent that incurred this cost (HashMap key in
+    /// `config.agents`). `None` for records persisted before per-agent
+    /// attribution, or when `[cost].track_per_agent = false`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_alias: Option<String>,
 }
 
 impl CostRecord {
-    /// Create a new cost record.
+    /// Create a new cost record without agent attribution.
     pub fn new(session_id: impl Into<String>, usage: TokenUsage) -> Self {
         Self {
             id: uuid::Uuid::new_v4().to_string(),
             usage,
             session_id: session_id.into(),
+            agent_alias: None,
+        }
+    }
+
+    /// Create a new cost record attributed to an agent.
+    pub fn with_agent(
+        session_id: impl Into<String>,
+        agent_alias: Option<String>,
+        usage: TokenUsage,
+    ) -> Self {
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            usage,
+            session_id: session_id.into(),
+            agent_alias,
         }
     }
 }
@@ -124,6 +144,23 @@ pub struct CostSummary {
     pub request_count: usize,
     /// Breakdown by model
     pub by_model: std::collections::HashMap<String, ModelStats>,
+    /// Breakdown by agent alias. Empty when `[cost].track_per_agent =
+    /// false` or when no records carry an agent_alias.
+    #[serde(default)]
+    pub by_agent: std::collections::HashMap<String, AgentCostStats>,
+}
+
+/// Statistics for a specific agent alias.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentCostStats {
+    /// Agent alias (HashMap key in `config.agents`).
+    pub agent_alias: String,
+    /// Total cost attributed to this agent for the period.
+    pub cost_usd: f64,
+    /// Total tokens attributed to this agent for the period.
+    pub total_tokens: u64,
+    /// Number of requests attributed to this agent for the period.
+    pub request_count: usize,
 }
 
 /// Statistics for a specific model.
@@ -148,6 +185,7 @@ impl Default for CostSummary {
             total_tokens: 0,
             request_count: 0,
             by_model: std::collections::HashMap::new(),
+            by_agent: std::collections::HashMap::new(),
         }
     }
 }

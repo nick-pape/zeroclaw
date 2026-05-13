@@ -350,7 +350,6 @@ impl V2Config {
             "search_provider",
         );
 
-
         passthrough.insert("schema_version".to_string(), toml::Value::Integer(3));
 
         Ok(toml::Value::Table(passthrough))

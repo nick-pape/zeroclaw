@@ -1,11 +1,28 @@
 import { Link } from 'react-router-dom';
-import { Bot, MessageSquare, Pencil, Power } from 'lucide-react';
+import { Bot, Clock, DollarSign, MessageSquare, Pencil, Power } from 'lucide-react';
 import type { AgentSummary } from '@/lib/agents';
 
 export interface AgentCardProps {
   agent: AgentSummary;
   toggling: boolean;
   onToggle: () => void;
+}
+
+function formatRelative(iso: string | null): string {
+  if (!iso) return 'no sessions yet';
+  const ts = Date.parse(iso);
+  if (Number.isNaN(ts)) return 'no sessions yet';
+  const diffSec = Math.max(0, Math.floor((Date.now() - ts) / 1000));
+  if (diffSec < 60) return 'just now';
+  if (diffSec < 3600) return `${Math.floor(diffSec / 60)}m ago`;
+  if (diffSec < 86_400) return `${Math.floor(diffSec / 3600)}h ago`;
+  return `${Math.floor(diffSec / 86_400)}d ago`;
+}
+
+function formatUsd(value: number | null): string {
+  if (value === null) return '—';
+  if (value < 0.01) return '<$0.01';
+  return `$${value.toFixed(2)}`;
 }
 
 /**
@@ -71,13 +88,45 @@ export default function AgentCard({ agent, toggling, onToggle }: AgentCardProps)
         </button>
       </div>
 
-      <p className="text-xs mb-4" style={{ color: 'var(--pc-text-muted)' }}>
-        {channelCount === 0
-          ? 'No channels bound'
-          : channelCount === 1
-            ? '1 channel bound'
-            : `${channelCount} channels bound`}
-      </p>
+      <div className="flex flex-col gap-1 mb-4">
+        <p className="text-xs" style={{ color: 'var(--pc-text-muted)' }}>
+          {channelCount === 0
+            ? 'No channels bound'
+            : channelCount === 1
+              ? '1 channel bound'
+              : `${channelCount} channels bound`}
+        </p>
+        <p
+          className="text-xs flex items-center gap-1.5"
+          style={{ color: 'var(--pc-text-muted)' }}
+        >
+          <MessageSquare className="h-3 w-3" />
+          {agent.sessionCount === 0
+            ? 'No sessions'
+            : agent.sessionCount === 1
+              ? '1 session'
+              : `${agent.sessionCount} sessions`}
+          <span
+            className="inline-flex items-center gap-1 ml-2"
+            style={{ color: 'var(--pc-text-faint)' }}
+          >
+            <Clock className="h-3 w-3" />
+            {formatRelative(agent.lastActivity)}
+          </span>
+        </p>
+        <p
+          className="text-xs flex items-center gap-1.5"
+          style={{ color: 'var(--pc-text-muted)' }}
+          title={
+            agent.monthCostUsd === null
+              ? 'Per-agent tracking disabled in [cost].track_per_agent'
+              : 'Month-to-date spend attributed to this agent'
+          }
+        >
+          <DollarSign className="h-3 w-3" />
+          {formatUsd(agent.monthCostUsd)} this month
+        </p>
+      </div>
 
       <div className="flex items-center gap-2">
         <Link

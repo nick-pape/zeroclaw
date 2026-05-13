@@ -191,6 +191,7 @@ impl SessionBackend for SessionStore {
                     last_activity,
                     message_count: 0,
                     key,
+                    agent_alias: None,
                 }
             })
             .collect()

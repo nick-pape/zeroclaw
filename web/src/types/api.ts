@@ -99,10 +99,20 @@ export interface CostSummary {
   total_tokens: number;
   request_count: number;
   by_model: Record<string, ModelStats>;
+  /** Per-agent rollup. Empty when `[cost].track_per_agent = false` or
+   * when no records carry an agent_alias. */
+  by_agent: Record<string, AgentCostStats>;
 }
 
 export interface ModelStats {
   model: string;
+  cost_usd: number;
+  total_tokens: number;
+  request_count: number;
+}
+
+export interface AgentCostStats {
+  agent_alias: string;
   cost_usd: number;
   total_tokens: number;
   request_count: number;
@@ -121,6 +131,10 @@ export interface Session {
   last_activity: string;
   message_count: number;
   name?: string;
+  /** Alias of the agent that owned this session (HashMap key in
+   * `config.agents`). `null` for sessions persisted before per-agent
+   * attribution, or for backends without per-agent tracking. */
+  agent_alias: string | null;
 }
 
 export interface ChannelDetail {

@@ -299,7 +299,9 @@ channel_id = "mm-fold-test"
         .and_then(toml::Value::as_array)
         .expect("channels.mattermost.default.channel_ids array");
     assert!(
-        channel_ids.iter().any(|v| v.as_str() == Some("mm-fold-test")),
+        channel_ids
+            .iter()
+            .any(|v| v.as_str() == Some("mm-fold-test")),
         "V2 mattermost.channel_id was not folded into V3 channel_ids[]; got {:?}",
         channel_ids
     );

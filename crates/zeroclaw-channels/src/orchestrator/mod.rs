@@ -338,6 +338,7 @@ impl InterruptOnNewMessageConfig {
 struct ChannelCostTrackingState {
     tracker: Arc<zeroclaw_runtime::cost::CostTracker>,
     model_provider_pricing: Arc<zeroclaw_runtime::agent::cost::ModelProviderPricing>,
+    agent_alias: Arc<String>,
 }
 
 #[derive(Clone)]
@@ -3310,6 +3311,7 @@ async fn process_channel_message(
             state.tracker,
             state.model_provider_pricing,
         )
+        .with_agent_alias(state.agent_alias.as_str())
     });
     let llm_call_start = Instant::now();
     #[allow(clippy::cast_possible_truncation)]
@@ -6478,6 +6480,7 @@ pub async fn start_channels(
             ChannelCostTrackingState {
                 tracker,
                 model_provider_pricing: Arc::new(pricing),
+                agent_alias: Arc::new(agent_alias.clone()),
             }
         }),
         pacing: config.pacing.clone(),

@@ -282,6 +282,9 @@ async fn handle_socket(
         if effective_name.is_none() {
             effective_name = backend.get_session_name(&session_key).unwrap_or(None);
         }
+        // Stamp the agent alias so future /api/sessions queries and
+        // per-agent filters can attribute this session to its agent.
+        let _ = backend.set_session_agent_alias(&session_key, &agent_alias);
     }
 
     // Send session_start message to client

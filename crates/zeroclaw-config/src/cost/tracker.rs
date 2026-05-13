@@ -1,4 +1,6 @@
-use super::types::{BudgetCheck, CostRecord, CostSummary, ModelStats, TokenUsage, UsagePeriod};
+use super::types::{
+    AgentCostStats, BudgetCheck, CostRecord, CostSummary, ModelStats, TokenUsage, UsagePeriod,
+};
 use crate::schema::CostConfig;
 use anyhow::{Context, Result, anyhow};
 use chrono::{Datelike, NaiveDate, Utc};
@@ -106,8 +108,19 @@ impl CostTracker {
         Ok(BudgetCheck::Allowed)
     }
 
-    /// Record a usage event.
+    /// Record a usage event without per-agent attribution.
     pub fn record_usage(&self, usage: TokenUsage) -> Result<()> {
+        self.record_usage_with_agent(usage, None)
+    }
+
+    /// Record a usage event attributed to a specific agent alias. When
+    /// `[cost].track_per_agent` is false the alias is dropped before
+    /// persistence.
+    pub fn record_usage_with_agent(
+        &self,
+        usage: TokenUsage,
+        agent_alias: Option<&str>,
+    ) -> Result<()> {
         if !self.config.enabled {
             return Ok(());
         }
@@ -118,7 +131,12 @@ impl CostTracker {
             ));
         }
 
-        let record = CostRecord::new(&self.session_id, usage);
+        let effective_alias = if self.config.track_per_agent {
+            agent_alias.map(str::to_string)
+        } else {
+            None
+        };
+        let record = CostRecord::with_agent(&self.session_id, effective_alias, usage);
 
         // Persist first for durability guarantees.
         {
@@ -133,32 +151,79 @@ impl CostTracker {
         Ok(())
     }
 
-    /// Get the current cost summary.
+    /// Get the current cost summary. When `[cost].track_per_agent` is
+    /// enabled, the response includes a `by_agent` rollup over today's
+    /// records.
     pub fn get_summary(&self) -> Result<CostSummary> {
-        let (daily_cost, monthly_cost) = {
+        self.get_summary_filtered(None)
+    }
+
+    /// Get the current cost summary scoped to a single agent alias. The
+    /// session/day/month figures and `by_model` are filtered to records
+    /// attributed to that alias; `by_agent` is left empty since the
+    /// caller already chose the dimension.
+    pub fn get_summary_for_agent(&self, agent_alias: &str) -> Result<CostSummary> {
+        self.get_summary_filtered(Some(agent_alias))
+    }
+
+    fn get_summary_filtered(&self, agent_filter: Option<&str>) -> Result<CostSummary> {
+        let (daily_cost, monthly_cost, daily_records) = {
             let mut storage = self.lock_storage();
-            storage.get_aggregated_costs()?
+            let (d, m) = storage.get_aggregated_costs()?;
+            let daily = if self.config.track_per_agent || agent_filter.is_some() {
+                storage.daily_records()?
+            } else {
+                Vec::new()
+            };
+            (d, m, daily)
         };
 
         let session_costs = self.lock_session_costs();
-        let session_cost: f64 = session_costs
-            .iter()
-            .map(|record| record.usage.cost_usd)
-            .sum();
-        let total_tokens: u64 = session_costs
-            .iter()
-            .map(|record| record.usage.total_tokens)
-            .sum();
-        let request_count = session_costs.len();
-        let by_model = build_session_model_stats(&session_costs);
+        let matches_agent = |record: &CostRecord| match agent_filter {
+            Some(alias) => record.agent_alias.as_deref() == Some(alias),
+            None => true,
+        };
+
+        let scoped: Vec<&CostRecord> = session_costs.iter().filter(|r| matches_agent(r)).collect();
+        let session_cost: f64 = scoped.iter().map(|record| record.usage.cost_usd).sum();
+        let total_tokens: u64 = scoped.iter().map(|record| record.usage.total_tokens).sum();
+        let request_count = scoped.len();
+        let by_model = build_model_stats(scoped.iter().copied());
+
+        let (daily_total, monthly_total, by_agent) = if let Some(alias) = agent_filter {
+            // Per-agent view: re-aggregate day/month from persisted records.
+            let mut daily_total = 0.0;
+            let mut monthly_total = 0.0;
+            let today = Utc::now().date_naive();
+            let now = Utc::now();
+            for record in &daily_records {
+                if record.agent_alias.as_deref() != Some(alias) {
+                    continue;
+                }
+                let ts = record.usage.timestamp.naive_utc();
+                if ts.date() == today {
+                    daily_total += record.usage.cost_usd;
+                }
+                if ts.year() == now.year() && ts.month() == now.month() {
+                    monthly_total += record.usage.cost_usd;
+                }
+            }
+            (daily_total, monthly_total, HashMap::new())
+        } else if self.config.track_per_agent {
+            let by_agent = build_agent_stats(&daily_records);
+            (daily_cost, monthly_cost, by_agent)
+        } else {
+            (daily_cost, monthly_cost, HashMap::new())
+        };
 
         Ok(CostSummary {
             session_cost_usd: session_cost,
-            daily_cost_usd: daily_cost,
-            monthly_cost_usd: monthly_cost,
+            daily_cost_usd: daily_total,
+            monthly_cost_usd: monthly_total,
             total_tokens,
             request_count,
             by_model,
+            by_agent,
         })
     }
 
@@ -233,10 +298,13 @@ fn resolve_storage_path(workspace_dir: &Path) -> Result<PathBuf> {
     Ok(storage_path)
 }
 
-fn build_session_model_stats(session_costs: &[CostRecord]) -> HashMap<String, ModelStats> {
+fn build_model_stats<'a, I>(records: I) -> HashMap<String, ModelStats>
+where
+    I: IntoIterator<Item = &'a CostRecord>,
+{
     let mut by_model: HashMap<String, ModelStats> = HashMap::new();
 
-    for record in session_costs {
+    for record in records {
         let entry = by_model
             .entry(record.usage.model.clone())
             .or_insert_with(|| ModelStats {
@@ -252,6 +320,30 @@ fn build_session_model_stats(session_costs: &[CostRecord]) -> HashMap<String, Mo
     }
 
     by_model
+}
+
+fn build_agent_stats(records: &[CostRecord]) -> HashMap<String, AgentCostStats> {
+    let mut by_agent: HashMap<String, AgentCostStats> = HashMap::new();
+
+    for record in records {
+        let Some(alias) = record.agent_alias.as_deref() else {
+            continue;
+        };
+        let entry = by_agent
+            .entry(alias.to_string())
+            .or_insert_with(|| AgentCostStats {
+                agent_alias: alias.to_string(),
+                cost_usd: 0.0,
+                total_tokens: 0,
+                request_count: 0,
+            });
+
+        entry.cost_usd += record.usage.cost_usd;
+        entry.total_tokens += record.usage.total_tokens;
+        entry.request_count += 1;
+    }
+
+    by_agent
 }
 
 /// Persistent storage for cost records.
@@ -402,6 +494,23 @@ impl CostStorage {
         Ok((self.daily_cost_usd, self.monthly_cost_usd))
     }
 
+    /// Snapshot every record whose timestamp falls within the current
+    /// calendar month. Used to build per-agent rollups without folding a
+    /// new aggregate table into the JSONL file.
+    fn daily_records(&mut self) -> Result<Vec<CostRecord>> {
+        self.ensure_period_cache_current()?;
+        let year = self.cached_year;
+        let month = self.cached_month;
+        let mut out = Vec::new();
+        self.for_each_record(|record| {
+            let ts = record.usage.timestamp.naive_utc();
+            if ts.year() == year && ts.month() == month {
+                out.push(record);
+            }
+        })?;
+        Ok(out)
+    }
+
     /// Get cost for a specific date.
     fn get_cost_for_date(&self, date: NaiveDate) -> Result<f64> {
         let mut cost = 0.0;
@@ -550,6 +659,76 @@ mod tests {
         let tracker = CostTracker::new(enabled_config(), tmp.path()).unwrap();
         let today_cost = tracker.get_daily_cost(Utc::now().date_naive()).unwrap();
         assert!((today_cost - valid_usage.cost_usd).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn per_agent_aggregation_buckets_by_alias() {
+        let tmp = TempDir::new().unwrap();
+        let tracker = CostTracker::new(enabled_config(), tmp.path()).unwrap();
+
+        tracker
+            .record_usage_with_agent(
+                TokenUsage::new("test/model", 1_000, 1_000, 1.0, 1.0),
+                Some("scout"),
+            )
+            .unwrap();
+        tracker
+            .record_usage_with_agent(
+                TokenUsage::new("test/model", 2_000, 0, 1.0, 1.0),
+                Some("scout"),
+            )
+            .unwrap();
+        tracker
+            .record_usage_with_agent(
+                TokenUsage::new("test/model", 500, 500, 1.0, 1.0),
+                Some("scribe"),
+            )
+            .unwrap();
+
+        let summary = tracker.get_summary().unwrap();
+        assert_eq!(summary.by_agent.len(), 2);
+        let scout = summary.by_agent.get("scout").unwrap();
+        assert_eq!(scout.request_count, 2);
+        assert_eq!(scout.total_tokens, 4_000);
+        let scribe = summary.by_agent.get("scribe").unwrap();
+        assert_eq!(scribe.request_count, 1);
+        assert_eq!(scribe.total_tokens, 1_000);
+
+        let scoped = tracker.get_summary_for_agent("scout").unwrap();
+        assert_eq!(scoped.request_count, 2);
+        assert!(
+            scoped.by_agent.is_empty(),
+            "per-agent view doesn't re-bucket"
+        );
+        assert!(
+            (scoped.daily_cost_usd - scout.cost_usd).abs() < 1e-9,
+            "daily filtered to alias must match by_agent bucket"
+        );
+    }
+
+    #[test]
+    fn track_per_agent_disabled_strips_alias() {
+        let tmp = TempDir::new().unwrap();
+        let config = CostConfig {
+            enabled: true,
+            track_per_agent: false,
+            ..Default::default()
+        };
+        let tracker = CostTracker::new(config, tmp.path()).unwrap();
+
+        tracker
+            .record_usage_with_agent(
+                TokenUsage::new("test/model", 1_000, 1_000, 1.0, 1.0),
+                Some("scout"),
+            )
+            .unwrap();
+
+        let summary = tracker.get_summary().unwrap();
+        assert_eq!(summary.request_count, 1);
+        assert!(
+            summary.by_agent.is_empty(),
+            "track_per_agent=false must not surface per-agent rollups"
+        );
     }
 
     #[test]

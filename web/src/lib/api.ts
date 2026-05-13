@@ -1055,6 +1055,15 @@ export function getCost(): Promise<CostSummary> {
   );
 }
 
+/** Cost summary filtered to a single agent alias. Backed by the same
+ * `/api/cost` endpoint as {@link getCost} via `?agent=<alias>`. */
+export function getCostForAgent(alias: string): Promise<CostSummary> {
+  const url = `/api/cost?agent=${encodeURIComponent(alias)}`;
+  return apiFetch<CostSummary | { cost: CostSummary }>(url).then((data) =>
+    unwrapField(data, 'cost'),
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Sessions
 // ---------------------------------------------------------------------------

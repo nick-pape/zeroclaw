@@ -32,6 +32,9 @@ pub struct ToolLoopCostTrackingContext {
     pub tracker: Arc<CostTracker>,
     pub model_provider_pricing: Arc<ModelProviderPricing>,
     pub turn_usage: Arc<Mutex<TurnUsage>>,
+    /// Alias of the agent driving this turn. Stamped onto persisted
+    /// `CostRecord`s so `/api/cost?agent=<alias>` can attribute spend.
+    pub agent_alias: Option<String>,
 }
 
 impl ToolLoopCostTrackingContext {
@@ -43,7 +46,16 @@ impl ToolLoopCostTrackingContext {
             tracker,
             model_provider_pricing,
             turn_usage: Arc::new(Mutex::new(TurnUsage::default())),
+            agent_alias: None,
         }
+    }
+
+    /// Attach an agent alias to this context so subsequent
+    /// `record_tool_loop_cost_usage` calls stamp records with it.
+    #[must_use]
+    pub fn with_agent_alias(mut self, agent_alias: impl Into<String>) -> Self {
+        self.agent_alias = Some(agent_alias.into());
+        self
     }
 
     /// Snapshot the per-scope usage. Wrapping code calls this after the
@@ -127,7 +139,10 @@ pub fn record_tool_loop_cost_usage(
         warn_once_missing_pricing(model_provider_name, model);
     }
 
-    if let Err(error) = ctx.tracker.record_usage(cost_usage.clone()) {
+    if let Err(error) = ctx
+        .tracker
+        .record_usage_with_agent(cost_usage.clone(), ctx.agent_alias.as_deref())
+    {
         tracing::warn!(
             model_provider = model_provider_name,
             model,

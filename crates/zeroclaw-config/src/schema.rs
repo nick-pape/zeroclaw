@@ -4605,6 +4605,13 @@ pub struct CostConfig {
     #[serde(default)]
     #[nested]
     pub enforcement: CostEnforcementConfig,
+
+    /// Stamp each recorded cost entry with the originating agent alias so
+    /// `/api/cost?agent=<alias>` and CLI rollups can attribute spend to a
+    /// specific agent. Disable on high-volume deployments if the extra
+    /// HashMap aggregation shows up in profiles (default: true).
+    #[serde(default = "default_track_per_agent")]
+    pub track_per_agent: bool,
 }
 
 /// Configuration for cost enforcement behavior when budget limits are reached.
@@ -4657,6 +4664,10 @@ fn default_cost_enabled() -> bool {
     true
 }
 
+fn default_track_per_agent() -> bool {
+    true
+}
+
 impl Default for CostConfig {
     fn default() -> Self {
         Self {
@@ -4666,6 +4677,7 @@ impl Default for CostConfig {
             warn_at_percent: default_warn_percent(),
             allow_override: false,
             enforcement: CostEnforcementConfig::default(),
+            track_per_agent: default_track_per_agent(),
         }
     }
 }
