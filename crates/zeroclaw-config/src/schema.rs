@@ -3090,7 +3090,12 @@ impl Config {
         self.install_root_dir().join("shared")
     }
 
-    fn install_root_dir(&self) -> std::path::PathBuf {
+    /// Install root: `<install>/` derived from `config_path`'s parent. Used
+    /// to compute `<install>/shared/`, `<install>/agents/`, and the
+    /// skill-bundle directory defaults. Public so consumers (gateway, CLI,
+    /// SkillsService) share the same anchor.
+    #[must_use]
+    pub fn install_root_dir(&self) -> std::path::PathBuf {
         self.config_path
             .parent()
             .map(std::path::Path::to_path_buf)

@@ -276,6 +276,60 @@ Examples:
 pub enum SkillCommands {
     /// List all installed skills
     List,
+    /// Scaffold a new skill from scratch (canonical SKILL.md + optional subdirs)
+    #[command(long_about = "\
+Scaffold a new skill under a skill bundle. Writes <bundle.directory>/<name>/SKILL.md \
+plus the canonical optional subdirs (scripts/, references/, assets/). \
+Name must be lowercase + hyphens; description is required (prompted on TTY if omitted).
+
+Examples:
+  zeroclaw skills add code-review --bundle official --description \"Review PRs.\"
+  zeroclaw skills add ops-runbook --description \"Triage prod incidents.\" --edit")]
+    Add {
+        /// Skill name (lowercase + hyphens only)
+        name: String,
+        /// Target bundle alias. Optional when exactly one bundle is configured.
+        #[arg(long)]
+        bundle: Option<String>,
+        /// What the skill does and when to use it (frontmatter `description`).
+        /// Required; prompted on TTY when missing.
+        #[arg(long)]
+        description: Option<String>,
+        /// SPDX license identifier (e.g. MIT).
+        #[arg(long)]
+        license: Option<String>,
+        /// Skill author handle.
+        #[arg(long)]
+        author: Option<String>,
+        /// SemVer version (defaults to 0.1.0).
+        #[arg(long)]
+        version: Option<String>,
+        /// Skill category for registry grouping.
+        #[arg(long)]
+        category: Option<String>,
+        /// Skip scaffolding scripts/, references/, assets/.
+        #[arg(long)]
+        no_scaffold: bool,
+        /// Open SKILL.md in $EDITOR after scaffold.
+        #[arg(long)]
+        edit: bool,
+    },
+    /// Open a skill's SKILL.md (or a sibling file) in $EDITOR
+    Edit {
+        /// Skill name
+        name: String,
+        /// Target bundle alias. Optional when name is unique across bundles.
+        #[arg(long)]
+        bundle: Option<String>,
+        /// Edit a sibling file instead of SKILL.md (e.g. scripts/runner.sh).
+        #[arg(long)]
+        file: Option<String>,
+    },
+    /// Manage skill bundles (the named directories skills live in)
+    Bundle {
+        #[command(subcommand)]
+        bundle_command: SkillBundleCommands,
+    },
     /// Audit a skill source directory or installed skill name
     Audit {
         /// Skill path or installed skill name
@@ -298,6 +352,18 @@ pub enum SkillCommands {
         /// Show verbose output
         #[arg(long)]
         verbose: bool,
+    },
+}
+
+/// Skill bundle subcommands (`zeroclaw skills bundle <op>`)
+#[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SkillBundleCommands {
+    /// List configured skill bundles and their resolved directories
+    List,
+    /// Show metadata + skill list for a bundle
+    Show {
+        /// Bundle alias
+        alias: String,
     },
 }
 

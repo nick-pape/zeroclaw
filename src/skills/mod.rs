@@ -3,6 +3,7 @@ pub use zeroclaw_runtime::skills::*;
 
 use anyhow::{Context, Result};
 use std::path::PathBuf;
+use zeroclaw_runtime::skills::{ScaffoldOptions, SkillFrontmatter, SkillsService};
 pub mod creator {
     #[allow(unused_imports)]
     pub use zeroclaw_runtime::skills::creator::*;
@@ -168,6 +169,35 @@ pub fn handle_command(command: crate::SkillCommands, config: &crate::config::Con
             );
             Ok(())
         }
+        crate::SkillCommands::Add {
+            name,
+            bundle,
+            description,
+            license,
+            author,
+            version,
+            category,
+            no_scaffold,
+            edit,
+        } => handle_add(
+            config,
+            name,
+            bundle,
+            description,
+            license,
+            author,
+            version,
+            category,
+            no_scaffold,
+            edit,
+        ),
+        crate::SkillCommands::Edit { name, bundle, file } => {
+            handle_edit(config, name, bundle, file)
+        }
+        crate::SkillCommands::Bundle { bundle_command } => match bundle_command {
+            crate::SkillBundleCommands::List => handle_bundle_list(config),
+            crate::SkillBundleCommands::Show { alias } => handle_bundle_show(config, alias),
+        },
         crate::SkillCommands::Test { name, verbose } => {
             let results = if let Some(ref skill_name) = name {
                 // Test a single skill
@@ -207,4 +237,180 @@ pub fn handle_command(command: crate::SkillCommands, config: &crate::config::Con
             Ok(())
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_add(
+    config: &crate::config::Config,
+    name: String,
+    bundle: Option<String>,
+    description: Option<String>,
+    license: Option<String>,
+    author: Option<String>,
+    version: Option<String>,
+    category: Option<String>,
+    no_scaffold: bool,
+    edit: bool,
+) -> Result<()> {
+    let install_root = config.install_root_dir();
+    let service = SkillsService::new(config, install_root);
+    let target = service
+        .resolve_ref(&name, bundle.as_deref())
+        .context("failed to resolve bundle target for skill add")?;
+
+    let description = prompt_for_description(description)?;
+    let frontmatter = SkillFrontmatter {
+        name: target.name().to_string(),
+        description,
+        license,
+        author,
+        version: Some(version.unwrap_or_else(|| "0.1.0".to_string())),
+        category,
+    };
+
+    let skill_dir = service.scaffold_skill(
+        &target,
+        frontmatter,
+        ScaffoldOptions {
+            create_optional_subdirs: !no_scaffold,
+            body: String::new(),
+        },
+    )?;
+
+    println!(
+        "  {} Scaffolded skill {} at {}",
+        console::style("✓").green().bold(),
+        target,
+        skill_dir.display(),
+    );
+
+    if edit {
+        open_in_editor(
+            &skill_dir.join(zeroclaw_runtime::skills::constants::SKILL_MANIFEST_FILENAME),
+        )?;
+    }
+    Ok(())
+}
+
+fn handle_edit(
+    config: &crate::config::Config,
+    name: String,
+    bundle: Option<String>,
+    file: Option<String>,
+) -> Result<()> {
+    let install_root = config.install_root_dir();
+    let service = SkillsService::new(config, install_root);
+    let target = service.resolve_ref(&name, bundle.as_deref())?;
+
+    let summary = service
+        .list_skills(Some(target.bundle()))?
+        .into_iter()
+        .find(|s| s.r#ref.name() == target.name())
+        .ok_or_else(|| anyhow::anyhow!("skill '{target}' not found"))?;
+
+    let path = match file {
+        Some(rel) => summary.directory.join(rel),
+        None => summary
+            .directory
+            .join(zeroclaw_runtime::skills::constants::SKILL_MANIFEST_FILENAME),
+    };
+    if !path.exists() {
+        anyhow::bail!("file not found: {}", path.display());
+    }
+    open_in_editor(&path)
+}
+
+fn handle_bundle_list(config: &crate::config::Config) -> Result<()> {
+    let install_root = config.install_root_dir();
+    let service = SkillsService::new(config, install_root);
+    let bundles = service.list_bundles()?;
+    if bundles.is_empty() {
+        println!("No skill bundles configured.");
+        println!(
+            "  Create one: zeroclaw config set skill-bundles.default.directory shared/skills/default"
+        );
+        return Ok(());
+    }
+    println!("Skill bundles ({}):", bundles.len());
+    println!();
+    for b in &bundles {
+        println!(
+            "  {} → {}",
+            console::style(&b.alias).white().bold(),
+            console::style(b.directory.display()).dim(),
+        );
+        if !b.include.is_empty() {
+            println!("    include: {}", b.include.join(", "));
+        }
+        if !b.exclude.is_empty() {
+            println!("    exclude: {}", b.exclude.join(", "));
+        }
+    }
+    println!();
+    Ok(())
+}
+
+fn handle_bundle_show(config: &crate::config::Config, alias: String) -> Result<()> {
+    let install_root = config.install_root_dir();
+    let service = SkillsService::new(config, install_root);
+    let bundles = service.list_bundles()?;
+    let bundle = bundles
+        .into_iter()
+        .find(|b| b.alias == alias)
+        .ok_or_else(|| anyhow::anyhow!("skill bundle '{alias}' not configured"))?;
+
+    println!(
+        "{} → {}",
+        console::style(&bundle.alias).white().bold(),
+        bundle.directory.display(),
+    );
+    if !bundle.include.is_empty() {
+        println!("  include: {}", bundle.include.join(", "));
+    }
+    if !bundle.exclude.is_empty() {
+        println!("  exclude: {}", bundle.exclude.join(", "));
+    }
+
+    let skills = service.list_skills(Some(&alias))?;
+    if skills.is_empty() {
+        println!("  (no skills installed)");
+    } else {
+        println!("  skills ({}):", skills.len());
+        for s in &skills {
+            println!(
+                "    {} — {}",
+                console::style(s.r#ref.name()).white(),
+                s.frontmatter.description,
+            );
+        }
+    }
+    Ok(())
+}
+
+fn prompt_for_description(description: Option<String>) -> Result<String> {
+    if let Some(d) = description
+        && !d.trim().is_empty()
+    {
+        return Ok(d);
+    }
+    if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        let prompt: String = dialoguer::Input::new()
+            .with_prompt("Skill description (what it does, when to use it)")
+            .interact_text()?;
+        if prompt.trim().is_empty() {
+            anyhow::bail!("description must not be empty");
+        }
+        Ok(prompt)
+    } else {
+        anyhow::bail!("--description is required when stdin is not a TTY");
+    }
+}
+
+fn open_in_editor(path: &std::path::Path) -> Result<()> {
+    let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
+    let status = std::process::Command::new(&editor).arg(path).status()?;
+    if !status.success() {
+        anyhow::bail!("{editor} exited with non-zero status");
+    }
+    Ok(())
 }
