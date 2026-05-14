@@ -26,7 +26,7 @@ import {
   type PickerItem,
   type SectionInfo,
 } from '../lib/api';
-import FieldForm from '../components/onboard/FieldForm';
+import FieldForm, { clearFieldFormCatalogCaches } from '../components/onboard/FieldForm';
 import PersonalityEditor from '../components/onboard/PersonalityEditor';
 import SkillsBundleEditor from '../components/onboard/SkillsBundleEditor';
 import ReloadDaemonButton from '../components/onboard/ReloadDaemonButton';
@@ -120,6 +120,13 @@ export default function Config() {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sectionParam, sections]);
+
+  // Bust FieldForm's per-provider model catalog cache on section change so a
+  // model alias just added under e.g. `providers.models.anthropic` shows up
+  // the next time the user opens an agent form, without a hard refresh.
+  useEffect(() => {
+    clearFieldFormCatalogCaches();
+  }, [sectionParam, typeParam, aliasParam]);
 
   const activeSection = useMemo(
     () => sections.find((s) => s.key === activeKey) ?? null,

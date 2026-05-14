@@ -184,25 +184,32 @@ function isOptionalArray(typeHint: string): boolean {
   return compact.startsWith('Option<Vec<') || compact.startsWith('Option<HashSet<');
 }
 
-const modelsCache: Record<string, { models: string[]; live: boolean }> = {};
+// Per-provider catalog cache. Cleared via clearFieldFormCatalogCaches() on
+// nav so a new model alias added under (say) `anthropic` shows up the next
+// time the user opens an agent form without a hard refresh.
+let modelsCache: Record<string, { models: string[]; live: boolean }> = {};
 
-// Shared agent-options cache. Populated lazily by the first FieldRow on
-// an `agents.<alias>.<field>` path; lives module-level so every row in
-// the same agent form reuses one fetch instead of N fetches.
-let agentOptionsCache: AgentOptionsResponse | null = null;
+// In-flight `getAgentOptions()` promise so N FieldForm rows mounting at
+// once share a single round-trip. Cleared when the request resolves;
+// the response itself is NOT cached across mounts — each FieldForm mount
+// triggers a fresh fetch so newly-created channels / agents / bundles
+// surface immediately on the next form visit.
 let agentOptionsPromise: Promise<AgentOptionsResponse> | null = null;
 function loadAgentOptions(): Promise<AgentOptionsResponse> {
-  if (agentOptionsCache) return Promise.resolve(agentOptionsCache);
   if (agentOptionsPromise) return agentOptionsPromise;
   agentOptionsPromise = getAgentOptions()
-    .then((r) => {
-      agentOptionsCache = r;
-      return r;
-    })
     .finally(() => {
       agentOptionsPromise = null;
     });
   return agentOptionsPromise;
+}
+
+/// Clear the per-provider model catalog cache. Called by Config.tsx when
+/// the user navigates between sections so a model alias added under e.g.
+/// `providers.models.anthropic` shows up the next time another agent's
+/// `model_provider` dropdown is opened.
+export function clearFieldFormCatalogCaches() {
+  modelsCache = {};
 }
 
 // Single-select alias-ref fields on an agent: render as <select> with the
@@ -764,9 +771,7 @@ function FieldRow({ entry, value, onChange, comment, onCommentChange, error, onD
       : null;
   const agentNeedsOptions =
     agentSingleAliasKind !== null || agentMultiAliasKind !== null;
-  const [agentOptions, setAgentOptions] = useState<AgentOptionsResponse | null>(
-    agentOptionsCache,
-  );
+  const [agentOptions, setAgentOptions] = useState<AgentOptionsResponse | null>(null);
 
   useEffect(() => {
     if (!isProviderModelField) return;
@@ -791,14 +796,22 @@ function FieldRow({ entry, value, onChange, comment, onCommentChange, error, onD
       });
   }, [isProviderModelField, entry.path]);
 
+  // Refetch on every mount so newly-created channels / agents / bundles
+  // (added in a different section) surface without a page reload.
   useEffect(() => {
-    if (!agentNeedsOptions || agentOptions !== null) return;
+    if (!agentNeedsOptions) return;
+    let cancelled = false;
     void loadAgentOptions()
-      .then((r) => setAgentOptions(r))
+      .then((r) => {
+        if (!cancelled) setAgentOptions(r);
+      })
       .catch(() => {
         // Fail-open: leave options null so the field falls back to text.
       });
-  }, [agentNeedsOptions, agentOptions]);
+    return () => {
+      cancelled = true;
+    };
+  }, [agentNeedsOptions]);
 
   if (tombstoned) {
     return (
