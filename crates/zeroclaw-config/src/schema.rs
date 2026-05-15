@@ -8338,7 +8338,7 @@ impl Default for ObservabilityConfig {
 }
 
 fn default_log_persistence() -> String {
-    "none".to_string()
+    "rolling".to_string()
 }
 
 fn default_log_persistence_path() -> String {
@@ -15139,7 +15139,7 @@ mod tests {
     async fn observability_config_default() {
         let o = ObservabilityConfig::default();
         assert_eq!(o.backend, "none");
-        assert_eq!(o.log_persistence, "none");
+        assert_eq!(o.log_persistence, "rolling");
         assert_eq!(o.log_persistence_path, "state/runtime-trace.jsonl");
         assert_eq!(o.log_persistence_max_entries, 200);
         assert_eq!(o.log_tool_io, "redacted");
@@ -15614,7 +15614,7 @@ auto_save = true
 
         assert_eq!(parsed.providers.models.len(), config.providers.models.len());
         assert_eq!(parsed.observability.backend, "log");
-        assert_eq!(parsed.observability.log_persistence, "none");
+        assert_eq!(parsed.observability.log_persistence, "rolling");
         let default_profile = parsed.risk_profiles.get("default").unwrap();
         assert_eq!(default_profile.level, AutonomyLevel::Full);
         assert!(!default_profile.workspace_only);
@@ -15649,7 +15649,7 @@ default_temperature = 0.7
                 .is_none()
         );
         assert_eq!(parsed.observability.backend, "none");
-        assert_eq!(parsed.observability.log_persistence, "none");
+        assert_eq!(parsed.observability.log_persistence, "rolling");
         // Migration synthesizes risk_profiles.default from the legacy
         // [autonomy] block; assert against the named entry rather than a
         // global "active" profile (no such concept exists).

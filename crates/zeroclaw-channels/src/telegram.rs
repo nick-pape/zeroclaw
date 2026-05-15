@@ -549,7 +549,7 @@ impl TelegramChannel {
         if config.tts.enabled {
             match super::tts::TtsManager::from_config(config) {
                 Ok(m) => self.tts_manager = Some(Arc::new(m)),
-                Err(e) => tracing::warn!(error = ?e, "Telegram TTS disabled"),
+                Err(e) => tracing::warn!(error = ?e, "TTS disabled"),
             }
         }
         self
@@ -588,7 +588,7 @@ impl TelegramChannel {
                 Ok(resp) => resp,
                 Err(err) => {
                     tracing::warn!(
-                        "Telegram: failed to add ACK reaction to chat_id={chat_id}, message_id={message_id}: {err}"
+                        "failed to add ACK reaction to chat_id={chat_id}, message_id={message_id}: {err}"
                     );
                     return;
                 }
@@ -598,7 +598,7 @@ impl TelegramChannel {
                 let status = response.status();
                 let err_body = response.text().await.unwrap_or_default();
                 tracing::warn!(
-                    "Telegram: add ACK reaction failed for chat_id={chat_id}, message_id={message_id}: status={status}, body={err_body}"
+                    "add ACK reaction failed for chat_id={chat_id}, message_id={message_id}: status={status}, body={err_body}"
                 );
             }
         });
@@ -629,7 +629,7 @@ impl TelegramChannel {
 
         let Some(config) = &self.persist else {
             tracing::warn!(
-                "Telegram: paired identity {identity} not persisted (no persistence handle wired)"
+                "paired identity {identity} not persisted (no persistence handle wired)"
             );
             return Ok(());
         };
@@ -848,10 +848,10 @@ impl TelegramChannel {
                 .await
                 {
                     Ok(()) => {
-                        tracing::info!("Telegram: voice reply sent ({} chars)", text.len());
+                        tracing::info!("voice reply sent ({} chars)", text.len());
                     }
                     Err(e) => {
-                        tracing::warn!(error = ?e, "Telegram: TTS voice reply failed");
+                        tracing::warn!(error = ?e, "TTS voice reply failed");
                     }
                 }
             });
@@ -898,10 +898,10 @@ impl TelegramChannel {
                 .await
                 {
                     Ok(()) => {
-                        tracing::info!("Telegram: voice reply sent ({} chars)", text.len());
+                        tracing::info!("voice reply sent ({} chars)", text.len());
                     }
                     Err(e) => {
-                        tracing::warn!(error = ?e, "Telegram: TTS voice reply failed");
+                        tracing::warn!(error = ?e, "TTS voice reply failed");
                     }
                 }
             }
@@ -919,7 +919,7 @@ impl TelegramChannel {
     ) -> anyhow::Result<()> {
         let audio_bytes = tts_manager.synthesize(text).await?;
         let audio_len = audio_bytes.len();
-        tracing::info!("Telegram TTS: synthesized {audio_len} bytes of audio");
+        tracing::info!("synthesized {audio_len} bytes of audio");
 
         if audio_bytes.is_empty() {
             anyhow::bail!("TTS returned empty audio");
@@ -948,7 +948,7 @@ impl TelegramChannel {
             anyhow::bail!("sendVoice failed: status={status}, body={body}");
         }
 
-        tracing::info!("Telegram TTS: sent voice note ({audio_len} bytes)");
+        tracing::info!("sent voice note ({audio_len} bytes)");
         Ok(())
     }
 
@@ -1131,7 +1131,7 @@ impl TelegramChannel {
             .map(|id| id.to_string());
 
         let Some(chat_id) = chat_id else {
-            tracing::warn!("Telegram: missing chat_id in message, skipping");
+            tracing::warn!("missing chat_id in message, skipping");
             return;
         };
 
@@ -1166,12 +1166,12 @@ impl TelegramChannel {
                                         ))
                                         .await;
                                     tracing::info!(
-                                        "Telegram: paired and allowlisted identity={identity}"
+                                        "paired and allowlisted identity={identity}"
                                     );
                                 }
                                 Err(e) => {
                                     tracing::error!(
-                                        "Telegram: failed to persist allowlist after bind: {e}"
+                                        "failed to persist allowlist after bind: {e}"
                                     );
                                     let _ = self
                                         .send(&SendMessage::new(
@@ -1219,7 +1219,7 @@ impl TelegramChannel {
         }
 
         tracing::warn!(
-            "Telegram: ignoring message from unauthorized user: username={username}, sender_id={}. \
+            "ignoring message from unauthorized user: username={username}, sender_id={}. \
 Allowlist Telegram username (without '@') or numeric user ID.",
             sender_id_str.as_deref().unwrap_or("unknown")
         );
@@ -2128,10 +2128,10 @@ Allowlist Telegram username (without '@') or numeric user ID.",
 
         if !resp.status().is_success() {
             let err = resp.text().await?;
-            anyhow::bail!("Telegram {method} by URL failed: {err}");
+            anyhow::bail!("{method} by URL failed: {err}");
         }
 
-        tracing::info!("Telegram {method} sent to {chat_id}: {url}");
+        tracing::info!("{method} sent to {chat_id}: {url}");
         Ok(())
     }
 
@@ -2262,7 +2262,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             anyhow::bail!("Telegram sendDocument failed: {err}");
         }
 
-        tracing::info!("Telegram document sent to {chat_id}: {file_name}");
+        tracing::info!("document sent to {chat_id}: {file_name}");
         Ok(())
     }
 
@@ -2301,7 +2301,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             anyhow::bail!("Telegram sendDocument failed: {err}");
         }
 
-        tracing::info!("Telegram document sent to {chat_id}: {file_name}");
+        tracing::info!("document sent to {chat_id}: {file_name}");
         Ok(())
     }
 
@@ -2345,7 +2345,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             anyhow::bail!("Telegram sendPhoto failed: {err}");
         }
 
-        tracing::info!("Telegram photo sent to {chat_id}: {file_name}");
+        tracing::info!("photo sent to {chat_id}: {file_name}");
         Ok(())
     }
 
@@ -2384,7 +2384,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             anyhow::bail!("Telegram sendPhoto failed: {err}");
         }
 
-        tracing::info!("Telegram photo sent to {chat_id}: {file_name}");
+        tracing::info!("photo sent to {chat_id}: {file_name}");
         Ok(())
     }
 
@@ -2428,7 +2428,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             anyhow::bail!("Telegram sendVideo failed: {err}");
         }
 
-        tracing::info!("Telegram video sent to {chat_id}: {file_name}");
+        tracing::info!("video sent to {chat_id}: {file_name}");
         Ok(())
     }
 
@@ -2472,7 +2472,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             anyhow::bail!("Telegram sendAudio failed: {err}");
         }
 
-        tracing::info!("Telegram audio sent to {chat_id}: {file_name}");
+        tracing::info!("audio sent to {chat_id}: {file_name}");
         Ok(())
     }
 
@@ -2516,7 +2516,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             anyhow::bail!("Telegram sendVoice failed: {err}");
         }
 
-        tracing::info!("Telegram voice sent to {chat_id}: {file_name}");
+        tracing::info!("voice sent to {chat_id}: {file_name}");
         Ok(())
     }
 
@@ -2553,7 +2553,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             anyhow::bail!("Telegram sendDocument by URL failed: {err}");
         }
 
-        tracing::info!("Telegram document (URL) sent to {chat_id}: {url}");
+        tracing::info!("document (URL) sent to {chat_id}: {url}");
         Ok(())
     }
 
@@ -2590,7 +2590,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             anyhow::bail!("Telegram sendPhoto by URL failed: {err}");
         }
 
-        tracing::info!("Telegram photo (URL) sent to {chat_id}: {url}");
+        tracing::info!("photo (URL) sent to {chat_id}: {url}");
         Ok(())
     }
 
@@ -2760,7 +2760,7 @@ impl Channel for TelegramChannel {
         } else {
             let status = resp.status();
             let err = resp.text().await.unwrap_or_default();
-            tracing::debug!(error = ?err, "Telegram editMessageText failed ({status})");
+            tracing::debug!(error = ?err, "editMessageText failed ({status})");
         }
 
         Ok(())
@@ -2955,7 +2955,7 @@ impl Channel for TelegramChannel {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            tracing::debug!("Telegram deleteMessage failed ({status}): {body}");
+            tracing::debug!("deleteMessage failed ({status}): {body}");
         }
 
         Ok(())
@@ -3007,7 +3007,7 @@ impl Channel for TelegramChannel {
             let _ = self.get_bot_username().await;
         }
 
-        tracing::info!("Telegram channel listening for messages...");
+        tracing::info!("channel listening for messages...");
 
         // Startup probe: claim the getUpdates slot before entering the long-poll loop.
         // A previous daemon's 30-second poll may still be active on Telegram's server.
@@ -3023,14 +3023,14 @@ impl Channel for TelegramChannel {
             });
             match self.http_client().post(&url).json(&probe).send().await {
                 Err(e) => {
-                    tracing::warn!("Telegram startup probe error: {e}; retrying in 5s");
+                    tracing::warn!("startup probe error: {e}; retrying in 5s");
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 }
                 Ok(resp) => {
                     match resp.json::<serde_json::Value>().await {
                         Err(e) => {
                             tracing::warn!(
-                                "Telegram startup probe parse error: {e}; retrying in 5s"
+                                "startup probe parse error: {e}; retrying in 5s"
                             );
                             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                         }
@@ -3100,7 +3100,7 @@ impl Channel for TelegramChannel {
             let resp = match self.http_client().post(&url).json(&body).send().await {
                 Ok(r) => r,
                 Err(e) => {
-                    tracing::warn!(error = ?e, "Telegram poll error");
+                    tracing::warn!(error = ?e, "poll error");
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                     continue;
                 }
@@ -3109,7 +3109,7 @@ impl Channel for TelegramChannel {
             let data: serde_json::Value = match resp.json().await {
                 Ok(d) => d,
                 Err(e) => {
-                    tracing::warn!(error = ?e, "Telegram parse error");
+                    tracing::warn!(error = ?e, "parse error");
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                     continue;
                 }
@@ -3269,11 +3269,11 @@ Ensure only one `zeroclaw` process is using this bot token."
         {
             Ok(Ok(resp)) => resp.status().is_success(),
             Ok(Err(e)) => {
-                tracing::debug!(error = ?e, "Telegram health check failed");
+                tracing::debug!(error = ?e, "health check failed");
                 false
             }
             Err(_) => {
-                tracing::debug!("Telegram health check timed out after 5s");
+                tracing::debug!("health check timed out after 5s");
                 false
             }
         }

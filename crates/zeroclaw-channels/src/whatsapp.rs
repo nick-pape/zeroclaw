@@ -146,7 +146,7 @@ impl WhatsAppChannel {
                     Ok(re) => Some(re),
                     Err(e) => {
                         tracing::warn!(
-                            "WhatsApp: ignoring invalid mention_pattern {trimmed:?}: {e}"
+                            "ignoring invalid mention_pattern {trimmed:?}: {e}"
                         );
                         None
                     }
@@ -268,7 +268,7 @@ impl WhatsAppChannel {
 
                     if !self.is_number_allowed(&normalized_from) {
                         tracing::warn!(
-                            "WhatsApp: ignoring message from unauthorized number: {normalized_from}. \
+                            "ignoring message from unauthorized number: {normalized_from}. \
                             Add to channels.whatsapp.allowed_numbers in config.toml, \
                             or run `zeroclaw onboard --channels-only` to configure interactively."
                         );
@@ -284,7 +284,7 @@ impl WhatsAppChannel {
                             .to_string()
                     } else {
                         // Could be image, audio, etc. — skip for now
-                        tracing::debug!("WhatsApp: skipping non-text message from {from}");
+                        tracing::debug!("skipping non-text message from {from}");
                         continue;
                     };
 
@@ -306,7 +306,7 @@ impl WhatsAppChannel {
                         Some(c) => c,
                         None => {
                             tracing::debug!(
-                                "WhatsApp: message from {from} did not match mention patterns, dropping"
+                                "message from {from} did not match mention patterns, dropping"
                             );
                             continue;
                         }
@@ -388,7 +388,7 @@ impl Channel for WhatsAppChannel {
         if !resp.status().is_success() {
             let status = resp.status();
             let error_body = resp.text().await.unwrap_or_default();
-            tracing::error!("WhatsApp send failed: {status} — {error_body}");
+            tracing::error!("send failed: {status} — {error_body}");
             anyhow::bail!("WhatsApp API error: {status}");
         }
 

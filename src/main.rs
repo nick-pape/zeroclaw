@@ -81,22 +81,27 @@ where
         mut writer: Writer<'_>,
         event: &tracing::Event<'_>,
     ) -> std::fmt::Result {
-        // Walk up the span stack looking for an `agent_alias` field.
-        // The agent loop binds it once at entry; SubAgent spawn sites
-        // and cron dispatch bind their own. The closest enclosing
-        // span wins, which is the right semantic for nested spans.
-        let alias = ctx.event_scope().and_then(|scope| {
-            // Default Scope iteration is leaf→root, so the first hit
-            // is the closest enclosing span — exactly the right
-            // semantic for nested SubAgent / cron spans.
-            scope.into_iter().find_map(|span| {
-                span.extensions()
-                    .get::<ZeroclawAttribution>()
-                    .and_then(|a| a.get("agent_alias").map(str::to_string))
+        // Walk leaf→root through the span scope, picking the most
+        // specific alias-bound label available. agent_alias wins; if
+        // an event is emitted outside any agent context (channel
+        // listener, cron tick), fall back to the channel composite so
+        // the line still carries identity rather than the opaque
+        // `[system]` bucket.
+        let label = ctx
+            .event_scope()
+            .and_then(|scope| {
+                scope.into_iter().find_map(|span| {
+                    span.extensions()
+                        .get::<ZeroclawAttribution>()
+                        .and_then(|attribution| {
+                            attribution
+                                .get("agent_alias")
+                                .or_else(|| attribution.get("channel"))
+                                .map(str::to_string)
+                        })
+                })
             })
-        });
-
-        let label = alias.unwrap_or_else(|| "system".to_string());
+            .unwrap_or_else(|| "system".to_string());
         write!(writer, "[{label}] ")?;
         self.inner.format_event(ctx, writer, event)
     }

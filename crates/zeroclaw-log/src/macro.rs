@@ -54,6 +54,20 @@ macro_rules! record {
     }};
 }
 
+/// Wrap a future in a tracing span carrying alias-bound attribution.
+/// Field-name set is shared with `record!` (see [`crate::event`]). The
+/// trailing `=> <future>` becomes the body.
+#[macro_export]
+macro_rules! scope {
+    ($($key:ident : $value:expr),+ $(,)? => $body:expr) => {{
+        use $crate::tracing::Instrument;
+        ($body).instrument($crate::tracing::info_span!(
+            "zeroclaw_scope",
+            $($key = %($value)),+
+        ))
+    }};
+}
+
 #[cfg(test)]
 mod tests {
     // The macro emits a tracing event; verifying the full pipeline

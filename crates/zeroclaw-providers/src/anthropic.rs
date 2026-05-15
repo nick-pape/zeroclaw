@@ -678,7 +678,7 @@ impl AnthropicModelProvider {
                         model = %model,
                         input_tokens = ?observed_input,
                         cached_input_tokens = ?observed_cached,
-                        "Anthropic stream: message_start"
+                        "stream: message_start"
                     );
                 }
                 "content_block_start" => {
@@ -775,18 +775,18 @@ impl AnthropicModelProvider {
                     if stop_reason == "max_tokens" {
                         tracing::warn!(
                             output_tokens = ?observed_output,
-                            "Anthropic response truncated: hit max_tokens limit. Increase provider_max_tokens in config."
+                            "response truncated: hit max_tokens limit. Increase provider_max_tokens in config."
                         );
                     } else {
                         tracing::debug!(
                             stop_reason = %stop_reason,
                             output_tokens = ?observed_output,
-                            "Anthropic stream: message_delta"
+                            "stream: message_delta"
                         );
                     }
                 }
                 "message_stop" => {
-                    tracing::debug!("Anthropic stream: message_stop");
+                    tracing::debug!("stream: message_stop");
                     if input_tokens.is_some() || output_tokens.is_some() {
                         let _ = tx
                             .send(Ok(StreamEvent::Usage(TokenUsage {
@@ -849,7 +849,7 @@ impl ModelProvider for AnthropicModelProvider {
             system
         };
 
-        tracing::debug!(max_tokens = self.max_tokens, model = %model, "Anthropic API request");
+        tracing::debug!(max_tokens = self.max_tokens, model = %model, "API request");
         let request = NativeChatRequest {
             model: model.to_string(),
             max_tokens: self.max_tokens,
@@ -927,7 +927,7 @@ impl ModelProvider for AnthropicModelProvider {
         } else {
             system_prompt
         };
-        tracing::debug!(max_tokens = self.max_tokens, model = %model, "Anthropic streaming API request");
+        tracing::debug!(max_tokens = self.max_tokens, model = %model, "streaming API request");
         let native_request = NativeChatRequest {
             model: model.to_string(),
             max_tokens: self.max_tokens,
@@ -1087,7 +1087,7 @@ impl ModelProvider for AnthropicModelProvider {
             system_prompt
         };
 
-        tracing::debug!(max_tokens = self.max_tokens, model = %model, "Anthropic stream_chat request");
+        tracing::debug!(max_tokens = self.max_tokens, model = %model, "stream_chat request");
         let native_request = NativeChatRequest {
             model: model.to_string(),
             max_tokens: self.max_tokens,

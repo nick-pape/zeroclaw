@@ -234,10 +234,13 @@ impl ModelProvider for RouterModelProvider {
         let (provider_idx, resolved_model) = self.resolve(model);
 
         let (provider_name, model_provider) = &self.model_providers[provider_idx];
+        // `provider_name` is the configured `<type>.<alias>` key the
+        // caller registered with `RouterModelProvider::new` — already a
+        // composite. Layer's `set_composite` splits it on emit.
         tracing::info!(
             model_provider = provider_name.as_str(),
             model = resolved_model.as_str(),
-            "Router dispatching request"
+            "router dispatching request"
         );
 
         model_provider

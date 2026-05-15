@@ -337,7 +337,7 @@ impl SlackChannel {
                 .get("error")
                 .and_then(|e| e.as_str())
                 .unwrap_or("unknown");
-            tracing::debug!(error = ?err, "Slack chat.delete failed");
+            tracing::debug!(error = ?err, "chat.delete failed");
         }
 
         Ok(())
@@ -399,7 +399,7 @@ impl SlackChannel {
                 .get("error")
                 .and_then(|e| e.as_str())
                 .unwrap_or("unknown");
-            anyhow::bail!("Slack chat.postMessage (lazy draft) failed: {err}");
+            anyhow::bail!("chat.postMessage (lazy draft) failed: {err}");
         }
 
         let ts = resp_body
@@ -481,7 +481,7 @@ impl SlackChannel {
 
         if !status.is_success() {
             let sanitized = zeroclaw_providers::sanitize_api_error(&raw);
-            anyhow::bail!("Slack chat.postMessage failed ({status}): {sanitized}");
+            anyhow::bail!("chat.postMessage failed ({status}): {sanitized}");
         }
 
         let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap_or_default();
@@ -490,14 +490,14 @@ impl SlackChannel {
                 .get("error")
                 .and_then(|e| e.as_str())
                 .unwrap_or("unknown");
-            anyhow::bail!("Slack chat.postMessage failed: {err}");
+            anyhow::bail!("chat.postMessage failed: {err}");
         }
 
         parsed
             .get("ts")
             .and_then(|v| v.as_str())
             .map(String::from)
-            .ok_or_else(|| anyhow::anyhow!("Slack chat.postMessage response missing 'ts'"))
+            .ok_or_else(|| anyhow::anyhow!("chat.postMessage response missing 'ts'"))
     }
 
     /// Update an existing Slack message in-place using `chat.update`.
@@ -527,7 +527,7 @@ impl SlackChannel {
 
         if !status.is_success() {
             let sanitized = zeroclaw_providers::sanitize_api_error(&raw);
-            anyhow::bail!("Slack chat.update failed ({status}): {sanitized}");
+            anyhow::bail!("chat.update failed ({status}): {sanitized}");
         }
 
         let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap_or_default();
@@ -536,7 +536,7 @@ impl SlackChannel {
                 .get("error")
                 .and_then(|e| e.as_str())
                 .unwrap_or("unknown");
-            anyhow::bail!("Slack chat.update failed: {err}");
+            anyhow::bail!("chat.update failed: {err}");
         }
 
         Ok(())
@@ -750,7 +750,7 @@ impl SlackChannel {
         {
             Ok(response) => response,
             Err(err) => {
-                tracing::warn!(error = ?err, "Slack users.info request failed for {user_id}");
+                tracing::warn!(error = ?err, "users.info request failed for {user_id}");
                 return None;
             }
         };
@@ -763,7 +763,7 @@ impl SlackChannel {
 
         if !status.is_success() {
             let sanitized = zeroclaw_providers::sanitize_api_error(&body);
-            tracing::warn!("Slack users.info failed for {user_id} ({status}): {sanitized}");
+            tracing::warn!("users.info failed for {user_id} ({status}): {sanitized}");
             return None;
         }
 
@@ -773,7 +773,7 @@ impl SlackChannel {
                 .get("error")
                 .and_then(|e| e.as_str())
                 .unwrap_or("unknown");
-            tracing::warn!(error = ?err, "Slack users.info returned error for {user_id}");
+            tracing::warn!(error = ?err, "users.info returned error for {user_id}");
             return None;
         }
 
@@ -1250,7 +1250,7 @@ impl SlackChannel {
 
         if files.len() > SLACK_ATTACHMENT_MAX_FILES_PER_MESSAGE {
             tracing::warn!(
-                "Slack message has {} files; processing first {} only",
+                "message has {} files; processing first {} only",
                 files.len(),
                 SLACK_ATTACHMENT_MAX_FILES_PER_MESSAGE
             );
@@ -1346,7 +1346,7 @@ impl SlackChannel {
         {
             Ok(response) => response,
             Err(err) => {
-                tracing::warn!(error = ?err, "Slack files.info request failed for {file_id}");
+                tracing::warn!(error = ?err, "files.info request failed for {file_id}");
                 return None;
             }
         };
@@ -1358,7 +1358,7 @@ impl SlackChannel {
             .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
         if !status.is_success() {
             let sanitized = zeroclaw_providers::sanitize_api_error(&body);
-            tracing::warn!("Slack files.info failed for {file_id} ({status}): {sanitized}");
+            tracing::warn!("files.info failed for {file_id} ({status}): {sanitized}");
             return None;
         }
 
@@ -1368,7 +1368,7 @@ impl SlackChannel {
                 .get("error")
                 .and_then(|value| value.as_str())
                 .unwrap_or("unknown");
-            tracing::warn!(error = ?err, "Slack files.info returned error for {file_id}");
+            tracing::warn!(error = ?err, "files.info returned error for {file_id}");
             return None;
         }
 
@@ -1487,7 +1487,7 @@ impl SlackChannel {
             Ok(url) => url,
             Err(err) => {
                 let redacted_raw = Self::redact_raw_slack_url(raw_url);
-                tracing::warn!(error = ?err, "Slack file URL parse failed for {redacted_raw}");
+                tracing::warn!(error = ?err, "file URL parse failed for {redacted_raw}");
                 return None;
             }
         };
@@ -1495,7 +1495,7 @@ impl SlackChannel {
 
         if parsed.scheme() != "https" {
             tracing::warn!(
-                "Slack file URL rejected due to non-HTTPS scheme for {}: {}",
+                "file URL rejected due to non-HTTPS scheme for {}: {}",
                 redacted,
                 parsed.scheme()
             );
@@ -1503,11 +1503,11 @@ impl SlackChannel {
         }
 
         let Some(host) = parsed.host_str() else {
-            tracing::warn!("Slack file URL rejected due to missing host: {redacted}");
+            tracing::warn!("file URL rejected due to missing host: {redacted}");
             return None;
         };
         if !Self::is_allowed_slack_media_hostname(host) {
-            tracing::warn!("Slack file URL rejected due to non-Slack host: {redacted}");
+            tracing::warn!("file URL rejected due to non-Slack host: {redacted}");
             return None;
         }
 
@@ -1521,7 +1521,7 @@ impl SlackChannel {
             Ok(url) => url,
             Err(err) => {
                 tracing::warn!(
-                    "Slack file redirect URL parse failed for base {} and location {}: {}",
+                    "file redirect URL parse failed for base {} and location {}: {}",
                     redacted_base,
                     redacted_location,
                     err
@@ -1532,21 +1532,21 @@ impl SlackChannel {
         let redacted_target = Self::redact_slack_url(&target);
         if target.scheme() != "https" {
             tracing::warn!(
-                "Slack file redirect rejected due to non-HTTPS scheme for {}",
+                "file redirect rejected due to non-HTTPS scheme for {}",
                 redacted_target
             );
             return None;
         }
         let Some(host) = target.host_str() else {
             tracing::warn!(
-                "Slack file redirect rejected due to missing host for {}",
+                "file redirect rejected due to missing host for {}",
                 redacted_target
             );
             return None;
         };
         if !Self::is_allowed_slack_media_hostname(host) {
             tracing::warn!(
-                "Slack file redirect rejected due to non-Slack host for {}",
+                "file redirect rejected due to non-Slack host for {}",
                 redacted_target
             );
             return None;
@@ -1574,7 +1574,7 @@ impl SlackChannel {
         let client = match self.slack_media_http_client_no_redirect() {
             Ok(client) => client,
             Err(err) => {
-                tracing::warn!("Slack file fetch failed for {}: {}", redacted_parsed, err);
+                tracing::warn!("file fetch failed for {}: {}", redacted_parsed, err);
                 return None;
             }
         };
@@ -1589,7 +1589,7 @@ impl SlackChannel {
             let response = match req.send().await {
                 Ok(response) => response,
                 Err(err) => {
-                    tracing::warn!("Slack file fetch failed for {}: {}", redacted_current, err);
+                    tracing::warn!("file fetch failed for {}: {}", redacted_current, err);
                     return None;
                 }
             };
@@ -1600,7 +1600,7 @@ impl SlackChannel {
 
             if redirect_hop == SLACK_MEDIA_REDIRECT_MAX_HOPS {
                 tracing::warn!(
-                    "Slack file redirect limit exceeded for {} after {} hops",
+                    "file redirect limit exceeded for {} after {} hops",
                     redacted_current,
                     SLACK_MEDIA_REDIRECT_MAX_HOPS
                 );
@@ -1612,7 +1612,7 @@ impl SlackChannel {
             };
             let Ok(location) = location.to_str() else {
                 tracing::warn!(
-                    "Slack file redirect location header is not valid UTF-8 for {}",
+                    "file redirect location header is not valid UTF-8 for {}",
                     redacted_current
                 );
                 return Some(response);
@@ -1631,7 +1631,7 @@ impl SlackChannel {
         let image_urls = Self::slack_image_candidate_urls(file);
         if image_urls.is_empty() {
             tracing::warn!(
-                "Slack file attachment is image-like but has no downloadable URL: {}",
+                "file attachment is image-like but has no downloadable URL: {}",
                 file_name
             );
             return None;
@@ -1643,7 +1643,7 @@ impl SlackChannel {
             }
         }
 
-        tracing::warn!("Slack image attachment download failed for {file_name}");
+        tracing::warn!("image attachment download failed for {file_name}");
         None
     }
 
@@ -1663,7 +1663,7 @@ impl SlackChannel {
                 .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
             let sanitized = zeroclaw_providers::sanitize_api_error(&body);
             tracing::warn!(
-                "Slack image fetch failed for {} ({status}): {sanitized}",
+                "image fetch failed for {} ({status}): {sanitized}",
                 redacted_url
             );
             return None;
@@ -1678,7 +1678,7 @@ impl SlackChannel {
             let content_length = usize::try_from(content_length).unwrap_or(usize::MAX);
             if content_length > SLACK_ATTACHMENT_IMAGE_MAX_BYTES {
                 tracing::warn!(
-                    "Slack image fetch skipped for {}: content-length {} exceeds {} bytes",
+                    "image fetch skipped for {}: content-length {} exceeds {} bytes",
                     redacted_url,
                     content_length,
                     SLACK_ATTACHMENT_IMAGE_MAX_BYTES
@@ -1690,17 +1690,17 @@ impl SlackChannel {
         let bytes = match resp.bytes().await {
             Ok(bytes) => bytes,
             Err(err) => {
-                tracing::warn!(error = ?err, "Slack image body read failed for {}", redacted_url);
+                tracing::warn!(error = ?err, "image body read failed for {}", redacted_url);
                 return None;
             }
         };
         if bytes.is_empty() {
-            tracing::warn!("Slack image body is empty for {}", redacted_url);
+            tracing::warn!("image body is empty for {}", redacted_url);
             return None;
         }
         if bytes.len() > SLACK_ATTACHMENT_IMAGE_MAX_BYTES {
             tracing::warn!(
-                "Slack image body too large for {}: {} bytes exceeds {} bytes",
+                "image body too large for {}: {} bytes exceeds {} bytes",
                 redacted_url,
                 bytes.len(),
                 SLACK_ATTACHMENT_IMAGE_MAX_BYTES
@@ -1711,12 +1711,12 @@ impl SlackChannel {
         let Some(mime) =
             Self::detect_image_mime(content_type.as_deref(), file, bytes.as_ref(), url)
         else {
-            tracing::warn!("Slack image MIME detection failed for {}", redacted_url);
+            tracing::warn!("image MIME detection failed for {}", redacted_url);
             return None;
         };
         if !Self::is_supported_image_mime(&mime) {
             tracing::warn!(
-                "Slack image MIME not supported for {}: {mime}",
+                "image MIME not supported for {}: {mime}",
                 redacted_url
             );
             return None;
@@ -1732,7 +1732,7 @@ impl SlackChannel {
 
         if bytes.len() > SLACK_ATTACHMENT_IMAGE_INLINE_FALLBACK_MAX_BYTES {
             tracing::warn!(
-                "Slack image inline fallback skipped for {}: {} bytes exceeds {} bytes",
+                "image inline fallback skipped for {}: {} bytes exceeds {} bytes",
                 redacted_url,
                 bytes.len(),
                 SLACK_ATTACHMENT_IMAGE_INLINE_FALLBACK_MAX_BYTES
@@ -1760,7 +1760,7 @@ impl SlackChannel {
             .filter(|mime| mime.starts_with("image/"))
         {
             tracing::warn!(
-                "Slack image MIME mismatch for {}: HTTP header claims {}, but bytes do not match a supported image signature",
+                "image MIME mismatch for {}: HTTP header claims {}, but bytes do not match a supported image signature",
                 redacted_source,
                 header_mime
             );
@@ -1770,7 +1770,7 @@ impl SlackChannel {
             Self::slack_file_mime(file).filter(|mime| mime.starts_with("image/"))
         {
             tracing::warn!(
-                "Slack image MIME mismatch for {}: file metadata claims {}, but bytes do not match a supported image signature",
+                "image MIME mismatch for {}: file metadata claims {}, but bytes do not match a supported image signature",
                 redacted_source,
                 file_mime
             );
@@ -1781,7 +1781,7 @@ impl SlackChannel {
             && let Some(mime) = Self::mime_from_extension(&ext)
         {
             tracing::warn!(
-                "Slack image MIME mismatch for {}: filename extension implies {}, but bytes do not match a supported image signature",
+                "image MIME mismatch for {}: filename extension implies {}, but bytes do not match a supported image signature",
                 redacted_source,
                 mime
             );
@@ -1867,7 +1867,7 @@ impl SlackChannel {
             Ok(path) => path,
             Err(err) => {
                 tracing::warn!(
-                    "Slack image attachment path resolution failed for {}: {err}",
+                    "image attachment path resolution failed for {}: {err}",
                     file_name
                 );
                 return None;
@@ -1876,7 +1876,7 @@ impl SlackChannel {
 
         let Some(parent_dir) = output_path.parent() else {
             tracing::warn!(
-                "Slack image attachment write failed for {}: missing parent directory",
+                "image attachment write failed for {}: missing parent directory",
                 output_path.display()
             );
             return None;
@@ -1901,7 +1901,7 @@ impl SlackChannel {
             Ok(file) => file,
             Err(err) => {
                 tracing::warn!(
-                    "Slack image attachment temp open failed for {}: {err}",
+                    "image attachment temp open failed for {}: {err}",
                     temp_path.display()
                 );
                 return None;
@@ -1910,7 +1910,7 @@ impl SlackChannel {
 
         if let Err(err) = temp_file.write_all(bytes).await {
             tracing::warn!(
-                "Slack image attachment temp write failed for {}: {err}",
+                "image attachment temp write failed for {}: {err}",
                 temp_path.display()
             );
             let _ = tokio::fs::remove_file(&temp_path).await;
@@ -1918,7 +1918,7 @@ impl SlackChannel {
         }
         if let Err(err) = temp_file.sync_all().await {
             tracing::warn!(
-                "Slack image attachment temp sync failed for {}: {err}",
+                "image attachment temp sync failed for {}: {err}",
                 temp_path.display()
             );
             let _ = tokio::fs::remove_file(&temp_path).await;
@@ -1932,7 +1932,7 @@ impl SlackChannel {
         match tokio::fs::symlink_metadata(&output_path).await {
             Ok(meta) if meta.file_type().is_symlink() => {
                 tracing::warn!(
-                    "Slack image attachment refused: output path is a symlink: {}",
+                    "image attachment refused: output path is a symlink: {}",
                     output_path.display()
                 );
                 let _ = tokio::fs::remove_file(&temp_path).await;
@@ -1943,7 +1943,7 @@ impl SlackChannel {
 
         if let Err(err) = tokio::fs::rename(&temp_path, &output_path).await {
             tracing::warn!(
-                "Slack image attachment finalize failed for {}: {err}",
+                "image attachment finalize failed for {}: {err}",
                 output_path.display()
             );
             let _ = tokio::fs::remove_file(&temp_path).await;
@@ -2230,7 +2230,7 @@ impl SlackChannel {
         let status = resp.status();
         if !status.is_success() {
             tracing::warn!(
-                "Slack voice file download failed for {} ({status})",
+                "voice file download failed for {} ({status})",
                 redacted_url
             );
             return None;
@@ -2239,7 +2239,7 @@ impl SlackChannel {
         let audio_data = match resp.bytes().await {
             Ok(bytes) => bytes.to_vec(),
             Err(e) => {
-                tracing::warn!(error = ?e, "Slack voice file read failed for {}", redacted_url);
+                tracing::warn!(error = ?e, "voice file read failed for {}", redacted_url);
                 return None;
             }
         };
@@ -2262,11 +2262,11 @@ impl SlackChannel {
             Ok(text) => {
                 let trimmed = text.trim();
                 if trimmed.is_empty() {
-                    tracing::info!("Slack voice transcription returned empty text, skipping");
+                    tracing::info!("voice transcription returned empty text, skipping");
                     None
                 } else {
                     tracing::info!(
-                        "Slack: transcribed voice file {} ({} chars)",
+                        "transcribed voice file {} ({} chars)",
                         file_name,
                         trimmed.len()
                     );
@@ -2274,7 +2274,7 @@ impl SlackChannel {
                 }
             }
             Err(e) => {
-                tracing::warn!(error = ?e, "Slack voice transcription failed for {}", file_name);
+                tracing::warn!(error = ?e, "voice transcription failed for {}", file_name);
                 Some(Self::format_attachment_summary(file))
             }
         }
@@ -2293,7 +2293,7 @@ impl SlackChannel {
                 .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
             let sanitized = zeroclaw_providers::sanitize_api_error(&body);
             tracing::warn!(
-                "Slack snippet fetch failed for {} ({status}): {sanitized}",
+                "snippet fetch failed for {} ({status}): {sanitized}",
                 redacted_url
             );
             return None;
@@ -2303,7 +2303,7 @@ impl SlackChannel {
             let content_length = usize::try_from(content_length).unwrap_or(usize::MAX);
             if content_length > SLACK_ATTACHMENT_TEXT_DOWNLOAD_MAX_BYTES {
                 tracing::warn!(
-                    "Slack snippet download skipped for {}: content-length {} exceeds {} bytes",
+                    "snippet download skipped for {}: content-length {} exceeds {} bytes",
                     redacted_url,
                     content_length,
                     SLACK_ATTACHMENT_TEXT_DOWNLOAD_MAX_BYTES
@@ -2315,7 +2315,7 @@ impl SlackChannel {
         let bytes = match resp.bytes().await {
             Ok(bytes) => bytes,
             Err(err) => {
-                tracing::warn!(error = ?err, "Slack snippet body read failed for {}", redacted_url);
+                tracing::warn!(error = ?err, "snippet body read failed for {}", redacted_url);
                 return None;
             }
         };
@@ -2324,7 +2324,7 @@ impl SlackChannel {
         }
         if bytes.len() > SLACK_ATTACHMENT_TEXT_DOWNLOAD_MAX_BYTES {
             tracing::warn!(
-                "Slack snippet body too large for {}: {} bytes exceeds {} bytes",
+                "snippet body too large for {}: {} bytes exceeds {} bytes",
                 redacted_url,
                 bytes.len(),
                 SLACK_ATTACHMENT_TEXT_DOWNLOAD_MAX_BYTES
@@ -2332,7 +2332,7 @@ impl SlackChannel {
             return None;
         }
         if bytes.contains(&0) {
-            tracing::warn!("Slack snippet body appears binary for {}", redacted_url);
+            tracing::warn!("snippet body appears binary for {}", redacted_url);
             return None;
         }
 
@@ -2565,7 +2565,7 @@ impl SlackChannel {
             .unwrap_or_default();
 
         if channel_id.is_empty() {
-            tracing::warn!("Slack block_actions: missing channel ID in interactive payload");
+            tracing::warn!("block_actions: missing channel ID in interactive payload");
             return None;
         }
 
@@ -2654,7 +2654,7 @@ impl SlackChannel {
                 Err(e) => {
                     let wait = Self::compute_socket_mode_retry_delay(open_url_attempt);
                     tracing::warn!(
-                        "Slack Socket Mode: failed to open websocket URL: {e}; retrying in {:.3}s (attempt #{})",
+                        "Socket Mode: failed to open websocket URL: {e}; retrying in {:.3}s (attempt #{})",
                         wait.as_secs_f64(),
                         open_url_attempt.saturating_add(1),
                     );
@@ -2678,7 +2678,7 @@ impl SlackChannel {
                 Err(e) => {
                     let wait = Self::compute_socket_mode_retry_delay(socket_reconnect_attempt);
                     tracing::warn!(
-                        "Slack Socket Mode: websocket connect failed: {e}; retrying in {:.3}s (attempt #{})",
+                        "Socket Mode: websocket connect failed: {e}; retrying in {:.3}s (attempt #{})",
                         wait.as_secs_f64(),
                         socket_reconnect_attempt.saturating_add(1),
                     );
@@ -2687,7 +2687,7 @@ impl SlackChannel {
                     continue;
                 }
             };
-            tracing::info!("Slack Socket Mode: websocket connected");
+            tracing::info!("Socket Mode: websocket connected");
 
             let (mut write, mut read) = ws_stream.split();
 
@@ -2696,18 +2696,18 @@ impl SlackChannel {
                     Ok(WsMessage::Text(text)) => text,
                     Ok(WsMessage::Ping(payload)) => {
                         if let Err(e) = write.send(WsMessage::Pong(payload)).await {
-                            tracing::warn!(error = ?e, "Slack Socket Mode: pong send failed");
+                            tracing::warn!(error = ?e, "Socket Mode: pong send failed");
                             break;
                         }
                         continue;
                     }
                     Ok(WsMessage::Close(_)) => {
-                        tracing::warn!("Slack Socket Mode: websocket closed by server");
+                        tracing::warn!("Socket Mode: websocket closed by server");
                         break;
                     }
                     Ok(_) => continue,
                     Err(e) => {
-                        tracing::warn!(error = ?e, "Slack Socket Mode: websocket read failed");
+                        tracing::warn!(error = ?e, "Socket Mode: websocket read failed");
                         break;
                     }
                 };
@@ -2715,7 +2715,7 @@ impl SlackChannel {
                 let envelope: serde_json::Value = match serde_json::from_str(text.as_ref()) {
                     Ok(value) => value,
                     Err(e) => {
-                        tracing::warn!(error = ?e, "Slack Socket Mode: invalid JSON payload");
+                        tracing::warn!(error = ?e, "Socket Mode: invalid JSON payload");
                         continue;
                     }
                 };
@@ -2723,7 +2723,7 @@ impl SlackChannel {
                 if let Some(envelope_id) = envelope.get("envelope_id").and_then(|v| v.as_str()) {
                     let ack = serde_json::json!({ "envelope_id": envelope_id });
                     if let Err(e) = write.send(WsMessage::Text(ack.to_string().into())).await {
-                        tracing::warn!(error = ?e, "Slack Socket Mode: ack send failed");
+                        tracing::warn!(error = ?e, "Socket Mode: ack send failed");
                         break;
                     }
                 }
@@ -2733,7 +2733,7 @@ impl SlackChannel {
                     .and_then(|v| v.as_str())
                     .unwrap_or_default();
                 if envelope_type == "disconnect" {
-                    tracing::warn!("Slack Socket Mode: received disconnect event");
+                    tracing::warn!("Socket Mode: received disconnect event");
                     break;
                 }
 
@@ -2840,7 +2840,7 @@ impl SlackChannel {
                                         attachments: vec![],
                                     };
                                     tracing::info!(
-                                        "Slack: :{cancel_emoji}: reaction from {user} \
+                                        ":{cancel_emoji}: reaction from {user} \
                                          on {item_channel}/{item_ts} — sending /stop"
                                     );
                                     if tx.send(cancel_msg).await.is_err() {
@@ -2883,7 +2883,7 @@ impl SlackChannel {
                     continue;
                 }
                 if !self.is_user_allowed(user) {
-                    tracing::warn!("Slack: ignoring message from unauthorized user: {user}");
+                    tracing::warn!("ignoring message from unauthorized user: {user}");
                     continue;
                 }
 
@@ -2961,7 +2961,7 @@ impl SlackChannel {
 
             let wait = Self::compute_socket_mode_retry_delay(socket_reconnect_attempt);
             tracing::warn!(
-                "Slack Socket Mode: reconnecting in {:.3}s (attempt #{})...",
+                "Socket Mode: reconnecting in {:.3}s (attempt #{})...",
                 wait.as_secs_f64(),
                 socket_reconnect_attempt.saturating_add(1),
             );
@@ -3133,7 +3133,7 @@ impl SlackChannel {
             if !status.is_success() {
                 let sanitized = zeroclaw_providers::sanitize_api_error(&body);
                 tracing::warn!(
-                    "Slack history request failed for channel {} ({}): {}",
+                    "history request failed for channel {} ({}): {}",
                     channel_id,
                     status,
                     sanitized
@@ -3146,7 +3146,7 @@ impl SlackChannel {
                     .get("error")
                     .and_then(|e| e.as_str())
                     .unwrap_or("unknown");
-                tracing::warn!(error = ?err, "Slack history error for channel {channel_id}");
+                tracing::warn!(error = ?err, "history error for channel {channel_id}");
                 return None;
             }
 
@@ -3469,7 +3469,7 @@ impl Channel for SlackChannel {
 
         if !status.is_success() {
             let sanitized = zeroclaw_providers::sanitize_api_error(&body);
-            anyhow::bail!("Slack chat.postMessage failed ({status}): {sanitized}");
+            anyhow::bail!("chat.postMessage failed ({status}): {sanitized}");
         }
 
         // Slack returns 200 for most app-level errors; check JSON "ok" field
@@ -3479,7 +3479,7 @@ impl Channel for SlackChannel {
                 .get("error")
                 .and_then(|e| e.as_str())
                 .unwrap_or("unknown");
-            anyhow::bail!("Slack chat.postMessage failed: {err}");
+            anyhow::bail!("chat.postMessage failed: {err}");
         }
 
         Ok(())
@@ -3588,11 +3588,11 @@ impl Channel for SlackChannel {
                             .get("error")
                             .and_then(|e| e.as_str())
                             .unwrap_or("unknown");
-                        tracing::debug!(error = ?err, "Slack chat.update (draft) failed");
+                        tracing::debug!(error = ?err, "chat.update (draft) failed");
                     }
                 }
                 Err(e) => {
-                    tracing::debug!(error = ?e, "Slack chat.update (draft) HTTP error");
+                    tracing::debug!(error = ?e, "chat.update (draft) HTTP error");
                 }
             }
         });
@@ -3686,7 +3686,7 @@ impl Channel for SlackChannel {
             .get("error")
             .and_then(|e| e.as_str())
             .unwrap_or("unknown");
-        tracing::debug!("Slack chat.update (finalize) failed: {err}; falling back to delete+send");
+        tracing::debug!("chat.update (finalize) failed: {err}; falling back to delete+send");
 
         let _ = self.delete_message(recipient, &real_ts).await;
         let msg = SendMessage::new(text, recipient).in_thread(draft_thread_ts);
@@ -3805,7 +3805,7 @@ impl Channel for SlackChannel {
         let bot_user_id = self.get_bot_user_id().await.unwrap_or_default();
         let scoped_channels = self.scoped_channel_ids();
         if self.configured_app_token().is_some() {
-            tracing::info!("Slack channel listening in Socket Mode");
+            tracing::info!("channel listening in Socket Mode");
             return self
                 .listen_socket_mode(tx, &bot_user_id, scoped_channels)
                 .await;
@@ -3819,7 +3819,7 @@ impl Channel for SlackChannel {
 
         if let Some(ref channel_ids) = scoped_channels {
             tracing::info!(
-                "Slack channel listening on {} configured channel(s): {}",
+                "channel listening on {} configured channel(s): {}",
                 channel_ids.len(),
                 channel_ids.join(", ")
             );
@@ -3849,7 +3849,7 @@ impl Channel for SlackChannel {
                             discovered_channels = channels;
                         }
                         Err(e) => {
-                            tracing::warn!(error = ?e, "Slack channel discovery failed");
+                            tracing::warn!(error = ?e, "channel discovery failed");
                         }
                     }
                     last_discovery = Instant::now();
@@ -3859,7 +3859,7 @@ impl Channel for SlackChannel {
             };
 
             if target_channels.is_empty() {
-                tracing::debug!("Slack: no accessible channels discovered yet");
+                tracing::debug!("no accessible channels discovered yet");
                 continue;
             }
 
@@ -3870,7 +3870,7 @@ impl Channel for SlackChannel {
                     Self::ensure_poll_cursor(&mut last_ts_by_channel, &channel_id, &bootstrap_ts);
                 if !had_cursor {
                     tracing::debug!(
-                        "Slack: initialized cursor for channel {} at {} to prevent historical replay",
+                        "initialized cursor for channel {} at {} to prevent historical replay",
                         channel_id,
                         cursor_ts
                     );
@@ -3921,7 +3921,7 @@ impl Channel for SlackChannel {
                         // Sender validation
                         if !self.is_user_allowed(user) {
                             tracing::warn!(
-                                "Slack: ignoring message from unauthorized user: {user}"
+                                "ignoring message from unauthorized user: {user}"
                             );
                             continue;
                         }

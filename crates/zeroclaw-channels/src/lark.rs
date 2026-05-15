@@ -629,7 +629,7 @@ impl LarkChannel {
         let mut token = match self.get_tenant_access_token().await {
             Ok(token) => token,
             Err(err) => {
-                tracing::warn!(error = ?err, "Lark: failed to fetch token for reaction");
+                tracing::warn!(error = ?err, "failed to fetch token for reaction");
                 return;
             }
         };
@@ -642,7 +642,7 @@ impl LarkChannel {
             {
                 Ok(resp) => resp,
                 Err(err) => {
-                    tracing::warn!(error = ?err, "Lark: failed to add reaction for {message_id}");
+                    tracing::warn!(error = ?err, "failed to add reaction for {message_id}");
                     return;
                 }
             };
@@ -653,7 +653,7 @@ impl LarkChannel {
                     Ok(new_token) => new_token,
                     Err(err) => {
                         tracing::warn!(
-                            "Lark: failed to refresh token for reaction on {message_id}: {err}"
+                            "failed to refresh token for reaction on {message_id}: {err}"
                         );
                         return;
                     }
@@ -666,7 +666,7 @@ impl LarkChannel {
                 let status = response.status();
                 let err_body = response.text().await.unwrap_or_default();
                 tracing::warn!(
-                    "Lark: add reaction failed for {message_id}: status={status}, body={err_body}"
+                    "add reaction failed for {message_id}: status={status}, body={err_body}"
                 );
                 return;
             }
@@ -674,7 +674,7 @@ impl LarkChannel {
             let payload: serde_json::Value = match response.json().await {
                 Ok(v) => v,
                 Err(err) => {
-                    tracing::warn!(error = ?err, "Lark: add reaction decode failed for {message_id}");
+                    tracing::warn!(error = ?err, "add reaction decode failed for {message_id}");
                     return;
                 }
             };
@@ -685,7 +685,7 @@ impl LarkChannel {
                     .get("msg")
                     .and_then(|v| v.as_str())
                     .unwrap_or("unknown error");
-                tracing::warn!("Lark: add reaction returned code={code} for {message_id}: {msg}");
+                tracing::warn!("add reaction returned code={code} for {message_id}: {msg}");
             }
             return;
         }
@@ -734,7 +734,7 @@ impl LarkChannel {
                     .and_then(|v| v.parse::<i32>().ok())
             })
             .unwrap_or(0);
-        tracing::info!("Lark: connecting to {wss_url}");
+        tracing::info!("connecting to {wss_url}");
 
         let (ws_stream, _) = zeroclaw_config::schema::ws_connect_with_proxy(
             &wss_url,
@@ -743,7 +743,7 @@ impl LarkChannel {
         )
         .await?;
         let (mut write, mut read) = ws_stream.split();
-        tracing::info!("Lark: WS connected (service_id={service_id})");
+        tracing::info!("WS connected (service_id={service_id})");
 
         let mut ping_secs = client_config.ping_interval.unwrap_or(120).max(10);
         let mut hb_interval = tokio::time::interval(Duration::from_secs(ping_secs));
@@ -772,7 +772,7 @@ impl LarkChannel {
             .await
             .is_err()
         {
-            anyhow::bail!("Lark: initial ping failed");
+            anyhow::bail!("initial ping failed");
         }
         // message_id → (fragment_slots, created_at) for multi-part reassembly
         type FragEntry = (Vec<Option<Vec<u8>>>, Instant);
@@ -790,7 +790,7 @@ impl LarkChannel {
                         payload: None,
                     };
                     if write.send(WsMsg::Binary(ping.encode_to_vec().into())).await.is_err() {
-                        tracing::warn!("Lark: ping failed, reconnecting");
+                        tracing::warn!("ping failed, reconnecting");
                         break;
                     }
                     // GC stale fragments > 5 min
@@ -800,7 +800,7 @@ impl LarkChannel {
 
                 _ = timeout_check.tick() => {
                     if last_recv.elapsed() > WS_HEARTBEAT_TIMEOUT {
-                        tracing::warn!("Lark: heartbeat timeout, reconnecting");
+                        tracing::warn!("heartbeat timeout, reconnecting");
                         break;
                     }
                 }
@@ -814,17 +814,17 @@ impl LarkChannel {
                             match ws_msg {
                                 WsMsg::Binary(b) => b,
                                 WsMsg::Ping(d) => { let _ = write.send(WsMsg::Pong(d)).await; continue; }
-                                WsMsg::Close(_) => { tracing::info!("Lark: WS closed — reconnecting"); break; }
+                                WsMsg::Close(_) => { tracing::info!("WS closed — reconnecting"); break; }
                                 _ => continue,
                             }
                         }
-                        None => { tracing::info!("Lark: WS closed — reconnecting"); break; }
-                        Some(Err(e)) => { tracing::error!(error = ?e, "Lark: WS read error"); break; }
+                        None => { tracing::info!("WS closed — reconnecting"); break; }
+                        Some(Err(e)) => { tracing::error!(error = ?e, "WS read error"); break; }
                     };
 
                     let frame = match PbFrame::decode(&raw[..]) {
                         Ok(f) => f,
-                        Err(e) => { tracing::error!(error = ?e, "Lark: proto decode"); continue; }
+                        Err(e) => { tracing::error!(error = ?e, "proto decode"); continue; }
                     };
 
                     // CONTROL frame
@@ -837,7 +837,7 @@ impl LarkChannel {
                                         if secs != ping_secs {
                                             ping_secs = secs;
                                             hb_interval = tokio::time::interval(Duration::from_secs(ping_secs));
-                                            tracing::info!("Lark: ping_interval → {ping_secs}s");
+                                            tracing::info!("ping_interval → {ping_secs}s");
                                         }
                                     }
                         continue;
@@ -879,7 +879,7 @@ impl LarkChannel {
 
                     let event: LarkEvent = match serde_json::from_slice(&payload) {
                         Ok(e) => e,
-                        Err(e) => { tracing::error!(error = ?e, "Lark: event JSON"); continue; }
+                        Err(e) => { tracing::error!(error = ?e, "event JSON"); continue; }
                     };
                     if event.header.event_type != "im.message.receive_v1" { continue; }
 
@@ -887,7 +887,7 @@ impl LarkChannel {
 
                     let recv: MsgReceivePayload = match serde_json::from_value(event_payload.clone()) {
                         Ok(r) => r,
-                        Err(e) => { tracing::error!(error = ?e, "Lark: payload parse"); continue; }
+                        Err(e) => { tracing::error!(error = ?e, "payload parse"); continue; }
                     };
 
                     if recv.sender.sender_type == "app" || recv.sender.sender_type == "bot" { continue; }
@@ -1112,7 +1112,7 @@ impl LarkChannel {
         let token = match self.get_tenant_access_token().await {
             Ok(t) => t,
             Err(e) => {
-                tracing::warn!(error = ?e, "Lark: failed to get token for image download");
+                tracing::warn!(error = ?e, "failed to get token for image download");
                 return None;
             }
         };
@@ -1127,14 +1127,14 @@ impl LarkChannel {
         {
             Ok(r) => r,
             Err(e) => {
-                tracing::warn!(error = ?e, "Lark: image download request failed for {image_key}");
+                tracing::warn!(error = ?e, "image download request failed for {image_key}");
                 return None;
             }
         };
 
         if !resp.status().is_success() {
             tracing::warn!(
-                "Lark: image download failed for {image_key}: status={}",
+                "image download failed for {image_key}: status={}",
                 resp.status()
             );
             return None;
@@ -1143,7 +1143,7 @@ impl LarkChannel {
         if let Some(cl) = resp.content_length()
             && cl > LARK_IMAGE_MAX_BYTES as u64
         {
-            tracing::warn!("Lark: image too large for {image_key}: {cl} bytes exceeds limit");
+            tracing::warn!("image too large for {image_key}: {cl} bytes exceeds limit");
             return None;
         }
 
@@ -1156,14 +1156,14 @@ impl LarkChannel {
         let bytes = match resp.bytes().await {
             Ok(b) => b,
             Err(e) => {
-                tracing::warn!(error = ?e, "Lark: image body read failed for {image_key}");
+                tracing::warn!(error = ?e, "image body read failed for {image_key}");
                 return None;
             }
         };
 
         if bytes.is_empty() || bytes.len() > LARK_IMAGE_MAX_BYTES {
             tracing::warn!(
-                "Lark: image body empty or too large for {image_key}: {} bytes",
+                "image body empty or too large for {image_key}: {} bytes",
                 bytes.len()
             );
             return None;
@@ -1171,7 +1171,7 @@ impl LarkChannel {
 
         let mime = lark_detect_image_mime(content_type.as_deref(), &bytes)?;
         if !LARK_SUPPORTED_IMAGE_MIMES.contains(&mime.as_str()) {
-            tracing::warn!("Lark: unsupported image MIME for {image_key}: {mime}");
+            tracing::warn!("unsupported image MIME for {image_key}: {mime}");
             return None;
         }
 
@@ -1190,7 +1190,7 @@ impl LarkChannel {
         let token = match self.get_tenant_access_token().await {
             Ok(t) => t,
             Err(e) => {
-                tracing::warn!(error = ?e, "Lark: failed to get token for file download");
+                tracing::warn!(error = ?e, "failed to get token for file download");
                 return None;
             }
         };
@@ -1205,14 +1205,14 @@ impl LarkChannel {
         {
             Ok(r) => r,
             Err(e) => {
-                tracing::warn!(error = ?e, "Lark: file download request failed for {file_key}");
+                tracing::warn!(error = ?e, "file download request failed for {file_key}");
                 return None;
             }
         };
 
         if !resp.status().is_success() {
             tracing::warn!(
-                "Lark: file download failed for {file_key}: status={}",
+                "file download failed for {file_key}: status={}",
                 resp.status()
             );
             return None;
@@ -1221,7 +1221,7 @@ impl LarkChannel {
         if let Some(cl) = resp.content_length()
             && cl > LARK_FILE_MAX_BYTES as u64
         {
-            tracing::warn!("Lark: file too large for {file_key}: {cl} bytes exceeds limit");
+            tracing::warn!("file too large for {file_key}: {cl} bytes exceeds limit");
             return Some(format!(
                 "[ATTACHMENT:{file_name} | size={cl} bytes | too large to inline]"
             ));
@@ -1237,13 +1237,13 @@ impl LarkChannel {
         let bytes = match resp.bytes().await {
             Ok(b) => b,
             Err(e) => {
-                tracing::warn!(error = ?e, "Lark: file body read failed for {file_key}");
+                tracing::warn!(error = ?e, "file body read failed for {file_key}");
                 return None;
             }
         };
 
         if bytes.is_empty() {
-            tracing::warn!("Lark: file body is empty for {file_key}");
+            tracing::warn!("file body is empty for {file_key}");
             return None;
         }
 
@@ -1347,16 +1347,16 @@ impl LarkChannel {
 
         match self.refresh_bot_open_id().await {
             Ok(Some(open_id)) => {
-                tracing::info!("Lark: resolved bot open_id: {open_id}");
+                tracing::info!("resolved bot open_id: {open_id}");
             }
             Ok(None) => {
                 tracing::warn!(
-                    "Lark: bot open_id missing from /bot/v3/info response; mention_only group messages will be ignored"
+                    "bot open_id missing from /bot/v3/info response; mention_only group messages will be ignored"
                 );
             }
             Err(err) => {
                 tracing::warn!(
-                    "Lark: failed to resolve bot open_id: {err}; mention_only group messages will be ignored"
+                    "failed to resolve bot open_id: {err}; mention_only group messages will be ignored"
                 );
             }
         }
@@ -1442,18 +1442,18 @@ impl LarkChannel {
         {
             Ok(result) => result,
             Err(e) => {
-                tracing::warn!(error = ?e, "Lark: audio download failed for {message_id}");
+                tracing::warn!(error = ?e, "audio download failed for {message_id}");
                 return None;
             }
         };
 
         match manager.transcribe(&audio_data, &filename).await {
             Ok(transcript) => {
-                tracing::debug!("Lark: audio transcribed for {message_id}");
+                tracing::debug!("audio transcribed for {message_id}");
                 Some(transcript)
             }
             Err(e) => {
-                tracing::warn!(error = ?e, "Lark: transcription failed for {message_id}");
+                tracing::warn!(error = ?e, "transcription failed for {message_id}");
                 None
             }
         }
@@ -1490,7 +1490,7 @@ impl LarkChannel {
             .and_then(|v| v.as_str())
             .unwrap_or("");
         if !self.is_user_allowed(open_id) {
-            tracing::warn!("Lark: ignoring audio from unauthorized user: {open_id}");
+            tracing::warn!("ignoring audio from unauthorized user: {open_id}");
             return vec![];
         }
 
@@ -1615,7 +1615,7 @@ impl LarkChannel {
 
         // Check allowlist
         if !self.is_user_allowed(open_id) {
-            tracing::warn!("Lark: ignoring message from unauthorized user: {open_id}");
+            tracing::warn!("ignoring message from unauthorized user: {open_id}");
             return messages;
         }
 
@@ -1678,14 +1678,14 @@ impl LarkChannel {
                         let marker = match self.download_image_as_marker(&key).await {
                             Some(m) => m,
                             None => {
-                                tracing::warn!("Lark: failed to download image {key}");
+                                tracing::warn!("failed to download image {key}");
                                 format!("[IMAGE:{key} | download failed]")
                             }
                         };
                         (marker, Vec::new())
                     }
                     None => {
-                        tracing::debug!("Lark: image message missing image_key");
+                        tracing::debug!("image message missing image_key");
                         return messages;
                     }
                 }
@@ -1709,14 +1709,14 @@ impl LarkChannel {
                         {
                             Some(c) => c,
                             None => {
-                                tracing::warn!("Lark: failed to download file {key}");
+                                tracing::warn!("failed to download file {key}");
                                 format!("[ATTACHMENT:{file_name} | download failed]")
                             }
                         };
                         (content, Vec::new())
                     }
                     None => {
-                        tracing::debug!("Lark: file message missing file_key");
+                        tracing::debug!("file message missing file_key");
                         return messages;
                     }
                 }
@@ -1724,12 +1724,12 @@ impl LarkChannel {
             "list" => match parse_list_content(content_str) {
                 Some(t) => (t, Vec::new()),
                 None => {
-                    tracing::debug!("Lark: list message with no extractable text");
+                    tracing::debug!("list message with no extractable text");
                     return messages;
                 }
             },
             _ => {
-                tracing::debug!("Lark: skipping unsupported message type: {msg_type}");
+                tracing::debug!("skipping unsupported message type: {msg_type}");
                 return messages;
             }
         };
@@ -1893,7 +1893,7 @@ impl LarkChannel {
 
             for msg in messages {
                 if state.tx.send(msg).await.is_err() {
-                    tracing::warn!("Lark: message channel closed");
+                    tracing::warn!("message channel closed");
                     break;
                 }
             }

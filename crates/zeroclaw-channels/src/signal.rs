@@ -354,7 +354,7 @@ impl Channel for SignalChannel {
         let mut url = reqwest::Url::parse(&format!("{}/api/v1/events", self.http_url))?;
         url.query_pairs_mut().append_pair("account", &self.account);
 
-        tracing::info!("Signal channel listening via SSE on {}...", self.http_url);
+        tracing::info!("channel listening via SSE on {}...", self.http_url);
 
         let mut retry_delay_secs = 2u64;
         let max_delay_secs = 60u64;
@@ -372,13 +372,13 @@ impl Channel for SignalChannel {
                 Ok(r) => {
                     let status = r.status();
                     let body = r.text().await.unwrap_or_default();
-                    tracing::warn!("Signal SSE returned {status}: {body}");
+                    tracing::warn!("SSE returned {status}: {body}");
                     tokio::time::sleep(tokio::time::Duration::from_secs(retry_delay_secs)).await;
                     retry_delay_secs = (retry_delay_secs * 2).min(max_delay_secs);
                     continue;
                 }
                 Err(e) => {
-                    tracing::warn!("Signal SSE connect error: {e}, retrying...");
+                    tracing::warn!("SSE connect error: {e}, retrying...");
                     tokio::time::sleep(tokio::time::Duration::from_secs(retry_delay_secs)).await;
                     retry_delay_secs = (retry_delay_secs * 2).min(max_delay_secs);
                     continue;
@@ -395,7 +395,7 @@ impl Channel for SignalChannel {
                 let chunk = match chunk {
                     Ok(c) => c,
                     Err(e) => {
-                        tracing::debug!(error = ?e, "Signal SSE chunk error, reconnecting");
+                        tracing::debug!(error = ?e, "SSE chunk error, reconnecting");
                         break;
                     }
                 };
@@ -403,7 +403,7 @@ impl Channel for SignalChannel {
                 let text = match String::from_utf8(chunk.to_vec()) {
                     Ok(t) => t,
                     Err(e) => {
-                        tracing::debug!("Signal SSE invalid UTF-8, skipping chunk: {}", e);
+                        tracing::debug!("SSE invalid UTF-8, skipping chunk: {}", e);
                         continue;
                     }
                 };
@@ -443,7 +443,7 @@ impl Channel for SignalChannel {
                                     }
                                 }
                                 Err(e) => {
-                                    tracing::debug!(error = ?e, "Signal SSE parse skip");
+                                    tracing::debug!(error = ?e, "SSE parse skip");
                                 }
                             }
                             current_data.clear();
@@ -477,12 +477,12 @@ impl Channel for SignalChannel {
                         }
                     }
                     Err(e) => {
-                        tracing::debug!(error = ?e, "Signal SSE trailing parse skip");
+                        tracing::debug!(error = ?e, "SSE trailing parse skip");
                     }
                 }
             }
 
-            tracing::debug!("Signal SSE stream ended, reconnecting...");
+            tracing::debug!("SSE stream ended, reconnecting...");
             tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
         }
     }

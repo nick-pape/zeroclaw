@@ -567,10 +567,10 @@ impl OllamaModelProvider {
 
         let response = request_builder.send().await?;
         let status = response.status();
-        tracing::debug!("Ollama response status: {}", status);
+        tracing::debug!("response status: {}", status);
 
         let body = response.bytes().await?;
-        tracing::debug!("Ollama response body length: {} bytes", body.len());
+        tracing::debug!("response body length: {} bytes", body.len());
 
         if !status.is_success() {
             let raw = String::from_utf8_lossy(&body);

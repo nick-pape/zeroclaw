@@ -242,14 +242,14 @@ impl DiscordChannel {
         let is_thread = match tokio::time::timeout(THREAD_LOOKUP_TIMEOUT, lookup).await {
             Ok(Ok(value)) => value,
             Ok(Err(e)) => {
-                tracing::debug!(channel_id, error = %e, "discord: channel lookup failed");
+                tracing::debug!(channel_id, error = %e, "channel lookup failed");
                 return false;
             }
             Err(_) => {
                 tracing::debug!(
                     channel_id,
                     timeout_secs = THREAD_LOOKUP_TIMEOUT.as_secs(),
-                    "discord: channel lookup timed out"
+                    "channel lookup timed out"
                 );
                 return false;
             }
@@ -280,7 +280,7 @@ impl DiscordChannel {
                 tracing::debug!(
                     emoji,
                     error = %e,
-                    "discord: failed to add failure reaction to outgoing message"
+                    "failed to add failure reaction to outgoing message"
                 );
             }
         }
@@ -327,7 +327,7 @@ async fn process_attachments(
             .and_then(|v| v.as_str())
             .unwrap_or("file");
         let Some(url) = att.get("url").and_then(|v| v.as_str()) else {
-            tracing::warn!(name, "discord: attachment has no url, skipping");
+            tracing::warn!(name, "attachment has no url, skipping");
             continue;
         };
 
@@ -339,10 +339,10 @@ async fn process_attachments(
                     }
                 }
                 Ok(resp) => {
-                    tracing::warn!(name, status = %resp.status(), "discord attachment fetch failed");
+                    tracing::warn!(name, status = %resp.status(), "attachment fetch failed");
                 }
                 Err(e) => {
-                    tracing::warn!(name, error = %e, "discord attachment fetch error");
+                    tracing::warn!(name, error = %e, "attachment fetch error");
                 }
             }
             continue;
@@ -363,7 +363,7 @@ async fn process_attachments(
                     let trimmed = text.trim();
                     if !trimmed.is_empty() {
                         tracing::info!(
-                            "Discord: transcribed audio attachment {} ({} chars)",
+                            "transcribed audio attachment {} ({} chars)",
                             name,
                             trimmed.len()
                         );
@@ -371,7 +371,7 @@ async fn process_attachments(
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(name, error = %e, "discord: voice transcription failed");
+                    tracing::warn!(name, error = %e, "voice transcription failed");
                 }
             }
             continue;
@@ -388,7 +388,7 @@ async fn process_attachments(
             Some(dir) => match save_attachment_bytes_to_workspace(dir, name, &bytes).await {
                 Ok(local_path) => local_path.display().to_string(),
                 Err(e) => {
-                    tracing::warn!(name, kind = marker_kind, error = %e, "discord: attachment save failed, falling back to url");
+                    tracing::warn!(name, kind = marker_kind, error = %e, "attachment save failed, falling back to url");
                     url.to_string()
                 }
             },
@@ -421,16 +421,16 @@ async fn download_attachment_bytes(
         Ok(resp) if resp.status().is_success() => match resp.bytes().await {
             Ok(b) => Some(b.to_vec()),
             Err(e) => {
-                tracing::warn!(name, error = %e, "discord: failed to read attachment bytes");
+                tracing::warn!(name, error = %e, "failed to read attachment bytes");
                 None
             }
         },
         Ok(resp) => {
-            tracing::warn!(name, status = %resp.status(), "discord: attachment download failed");
+            tracing::warn!(name, status = %resp.status(), "attachment download failed");
             None
         }
         Err(e) => {
-            tracing::warn!(name, error = %e, "discord: attachment fetch error");
+            tracing::warn!(name, error = %e, "attachment fetch error");
             None
         }
     }
@@ -642,25 +642,25 @@ fn validate_marker_target(
     if target.contains("://") {
         let scheme = target.split("://").next().unwrap_or("?");
         return Err(DiscordMarkerError::Refused(anyhow!(
-            "discord: marker target uses disallowed scheme {scheme:?}; only http/https and absolute workspace paths are accepted"
+            "marker target uses disallowed scheme {scheme:?}; only http/https and absolute workspace paths are accepted"
         )));
     }
     if target.starts_with("data:") || target.starts_with("file:") {
         return Err(DiscordMarkerError::Refused(anyhow!(
-            "discord: marker target uses disallowed scheme; only http/https and absolute workspace paths are accepted"
+            "marker target uses disallowed scheme; only http/https and absolute workspace paths are accepted"
         )));
     }
 
     let target_path = Path::new(target);
     if !target_path.is_absolute() {
         return Err(DiscordMarkerError::Refused(anyhow!(
-            "discord: marker target {target} is not an absolute path; the agent must emit absolute paths inside workspace_dir"
+            "marker target {target} is not an absolute path; the agent must emit absolute paths inside workspace_dir"
         )));
     }
 
     let workspace = workspace_dir.ok_or_else(|| {
         DiscordMarkerError::Refused(anyhow!(
-            "discord: marker target {target} is a local path but the channel was started without a workspace_dir, refusing for safety"
+            "marker target {target} is a local path but the channel was started without a workspace_dir, refusing for safety"
         ))
     })?;
     let workspace_canon = std::fs::canonicalize(workspace)
@@ -670,7 +670,7 @@ fn validate_marker_target(
         Ok(p) => p,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Err(DiscordMarkerError::NotFound(anyhow!(
-                "discord: marker target {target} not found on disk"
+                "marker target {target} not found on disk"
             )));
         }
         Err(e) => {
@@ -682,7 +682,7 @@ fn validate_marker_target(
 
     if !target_canon.starts_with(&workspace_canon) {
         return Err(DiscordMarkerError::Refused(anyhow!(
-            "discord: marker target {target} resolves to {} which is outside workspace_dir {}; refusing",
+            "marker target {target} resolves to {} which is outside workspace_dir {}; refusing",
             target_canon.display(),
             workspace_canon.display(),
         )));
@@ -716,7 +716,7 @@ fn classify_outgoing_attachments(
                     target = %attachment.target,
                     reason = kind_label,
                     error = %e,
-                    "discord: dropping unresolved outbound attachment marker"
+                    "dropping unresolved outbound attachment marker"
                 );
                 failures.push((attachment.target.clone(), e.kind()));
             }
@@ -898,7 +898,7 @@ async fn edit_discord_message(
         .await?;
 
     if resp.status().as_u16() == 429 {
-        tracing::debug!("Discord edit message rate-limited (429), skipping update");
+        tracing::debug!("edit message rate-limited (429), skipping update");
         return Ok(());
     }
 
@@ -908,7 +908,7 @@ async fn edit_discord_message(
             .text()
             .await
             .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
-        anyhow::bail!("Discord edit message failed ({status}): {err}");
+        anyhow::bail!("edit message failed ({status}): {err}");
     }
 
     Ok(())
@@ -933,7 +933,7 @@ async fn delete_discord_message(
         .await?;
 
     if resp.status().as_u16() == 429 {
-        tracing::debug!("Discord delete message rate-limited (429), skipping");
+        tracing::debug!("delete message rate-limited (429), skipping");
         return Ok(());
     }
 
@@ -943,7 +943,7 @@ async fn delete_discord_message(
             .text()
             .await
             .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
-        anyhow::bail!("Discord delete message failed ({status}): {err}");
+        anyhow::bail!("delete message failed ({status}): {err}");
     }
 
     Ok(())
@@ -1238,7 +1238,7 @@ impl Channel for DiscordChannel {
         if local_files.len() > 10 {
             tracing::warn!(
                 count = local_files.len(),
-                "discord: truncating local attachment upload list to 10 files"
+                "truncating local attachment upload list to 10 files"
             );
             local_files.truncate(10);
         }
@@ -1324,7 +1324,7 @@ impl Channel for DiscordChannel {
             .unwrap_or("wss://gateway.discord.gg");
 
         let ws_url = format!("{gw_url}/?v=10&encoding=json");
-        tracing::info!("Discord: connecting to gateway...");
+        tracing::info!("connecting to gateway...");
 
         let (ws_stream, _) = zeroclaw_config::schema::ws_connect_with_proxy(
             &ws_url,
@@ -1360,7 +1360,7 @@ impl Channel for DiscordChannel {
             .send(Message::Text(identify.to_string().into()))
             .await?;
 
-        tracing::info!("Discord: connected and identified");
+        tracing::info!("connected and identified");
 
         // Track the last sequence number for heartbeats and resume.
         // Only accessed in the select! loop below, so a plain i64 suffices.
@@ -1397,7 +1397,7 @@ impl Channel for DiscordChannel {
         if let Some(ref wd) = watchdog {
             let stall_signal = stall_tx.clone();
             wd.start(move || {
-                tracing::warn!("Discord: stall watchdog fired — no events for configured timeout, triggering reconnect");
+                tracing::warn!("stall watchdog fired — no events for configured timeout, triggering reconnect");
                 let _ = stall_signal.try_send(());
             })
             .await;
@@ -1409,7 +1409,7 @@ impl Channel for DiscordChannel {
         loop {
             tokio::select! {
                 _ = stall_rx.recv() => {
-                    tracing::info!("Discord: breaking listen loop due to stall watchdog");
+                    tracing::info!("breaking listen loop due to stall watchdog");
                     break;
                 }
                 _ = hb_rx.recv() => {
@@ -1424,14 +1424,14 @@ impl Channel for DiscordChannel {
                         Some(Ok(Message::Text(t))) => t,
                         Some(Ok(Message::Ping(payload))) => {
                             if write.send(Message::Pong(payload)).await.is_err() {
-                                tracing::warn!("Discord: pong send failed, reconnecting");
+                                tracing::warn!("pong send failed, reconnecting");
                                 break;
                             }
                             continue;
                         }
                         Some(Ok(Message::Close(_))) | None => break,
                         Some(Err(e)) => {
-                            tracing::warn!("Discord: websocket read error: {e}, reconnecting");
+                            tracing::warn!("websocket read error: {e}, reconnecting");
                             break;
                         }
                         _ => continue,
@@ -1467,12 +1467,12 @@ impl Channel for DiscordChannel {
                         }
                         // Op 7: Reconnect
                         7 => {
-                            tracing::warn!("Discord: received Reconnect (op 7), closing for restart");
+                            tracing::warn!("received Reconnect (op 7), closing for restart");
                             break;
                         }
                         // Op 9: Invalid Session
                         9 => {
-                            tracing::warn!("Discord: received Invalid Session (op 9), closing for restart");
+                            tracing::warn!("received Invalid Session (op 9), closing for restart");
                             break;
                         }
                         _ => {}
@@ -1501,7 +1501,7 @@ impl Channel for DiscordChannel {
 
                     // Sender validation
                     if !self.is_user_allowed(author_id) {
-                        tracing::warn!("Discord: ignoring message from unauthorized user: {author_id}");
+                        tracing::warn!("ignoring message from unauthorized user: {author_id}");
                         continue;
                     }
 
@@ -1582,7 +1582,7 @@ impl Channel for DiscordChannel {
                                 )
                                 .await
                             {
-                                tracing::warn!(error = ?e, "discord: archive store failed");
+                                tracing::warn!(error = ?e, "archive store failed");
                             }
                         }
                     }
@@ -1662,7 +1662,7 @@ impl Channel for DiscordChannel {
                                 .await
                             {
                                 tracing::debug!(
-                                    "Discord: failed to add ACK reaction for message {reaction_message_id}: {err}"
+                                    "failed to add ACK reaction for message {reaction_message_id}: {err}"
                                 );
                             }
                         });
@@ -1874,7 +1874,7 @@ impl Channel for DiscordChannel {
                             .insert(recipient.to_string(), std::time::Instant::now());
                     }
                     Err(e) => {
-                        tracing::debug!(error = ?e, "Discord draft update failed");
+                        tracing::debug!(error = ?e, "draft update failed");
                     }
                 }
 
@@ -1943,7 +1943,7 @@ impl Channel for DiscordChannel {
                 if let Some(paragraph) = paragraph {
                     let msg = SendMessage::new(&paragraph, recipient).in_thread(thread_ts.clone());
                     if let Err(e) = self.send(&msg).await {
-                        tracing::debug!(error = ?e, "Discord multi-message paragraph send failed");
+                        tracing::debug!(error = ?e, "multi-message paragraph send failed");
                     }
                     if self.multi_message_delay_ms > 0 {
                         tokio::time::sleep(std::time::Duration::from_millis(
@@ -1983,7 +1983,7 @@ impl Channel for DiscordChannel {
                 if !remaining.is_empty() {
                     let msg = SendMessage::new(&remaining, recipient).in_thread(thread_ts);
                     if let Err(e) = self.send(&msg).await {
-                        tracing::debug!(error = ?e, "Discord multi-message final flush failed");
+                        tracing::debug!(error = ?e, "multi-message final flush failed");
                     }
                 }
             }
@@ -2097,7 +2097,7 @@ impl Channel for DiscordChannel {
         if let Err(e) =
             delete_discord_message(&client, &self.bot_token, recipient, message_id).await
         {
-            tracing::debug!(error = ?e, "Discord cancel_draft delete failed");
+            tracing::debug!(error = ?e, "cancel_draft delete failed");
         }
 
         Ok(())

@@ -283,11 +283,12 @@ mod tests {
     fn disabled_storage_does_not_write_file() {
         let _guard = WRITER_TEST_LOCK.lock();
         let tmp = tempfile::tempdir().unwrap();
-        let cfg = ObservabilityConfig::default(); // log_persistence = "none"
+        let mut cfg = ObservabilityConfig::default();
+        cfg.log_persistence = "none".into();
         init_from_config(&cfg, tmp.path());
 
-        let ev = LogEvent::new(Severity::Info, "test", EventCategory::Agent);
-        record_event(ev);
+        let event = LogEvent::new(Severity::Info, "test", EventCategory::Agent);
+        record_event(event);
 
         let path = runtime_trace_path().unwrap();
         assert!(

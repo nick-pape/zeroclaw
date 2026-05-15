@@ -69,7 +69,6 @@ use zeroclaw_runtime::platform;
 use zeroclaw_runtime::security::pairing::{PairingGuard, constant_time_eq, is_public_bind};
 use zeroclaw_runtime::tools;
 use zeroclaw_runtime::tools::CanvasStore;
-use zeroclaw_runtime::util::truncate_with_ellipsis;
 
 /// Maximum request body size (64KB) — prevents memory exhaustion
 pub const MAX_BODY_SIZE: usize = 65_536;
@@ -2228,9 +2227,10 @@ async fn handle_whatsapp_message(
     // Process each message
     for msg in &messages {
         tracing::info!(
-            "WhatsApp message from {}: {}",
-            msg.sender,
-            truncate_with_ellipsis(&msg.content, 50)
+            channel = "whatsapp",
+            sender = %msg.sender,
+            content = %msg.content,
+            "inbound webhook message"
         );
 
         // Route approval replies to pending approval requests before dispatching to agent
@@ -2362,9 +2362,10 @@ async fn handle_linq_webhook(
     // Process each message
     for msg in &messages {
         tracing::info!(
-            "Linq message from {}: {}",
-            msg.sender,
-            truncate_with_ellipsis(&msg.content, 50)
+            channel = "linq",
+            sender = %msg.sender,
+            content = %msg.content,
+            "inbound webhook message"
         );
         let session_id = sender_session_id("linq", msg);
 
@@ -2481,9 +2482,10 @@ async fn handle_wati_webhook(State(state): State<AppState>, body: Bytes) -> impl
     // Process each message
     for msg in &messages {
         tracing::info!(
-            "WATI message from {}: {}",
-            msg.sender,
-            truncate_with_ellipsis(&msg.content, 50)
+            channel = "wati",
+            sender = %msg.sender,
+            content = %msg.content,
+            "inbound webhook message"
         );
         let session_id = sender_session_id("wati", msg);
 
@@ -2610,9 +2612,10 @@ async fn handle_nextcloud_talk_webhook(
         let nextcloud_talk = Arc::clone(nextcloud_talk);
         tokio::spawn(async move {
             tracing::info!(
-                "Nextcloud Talk message from {}: {}",
-                msg.sender,
-                truncate_with_ellipsis(&msg.content, 50)
+                channel = "nextcloud_talk",
+                sender = %msg.sender,
+                content = %msg.content,
+                "inbound webhook message"
             );
             let session_id = sender_session_id("nextcloud_talk", &msg);
 

@@ -1333,10 +1333,7 @@ pub async fn run_tool_call_loop(
                         Some(issue.as_str()),
                         serde_json::json!({
                             "iteration": iteration + 1,
-                            "response_excerpt": truncate_with_ellipsis(
-                                &scrub_credentials(&response_text),
-                                600
-                            ),
+                            "response": scrub_credentials(&response_text),
                         }),
                     );
                 }

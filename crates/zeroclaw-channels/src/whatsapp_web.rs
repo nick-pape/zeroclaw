@@ -141,7 +141,7 @@ impl WhatsAppWebChannel {
 
         if mention_only && bot_phone.is_none() {
             tracing::warn!(
-                "WhatsApp Web: mention_only enabled but pair_phone not set. \
+                "mention_only enabled but pair_phone not set. \
                 Bot identity will be resolved after connection. Group messages \
                 will be skipped until identity is known."
             );
@@ -212,7 +212,7 @@ impl WhatsAppWebChannel {
         if config.tts.enabled {
             match super::tts::TtsManager::from_config(config) {
                 Ok(m) => self.tts_manager = Some(Arc::new(m)),
-                Err(e) => tracing::warn!(error = ?e, "WhatsApp Web TTS disabled"),
+                Err(e) => tracing::warn!(error = ?e, "TTS disabled"),
             }
         }
         self
@@ -470,7 +470,7 @@ impl WhatsAppWebChannel {
             && u64::from(seconds) > config.max_duration_secs
         {
             tracing::info!(
-                "WhatsApp Web: skipping voice note ({}s exceeds {}s limit)",
+                "skipping voice note ({}s exceeds {}s limit)",
                 seconds,
                 config.max_duration_secs
             );
@@ -482,7 +482,7 @@ impl WhatsAppWebChannel {
         let audio_data = match client.download(audio as &dyn Downloadable).await {
             Ok(data) => data,
             Err(e) => {
-                tracing::warn!(error = ?e, "WhatsApp Web: failed to download voice note");
+                tracing::warn!(error = ?e, "failed to download voice note");
                 return None;
             }
         };
@@ -497,25 +497,25 @@ impl WhatsAppWebChannel {
         };
 
         tracing::info!(
-            "WhatsApp Web: transcribing voice note ({} bytes, file={})",
+            "transcribing voice note ({} bytes, file={})",
             audio_data.len(),
             file_name
         );
 
         match manager.transcribe(&audio_data, file_name).await {
             Ok(text) if text.trim().is_empty() => {
-                tracing::info!("WhatsApp Web: voice transcription returned empty text, skipping");
+                tracing::info!("voice transcription returned empty text, skipping");
                 None
             }
             Ok(text) => {
                 tracing::info!(
-                    "WhatsApp Web: voice note transcribed ({} chars)",
+                    "voice note transcribed ({} chars)",
                     text.len()
                 );
                 Some(text)
             }
             Err(e) => {
-                tracing::warn!(error = ?e, "WhatsApp Web: voice transcription failed");
+                tracing::warn!(error = ?e, "voice transcription failed");
                 None
             }
         }
@@ -531,7 +531,7 @@ impl WhatsAppWebChannel {
     ) -> Result<()> {
         let audio_bytes = tts_manager.synthesize(text).await?;
         let audio_len = audio_bytes.len();
-        tracing::info!("WhatsApp Web TTS: synthesized {} bytes of audio", audio_len);
+        tracing::info!("TTS: synthesized {} bytes of audio", audio_len);
 
         if audio_bytes.is_empty() {
             anyhow::bail!("TTS returned empty audio");
@@ -544,7 +544,7 @@ impl WhatsAppWebChannel {
             .map_err(|e| anyhow!("Failed to upload TTS audio: {e}"))?;
 
         tracing::info!(
-            "WhatsApp Web TTS: uploaded audio (url_len={}, file_length={})",
+            "TTS: uploaded audio (url_len={}, file_length={})",
             upload.url.len(),
             upload.file_length
         );
@@ -573,7 +573,7 @@ impl WhatsAppWebChannel {
             .await
             .map_err(|e| anyhow!("Failed to send voice note: {e}"))?;
         tracing::info!(
-            "WhatsApp Web TTS: sent voice note ({} bytes, ~{}s)",
+            "TTS: sent voice note ({} bytes, ~{}s)",
             audio_len,
             estimated_seconds
         );
@@ -737,7 +737,7 @@ impl Channel for WhatsAppWebChannel {
             let normalized = self.normalize_phone(&message.recipient);
             if !self.is_number_allowed(&normalized) {
                 tracing::warn!(
-                    "WhatsApp Web: recipient {} not in allowed list",
+                    "recipient {} not in allowed list",
                     message.recipient
                 );
                 return Ok(());
@@ -812,12 +812,12 @@ impl Channel for WhatsAppWebChannel {
                         {
                             Ok(()) => {
                                 tracing::info!(
-                                    "WhatsApp Web: voice reply sent ({} chars)",
+                                    "voice reply sent ({} chars)",
                                     text.len()
                                 );
                             }
                             Err(e) => {
-                                tracing::warn!(error = ?e, "WhatsApp Web: TTS voice reply failed");
+                                tracing::warn!(error = ?e, "TTS voice reply failed");
                             }
                         }
                     }
@@ -834,7 +834,7 @@ impl Channel for WhatsAppWebChannel {
 
         let message_id = client.send_message(to, outgoing).await?;
         tracing::debug!(
-            "WhatsApp Web: sent text to {} (id: {})",
+            "sent text to {} (id: {})",
             message.recipient,
             message_id
         );
@@ -865,7 +865,7 @@ impl Channel for WhatsAppWebChannel {
             let expanded_session_path = shellexpand::tilde(&self.session_path).to_string();
 
             tracing::info!(
-                "WhatsApp Web channel starting (session: {})",
+                "channel starting (session: {})",
                 expanded_session_path
             );
 
@@ -876,7 +876,7 @@ impl Channel for WhatsAppWebChannel {
             // Check if we have a saved device to load
             let mut device = Device::new(backend.clone());
             if backend.exists().await? {
-                tracing::info!("WhatsApp Web: found existing session, loading device");
+                tracing::info!("found existing session, loading device");
                 if let Some(core_device) = backend.load().await? {
                     device.load_from_serializable(core_device);
                 } else {
@@ -884,7 +884,7 @@ impl Channel for WhatsAppWebChannel {
                 }
             } else {
                 tracing::info!(
-                    "WhatsApp Web: no existing session, new device will be created during pairing"
+                    "no existing session, new device will be created during pairing"
                 );
             };
 
@@ -1000,7 +1000,7 @@ impl Channel for WhatsAppWebChannel {
                                     if is_self_chat {
                                         if !wa_self_chat_mode {
                                             tracing::debug!(
-                                                "WhatsApp Web: ignoring self-chat message (self_chat_mode=false)"
+                                                "ignoring self-chat message (self_chat_mode=false)"
                                             );
                                             return;
                                         }
@@ -1017,7 +1017,7 @@ impl Channel for WhatsAppWebChannel {
                                             if let Some(digits) = phone_digits {
                                                 reply_target = format!("{digits}@s.whatsapp.net");
                                                 tracing::debug!(
-                                                    "WhatsApp Web: self-chat LID→phone reply target: {reply_target}"
+                                                    "self-chat LID→phone reply target: {reply_target}"
                                                 );
                                             }
                                         }
@@ -1038,14 +1038,14 @@ impl Channel for WhatsAppWebChannel {
                                         // returns true and we fall through to the policy branches
                                         // below to treat the message like an inbound trigger.
                                         tracing::debug!(
-                                            "WhatsApp Web: ignoring fromMe message outside self-chat thread (chat={chat}, sender={sender})"
+                                            "ignoring fromMe message outside self-chat thread (chat={chat}, sender={sender})"
                                         );
                                         return;
                                     } else if is_group {
                                         match wa_group_policy {
                                             zeroclaw_config::schema::WhatsAppChatPolicy::Ignore => {
                                                 tracing::debug!(
-                                                    "WhatsApp Web: ignoring group message (group_policy=ignore)"
+                                                    "ignoring group message (group_policy=ignore)"
                                                 );
                                                 return;
                                             }
@@ -1059,7 +1059,7 @@ impl Channel for WhatsAppWebChannel {
                                                         mapped_phone.as_deref(),
                                                     );
                                                     tracing::warn!(
-                                                        "WhatsApp Web: message from unrecognized sender not in allowed list (candidates_count={}){}",
+                                                        "message from unrecognized sender not in allowed list (candidates_count={}){}",
                                                         sender_candidates.len(),
                                                         lid_diag,
                                                     );
@@ -1072,7 +1072,7 @@ impl Channel for WhatsAppWebChannel {
                                         match wa_dm_policy {
                                             zeroclaw_config::schema::WhatsAppChatPolicy::Ignore => {
                                                 tracing::debug!(
-                                                    "WhatsApp Web: ignoring DM (dm_policy=ignore)"
+                                                    "ignoring DM (dm_policy=ignore)"
                                                 );
                                                 return;
                                             }
@@ -1086,7 +1086,7 @@ impl Channel for WhatsAppWebChannel {
                                                         mapped_phone.as_deref(),
                                                     );
                                                     tracing::warn!(
-                                                        "WhatsApp Web: message from unrecognized sender not in allowed list (candidates_count={}){}",
+                                                        "message from unrecognized sender not in allowed list (candidates_count={}){}",
                                                         sender_candidates.len(),
                                                         lid_diag,
                                                     );
@@ -1117,7 +1117,7 @@ impl Channel for WhatsAppWebChannel {
                                         .await
                                     } else {
                                         tracing::debug!(
-                                            "WhatsApp Web: ignoring non-PTT audio message from {}",
+                                            "ignoring non-PTT audio message from {}",
                                             normalized
                                         );
                                         None
@@ -1155,7 +1155,7 @@ impl Channel for WhatsAppWebChannel {
 
                                 if content.is_empty() {
                                     tracing::debug!(
-                                        "WhatsApp Web: ignoring empty or non-text message from {}",
+                                        "ignoring empty or non-text message from {}",
                                         normalized
                                     );
                                     return;
@@ -1173,7 +1173,7 @@ impl Channel for WhatsAppWebChannel {
                                             bp,
                                         ) {
                                             tracing::debug!(
-                                                "WhatsApp Web: ignoring group message without bot mention"
+                                                "ignoring group message without bot mention"
                                             );
                                             return;
                                         }
@@ -1183,14 +1183,14 @@ impl Channel for WhatsAppWebChannel {
                                             Some(c) => c,
                                             None => {
                                                 tracing::debug!(
-                                                    "WhatsApp Web: message empty after stripping mention"
+                                                    "message empty after stripping mention"
                                                 );
                                                 return;
                                             }
                                         }
                                     } else {
                                         tracing::debug!(
-                                            "WhatsApp Web: mention_only active but bot identity unknown, skipping group msg"
+                                            "mention_only active but bot identity unknown, skipping group msg"
                                         );
                                         return;
                                     }
@@ -1214,7 +1214,7 @@ impl Channel for WhatsAppWebChannel {
                                         Some(c) => c,
                                         None => {
                                             tracing::debug!(
-                                                "WhatsApp Web: message from {normalized} did not match mention patterns, dropping"
+                                                "message from {normalized} did not match mention patterns, dropping"
                                             );
                                             return;
                                         }
@@ -1242,7 +1242,7 @@ impl Channel for WhatsAppWebChannel {
                                 }
                             }
                             Event::Connected(_) => {
-                                tracing::info!("WhatsApp Web connected successfully");
+                                tracing::info!("connected successfully");
                                 WhatsAppWebChannel::reset_retry(&retry_count);
                                 // Resolve bot identity from the device store
                                 if mention_only {
@@ -1259,7 +1259,7 @@ impl Channel for WhatsAppWebChannel {
                                         if !digits.is_empty() {
                                             *bot_phone_inner.lock() = Some(digits.clone());
                                             tracing::info!(
-                                                "WhatsApp Web: resolved bot identity from device: +{}",
+                                                "resolved bot identity from device: +{}",
                                                 digits
                                             );
                                         }
@@ -1274,15 +1274,15 @@ impl Channel for WhatsAppWebChannel {
                                 let _ = logout_tx.send(());
                             }
                             Event::StreamError(stream_error) => {
-                                tracing::error!("WhatsApp Web stream error: {:?}", stream_error);
+                                tracing::error!("stream error: {:?}", stream_error);
                             }
                             Event::PairingCode { code, .. } => {
-                                tracing::info!("WhatsApp Web pair code received");
+                                tracing::info!("pair code received");
                                 tracing::info!(
                                     "Link your phone by entering this code in WhatsApp > Linked Devices"
                                 );
                                 eprintln!();
-                                eprintln!("WhatsApp Web pair code: {code}");
+                                eprintln!("pair code: {code}");
                                 eprintln!();
                             }
                             Event::PairingQrCode { code, .. } => {
@@ -1300,7 +1300,7 @@ impl Channel for WhatsAppWebChannel {
                                     }
                                     Err(err) => {
                                         tracing::warn!(
-                                            "WhatsApp Web: failed to render pairing QR in terminal: {}",
+                                            "failed to render pairing QR in terminal: {}",
                                             err
                                         );
                                         eprintln!();
@@ -1316,7 +1316,7 @@ impl Channel for WhatsAppWebChannel {
 
             // Configure pair-code flow when a phone number is provided.
             if let Some(ref phone) = self.pair_phone {
-                tracing::info!("WhatsApp Web: pair-code flow enabled for configured phone number");
+                tracing::info!("pair-code flow enabled for configured phone number");
                 builder = builder.with_pair_code(PairCodeOptions {
                     phone_number: phone.clone(),
                     custom_code: self.pair_code.clone(),
@@ -1324,7 +1324,7 @@ impl Channel for WhatsAppWebChannel {
                 });
             } else if self.pair_code.is_some() {
                 tracing::warn!(
-                    "WhatsApp Web: pair_code is set but pair_phone is missing; pair code config is ignored"
+                    "pair_code is set but pair_phone is missing; pair code config is ignored"
                 );
             }
 
@@ -1349,7 +1349,7 @@ impl Channel for WhatsAppWebChannel {
                     true
                 }
                 _ = tokio::signal::ctrl_c() => {
-                    tracing::info!("WhatsApp Web channel received Ctrl+C");
+                    tracing::info!("channel received Ctrl+C");
                     false
                 }
             };
@@ -1374,7 +1374,7 @@ impl Channel for WhatsAppWebChannel {
                 let (attempts, exceeded) = Self::record_retry(&retry_count);
                 if exceeded {
                     anyhow::bail!(
-                        "WhatsApp Web: exceeded {} reconnect attempts, giving up",
+                        "exceeded {} reconnect attempts, giving up",
                         Self::MAX_RETRIES
                     );
                 }
@@ -1387,23 +1387,23 @@ impl Channel for WhatsAppWebChannel {
                             Ok(()) => {}
                             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                             Err(e) => tracing::warn!(
-                                "WhatsApp Web: failed to remove session file {}: {e}",
+                                "failed to remove session file {}: {e}",
                                 path
                             ),
                         }
                     }
                     tracing::info!(
-                        "WhatsApp Web: session files removed, restarting for QR pairing"
+                        "session files removed, restarting for QR pairing"
                     );
                 } else {
                     tracing::warn!(
-                        "WhatsApp Web: bot stopped without LoggedOut; reconnecting with existing session"
+                        "bot stopped without LoggedOut; reconnecting with existing session"
                     );
                 }
 
                 let delay = Self::compute_retry_delay(attempts);
                 tracing::info!(
-                    "WhatsApp Web: reconnecting in {}s (attempt {}/{})",
+                    "reconnecting in {}s (attempt {}/{})",
                     delay,
                     attempts,
                     Self::MAX_RETRIES
@@ -1433,7 +1433,7 @@ impl Channel for WhatsAppWebChannel {
             let normalized = self.normalize_phone(recipient);
             if !self.is_number_allowed(&normalized) {
                 tracing::warn!(
-                    "WhatsApp Web: typing target {} not in allowed list",
+                    "typing target {} not in allowed list",
                     recipient
                 );
                 return Ok(());
@@ -1447,7 +1447,7 @@ impl Channel for WhatsAppWebChannel {
             .await
             .map_err(|e| anyhow!("Failed to send typing state (composing): {e}"))?;
 
-        tracing::debug!("WhatsApp Web: start typing for {}", recipient);
+        tracing::debug!("start typing for {}", recipient);
         Ok(())
     }
 
@@ -1461,7 +1461,7 @@ impl Channel for WhatsAppWebChannel {
             let normalized = self.normalize_phone(recipient);
             if !self.is_number_allowed(&normalized) {
                 tracing::warn!(
-                    "WhatsApp Web: typing target {} not in allowed list",
+                    "typing target {} not in allowed list",
                     recipient
                 );
                 return Ok(());
@@ -1475,7 +1475,7 @@ impl Channel for WhatsAppWebChannel {
             .await
             .map_err(|e| anyhow!("Failed to send typing state (paused): {e}"))?;
 
-        tracing::debug!("WhatsApp Web: stop typing for {}", recipient);
+        tracing::debug!("stop typing for {}", recipient);
         Ok(())
     }
 }
