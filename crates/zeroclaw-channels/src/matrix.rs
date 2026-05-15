@@ -1505,6 +1505,16 @@ mod inbound {
         }
         let attachments: Vec<MediaAttachment> = Vec::new();
 
+        let outbound_anchor =
+            resolve_outbound_anchor(thread_id.as_ref(), &ev.event_id, ctx.config.reply_in_thread);
+        // When the bot is the one starting the thread, mark its root seen
+        // so the next inbound that lands inside it does not re-fetch and
+        // re-inject a root preamble (the agent already saw the root in this
+        // same turn).
+        if thread_id.is_none() && ctx.config.reply_in_thread {
+            ctx_mod::mark_seen(&ctx.threads_seen, ev.event_id.clone()).await;
+        }
+
         let msg = ChannelMessage {
             id: ev.event_id.to_string(),
             sender: sender.to_string(),
@@ -1516,13 +1526,8 @@ mod inbound {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
-            // Reply anchor: only carry an existing Matrix thread root. A root
-            // timeline event is not a thread, even when outbound replies are
-            // configured to preserve thread context.
-            thread_ts: inbound_thread_ts(thread_id.as_ref()),
-            // Interruption scope is for cancellation grouping — only set when
-            // the inbound is genuinely *inside* a reply thread.
-            interruption_scope_id: thread_id.as_ref().map(|t| t.to_string()),
+            thread_ts: outbound_anchor.clone(),
+            interruption_scope_id: outbound_anchor,
             attachments,
         };
 
@@ -1547,6 +1552,27 @@ mod inbound {
         )
     }
 
+    /// Decide where the bot should anchor its reply. Carries the existing
+    /// thread root when the inbound is already inside an `m.thread`
+    /// relation. When the inbound is a root timeline event and
+    /// `reply_in_thread` is enabled, anchors a brand-new thread on the
+    /// inbound event itself so the bot's reply opens a thread the user
+    /// can continue the conversation in (matches the schema doc for
+    /// `[channels.matrix.<alias>].reply_in_thread`).
+    pub(super) fn resolve_outbound_anchor(
+        thread_id: Option<&OwnedEventId>,
+        event_id: &OwnedEventId,
+        reply_in_thread: bool,
+    ) -> Option<String> {
+        thread_id.map(ToString::to_string).or_else(|| {
+            if reply_in_thread {
+                Some(event_id.to_string())
+            } else {
+                None
+            }
+        })
+    }
+
     pub(super) fn extract_thread_id(raw: &RawEvent) -> Option<OwnedEventId> {
         let v: JsonValue = serde_json::from_str(raw.get()).ok()?;
         let relates = v.get("content")?.get("m.relates_to")?;
@@ -1556,10 +1582,6 @@ mod inbound {
         }
         let root = relates.get("event_id")?.as_str()?;
         root.parse().ok()
-    }
-
-    pub(super) fn inbound_thread_ts(thread_id: Option<&OwnedEventId>) -> Option<String> {
-        thread_id.map(ToString::to_string)
     }
 
     /// Pull the `m.in_reply_to.event_id` from a raw event. This is Matrix's
@@ -3917,7 +3939,7 @@ mod tests {
 
     mod thread_extraction {
         use super::super::inbound::{
-            extract_mentions_user_ids, extract_thread_id, inbound_thread_ts,
+            extract_mentions_user_ids, extract_thread_id, resolve_outbound_anchor,
         };
         use matrix_sdk::event_handler::RawEvent;
         use matrix_sdk::ruma::serde::Raw;
@@ -3952,21 +3974,6 @@ mod tests {
         }
 
         #[test]
-        fn root_message_does_not_become_thread_when_reply_in_thread_enabled() {
-            assert_eq!(inbound_thread_ts(None), None);
-        }
-
-        #[test]
-        fn threaded_message_uses_existing_thread_root() {
-            let root_id = "$root:server".parse().expect("event id");
-
-            assert_eq!(
-                inbound_thread_ts(Some(&root_id)).as_deref(),
-                Some("$root:server")
-            );
-        }
-
-        #[test]
         fn non_thread_relation_returns_none() {
             let r = raw(serde_json::json!({
                 "content": {
@@ -3976,6 +3983,35 @@ mod tests {
                 }
             }));
             assert!(extract_thread_id(&r).is_none());
+        }
+
+        #[test]
+        fn root_inbound_starts_new_thread_when_reply_in_thread_enabled() {
+            let event_id = "$root:server".parse().expect("event id");
+            assert_eq!(
+                resolve_outbound_anchor(None, &event_id, true).as_deref(),
+                Some("$root:server")
+            );
+        }
+
+        #[test]
+        fn root_inbound_stays_root_when_reply_in_thread_disabled() {
+            let event_id = "$root:server".parse().expect("event id");
+            assert_eq!(resolve_outbound_anchor(None, &event_id, false), None);
+        }
+
+        #[test]
+        fn threaded_inbound_keeps_existing_thread_root() {
+            let event_id = "$reply:server".parse().expect("event id");
+            let thread_root = "$root:server".parse().expect("thread id");
+            assert_eq!(
+                resolve_outbound_anchor(Some(&thread_root), &event_id, true).as_deref(),
+                Some("$root:server")
+            );
+            assert_eq!(
+                resolve_outbound_anchor(Some(&thread_root), &event_id, false).as_deref(),
+                Some("$root:server")
+            );
         }
 
         #[test]
