@@ -2924,6 +2924,20 @@ impl Default for AliasedAgentConfig {
     }
 }
 
+impl AliasedAgentConfig {
+    /// True when this agent has the bindings required to dispatch a turn:
+    /// enabled, non-empty `model_provider`, `risk_profile`, and
+    /// `runtime_profile`. `Config::validate()` emits the per-field errors
+    /// that, when all passed, mean this returns `true`.
+    #[must_use]
+    pub fn is_dispatchable(&self) -> bool {
+        self.enabled
+            && !self.model_provider.is_empty()
+            && !self.risk_profile.trim().is_empty()
+            && !self.runtime_profile.trim().is_empty()
+    }
+}
+
 /// One `[channels.<type>.<alias>]` block, with the owning agent (if any)
 /// resolved via `agents.<agent>.channels`. Returned by
 /// `Config::channels_by_alias()`.

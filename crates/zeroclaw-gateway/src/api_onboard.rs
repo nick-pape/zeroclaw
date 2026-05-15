@@ -178,47 +178,49 @@ pub struct SectionsResponse {
 #[derive(Debug, Serialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct OnboardStatusResponse {
-    /// `true` when the user hasn't started onboarding yet — no completed
-    /// section markers AND no usable model_provider configured. The dashboard
-    /// uses this signal to redirect first-load visits from `/` to
-    /// `/onboard`.
+    /// `true` when no agent is dispatchable yet. The dashboard uses this
+    /// signal to redirect first-load visits from `/` to `/onboard`.
     pub needs_onboarding: bool,
     /// Short machine-readable reason for the value of `needs_onboarding`,
-    /// for logs / debugging. Stable: `fresh_install` / `has_model_provider` /
-    /// `has_completed_sections`.
+    /// for logs / debugging. Stable: `fresh_install` / `incomplete_agent`
+    /// / `has_dispatchable_agent`.
     pub reason: &'static str,
+}
+
+/// Pure derivation of the onboard-status response from a config snapshot.
+/// `needs_onboarding` is `false` iff at least one `[agents.<alias>]` block
+/// is dispatchable (`AliasedAgentConfig::is_dispatchable`). Providers
+/// configured without an agent bound to them aren't a completion signal —
+/// `state.model.is_empty()` still bounces chat dispatch with 503 in that
+/// state, so reporting `needs_onboarding: false` there would be a lie.
+#[must_use]
+pub fn derive_onboard_status(cfg: &zeroclaw_config::schema::Config) -> OnboardStatusResponse {
+    let dispatchable = cfg.agents.values().any(|a| a.is_dispatchable());
+    let reason = if dispatchable {
+        "has_dispatchable_agent"
+    } else if !cfg.onboard_state.completed_sections.is_empty() {
+        "incomplete_agent"
+    } else {
+        "fresh_install"
+    };
+    OnboardStatusResponse {
+        needs_onboarding: !dispatchable,
+        reason,
+    }
 }
 
 /// `GET /api/onboard/status` — boolean signal for the dashboard's
 /// fresh-install redirect. The daemon writes a default `config.toml` on
 /// first init, so file existence isn't a useful "is the user new?" check.
-/// Instead we look at two explicit user-driven markers: any
-/// `onboard_state.completed_sections` entry (set when the wizard finishes
-/// a section) OR any entry under `providers.models`. When neither is
-/// present, the user is fresh and should land at `/onboard` instead of
-/// the empty Dashboard.
+/// Onboarding is complete iff at least one agent has its
+/// `model_provider`, `risk_profile`, and `runtime_profile` bound — the
+/// minimum surface a dispatched turn touches.
 pub async fn handle_onboard_status(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
     let cfg = state.config.read().clone();
-
-    let has_completed = !cfg.onboard_state.completed_sections.is_empty();
-    let has_model_provider = !cfg.providers.models.is_empty();
-
-    let (needs_onboarding, reason) = if has_completed {
-        (false, "has_completed_sections")
-    } else if has_model_provider {
-        (false, "has_model_provider")
-    } else {
-        (true, "fresh_install")
-    };
-
-    axum::Json(OnboardStatusResponse {
-        needs_onboarding,
-        reason,
-    })
-    .into_response()
+    axum::Json(derive_onboard_status(&cfg)).into_response()
 }
 
 /// All alias-reference choices an agent form needs, in one round-trip.
@@ -1142,6 +1144,8 @@ mod tests {
     #[test]
     fn build_agent_options_returns_every_configured_alias() {
         let mut cfg = zeroclaw_config::schema::Config::default();
+        cfg.create_map_key("providers.models.anthropic", "default")
+            .unwrap();
         cfg.create_map_key("risk-profiles", "alpha_risk").unwrap();
         cfg.create_map_key("runtime-profiles", "alpha_runtime")
             .unwrap();
@@ -1153,12 +1157,62 @@ mod tests {
 
         let resp = build_agent_options(&cfg);
 
+        assert_eq!(resp.model_providers, vec!["anthropic.default".to_string()]);
         assert_eq!(resp.risk_profiles, vec!["alpha_risk".to_string()]);
         assert_eq!(resp.runtime_profiles, vec!["alpha_runtime".to_string()]);
         assert_eq!(resp.skill_bundles, vec!["alpha_skills".to_string()]);
         assert_eq!(resp.knowledge_bundles, vec!["alpha_knowledge".to_string()],);
         assert_eq!(resp.mcp_bundles, vec!["alpha_mcp".to_string()]);
         assert_eq!(resp.agents, vec!["alpha_agent".to_string()]);
+    }
+
+    #[test]
+    fn derive_onboard_status_requires_dispatchable_agent() {
+        let mut cfg = zeroclaw_config::schema::Config::default();
+        let resp = derive_onboard_status(&cfg);
+        assert!(resp.needs_onboarding);
+        assert_eq!(resp.reason, "fresh_install");
+
+        cfg.create_map_key("providers.models.anthropic", "default")
+            .unwrap();
+        let resp = derive_onboard_status(&cfg);
+        assert!(
+            resp.needs_onboarding,
+            "provider configured without a bound agent must not flip needs_onboarding"
+        );
+        assert_eq!(resp.reason, "fresh_install");
+
+        cfg.create_map_key("risk-profiles", "default").unwrap();
+        cfg.create_map_key("runtime-profiles", "default").unwrap();
+        cfg.create_map_key("agents", "default").unwrap();
+        let resp = derive_onboard_status(&cfg);
+        assert!(
+            resp.needs_onboarding,
+            "agent without provider/profile bindings must still need onboarding"
+        );
+        assert_eq!(resp.reason, "fresh_install");
+
+        let agent = cfg.agents.get_mut("default").unwrap();
+        agent.model_provider = "anthropic.default".into();
+        agent.risk_profile = "default".into();
+        agent.runtime_profile = "default".into();
+        let resp = derive_onboard_status(&cfg);
+        assert!(!resp.needs_onboarding);
+        assert_eq!(resp.reason, "has_dispatchable_agent");
+    }
+
+    #[test]
+    fn derive_onboard_status_completed_sections_without_dispatchable_agent_stays_pending() {
+        let mut cfg = zeroclaw_config::schema::Config::default();
+        cfg.onboard_state
+            .completed_sections
+            .push("providers.models".into());
+        let resp = derive_onboard_status(&cfg);
+        assert!(
+            resp.needs_onboarding,
+            "completed_sections marker without a dispatchable agent must NOT flip the redirect"
+        );
+        assert_eq!(resp.reason, "incomplete_agent");
     }
 
     fn empty_cfg() -> zeroclaw_config::schema::Config {
