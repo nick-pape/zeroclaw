@@ -21,7 +21,6 @@ import {
   getDrift,
   getMapKeys,
   getSections,
-  getTemplates,
   listProps,
   patchConfig,
   selectSectionItem,
@@ -834,133 +833,9 @@ function sectionTabsForDirectForm(
         label: 'Limits',
         render: () => makeForm((p) => !p.startsWith('cost.rates.')),
       },
-      {
-        key: 'rates',
-        label: 'Rates',
-        render: () => <CostRatesStandalone onSaved={ctx.onSaved} />,
-      },
     ];
   }
   return null;
-}
-
-// Standalone rate-sheet editor for `/config/cost` → Rates tab. The
-// operator picks category + provider type explicitly; nothing is
-// auto-selected. URL params `?category=...&provider=...` hydrate the
-// pickers, so deep links from elsewhere (e.g. the dashboard's "Spend by
-// model" rows) can land here with the right slot already in view.
-//
-// Provider-type options come straight from the schema via
-// `GET /api/config/templates` — every `cost.rates.providers.<category>.<type>`
-// map section the Configurable derive enumerates is one option. No
-// hand-typed slot table on the frontend; adding a provider slot in
-// `for_each_*_provider_slot!` is the single source of truth.
-function CostRatesStandalone({ onSaved }: { onSaved?: () => void }) {
-  const location = useLocation();
-  const params = new URLSearchParams(location.search);
-  const urlCategory = params.get('category');
-  const urlProvider = params.get('provider');
-  const isValidCategory = (v: string | null): v is CostRatesCategory =>
-    v === 'models' || v === 'tts' || v === 'transcription';
-  const [category, setCategory] = useState<'' | CostRatesCategory>(
-    isValidCategory(urlCategory) ? urlCategory : '',
-  );
-  const [providerType, setProviderType] = useState<string>(urlProvider ?? '');
-  const [providerTypeOptions, setProviderTypeOptions] = useState<
-    Record<CostRatesCategory, string[]>
-  >({ models: [], tts: [], transcription: [] });
-  const [loadingTemplates, setLoadingTemplates] = useState(true);
-
-  useEffect(() => {
-    let cancelled = false;
-    getTemplates()
-      .then((r) => {
-        if (cancelled) return;
-        const byCat: Record<CostRatesCategory, string[]> = {
-          models: [],
-          tts: [],
-          transcription: [],
-        };
-        for (const t of r.templates) {
-          if (t.kind !== 'map') continue;
-          const parts = t.path.split('.');
-          if (parts.length !== 5) continue;
-          if (parts[0] !== 'cost' || parts[1] !== 'rates' || parts[2] !== 'providers') continue;
-          const cat = parts[3];
-          if (cat !== 'models' && cat !== 'tts' && cat !== 'transcription') continue;
-          const type = parts[4];
-          if (type) byCat[cat].push(type);
-        }
-        for (const k of Object.keys(byCat) as CostRatesCategory[]) {
-          byCat[k].sort();
-        }
-        setProviderTypeOptions(byCat);
-      })
-      .finally(() => {
-        if (!cancelled) setLoadingTemplates(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  const options = category ? providerTypeOptions[category] : [];
-
-  return (
-    <div className="flex flex-col gap-4">
-      <div className="flex items-center gap-3 flex-wrap">
-        <label className="text-sm flex items-center gap-2">
-          <span style={{ color: 'var(--pc-text-secondary)' }}>Category</span>
-          <select
-            value={category}
-            onChange={(e) => {
-              const v = e.target.value;
-              setCategory(isValidCategory(v) ? v : '');
-              setProviderType('');
-            }}
-            className="input-electric text-sm px-2 py-1 appearance-none cursor-pointer"
-          >
-            <option value="">select a category...</option>
-            <option value="models">models (USD per 1M tokens)</option>
-            <option value="tts">tts (USD per 1M chars)</option>
-            <option value="transcription">transcription (USD per minute)</option>
-          </select>
-        </label>
-        <label className="text-sm flex items-center gap-2">
-          <span style={{ color: 'var(--pc-text-secondary)' }}>Provider</span>
-          <select
-            value={providerType}
-            onChange={(e) => setProviderType(e.target.value)}
-            disabled={loadingTemplates || !category || options.length === 0}
-            className="input-electric text-sm px-2 py-1 appearance-none cursor-pointer"
-          >
-            <option value="">
-              {!category
-                ? 'pick a category first'
-                : loadingTemplates
-                  ? 'loading...'
-                  : options.length === 0
-                    ? 'no providers'
-                    : 'select a provider...'}
-            </option>
-            {options.map((p) => (
-              <option key={p} value={p}>
-                {p}
-              </option>
-            ))}
-          </select>
-        </label>
-      </div>
-
-      {category && providerType && (
-        <CostRatesEditor
-          category={category}
-          providerType={providerType}
-          onSaved={onSaved}
-        />
-      )}
-    </div>
-  );
 }
 
 function costCategoryForSection(sectionKey: string): CostRatesCategory | null {

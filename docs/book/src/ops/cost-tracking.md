@@ -170,32 +170,29 @@ profiles; the trade-off is losing the per-agent dimension everywhere.
 ### Config UI
 
 - `/config/cost` → **Limits** tab: every flat `[cost].*` field
-  (enabled, limits, enforcement, track_per_agent).
-- `/config/cost` → **Rates** tab: schema-driven editor. Pick a
-  category (models / tts / transcription) and a provider type; add /
-  remove / edit resource rate entries inline. The provider-type
-  dropdown comes from `GET /api/config/templates`, which lists every
-  `[cost.rates.providers.<category>.<type>]` map section
-  `Config::map_key_sections()` registers. There's no hand-typed list
-  on the frontend.
-- `/config/providers.<category>/<type>` → **Costs** tab: same
-  `CostRatesEditor` widget, scoped to that provider type. The `+ Add`
-  input suggests upstream resource ids drawn from
-  `providers.<category>.<type>.*.model` across configured aliases, so
-  the operator can one-click a rate row for every model they've
-  actually bound.
+  (enabled, limits, enforcement, track_per_agent). Rate-sheet rows
+  are not edited here — they're tied to the provider that owns the
+  model, so they live one tier down.
+- `/config/providers.<category>/<type>` → **Costs** tab: rate-sheet
+  editor for that provider type. The `+ Add` input suggests upstream
+  resource ids drawn from `providers.<category>.<type>.*.model`
+  across configured aliases, so the operator can one-click a rate row
+  for every model they've actually bound. This is the only entry
+  point for editing `[cost.rates.providers.<category>.<type>.*]`.
 
 ### Dashboard
 
-The dashboard's **Cost** tab (`/dashboard/cost`) shows three panels:
+The dashboard's **Cost** tab shows three panels plus a Window picker
+(today / last 7 days / last 30 days / this month / all time):
 
-- **Cost overview** — session-scoped totals (this daemon process)
-  plus daily / monthly totals from `costs.jsonl`.
-- **Spend by agent** — per-agent rollup, today's records only.
-  Visible when `track_per_agent` is true.
-- **Spend by model** — session-scoped per-model rollup. Empty
-  immediately after a daemon restart until at least one priced
-  response lands.
+- **Spend totals** — daily and monthly totals from `costs.jsonl`.
+- **Spend by agent · <window>** — per-agent rollup over the picked
+  window. Visible when `track_per_agent` is true.
+- **Spend by model · <window>** — per-model rollup. Each row's model
+  id is clickable; the click resolves the owning provider type from
+  configured aliases and navigates to that provider's Costs tab. When
+  the model id isn't bound to any configured provider the click is a
+  no-op (there's no qualified rate-sheet route for an orphan model).
 
 ### Gateway
 

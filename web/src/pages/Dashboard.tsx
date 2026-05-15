@@ -1540,6 +1540,21 @@ function CostTab({
   // on-demand, so there's no race with an in-flight initial fetch.
   const [modelToType, setModelToType] = useState<Record<string, string>>({});
 
+  // Pre-resolve on mount so clicking a model row navigates instantly
+  // without racing the lookup. Clicks before this resolves fall through
+  // to the same async resolve below.
+  useEffect(() => {
+    let cancelled = false;
+    void resolveModelToProviderType('models')
+      .then((map) => {
+        if (!cancelled) setModelToType(map);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   const openModelRates = async (modelId: string) => {
     let map = modelToType;
     if (!(modelId in map)) {
@@ -1548,22 +1563,20 @@ function CostTab({
         map = fresh;
         setModelToType(fresh);
       } catch {
-        /* fall through to the unscoped rates editor */
+        return;
       }
     }
     const type = map[modelId];
-    if (type) {
-      navigate(
-        `/config/providers.models/${encodeURIComponent(type)}?tab=costs`,
-      );
-    } else {
-      // No configured provider claims this model id; land on the
-      // standalone Rates view with the URL params hydrating the
-      // category so the operator can pick the right slot manually.
-      navigate(
-        `/config/cost?tab=rates&category=models&resource=${encodeURIComponent(modelId)}`,
-      );
+    if (!type) {
+      // No configured provider claims this model id. The rate sheet
+      // for a model that isn't bound to a provider has no qualified
+      // route, so the click is a no-op rather than landing on a
+      // dead-end page.
+      return;
     }
+    navigate(
+      `/config/providers.models/${encodeURIComponent(type)}?tab=costs`,
+    );
   };
 
   return (
