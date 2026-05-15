@@ -55,6 +55,7 @@ fn strip_media_markers(text: &str) -> String {
 pub async fn consolidate_turn(
     model_provider: &dyn ModelProvider,
     model: &str,
+    temperature: Option<f64>,
     memory: &dyn Memory,
     user_message: &str,
     assistant_response: &str,
@@ -79,15 +80,12 @@ pub async fn consolidate_turn(
         turn_text.clone()
     };
 
-    // Low temperature for consolidation — we want deterministic
-    // summarization, not creative rewrites.
-    const CONSOLIDATION_TEMPERATURE: f64 = 0.1;
     let raw = model_provider
         .chat_with_system(
             Some(CONSOLIDATION_SYSTEM_PROMPT),
             &truncated,
             model,
-            Some(CONSOLIDATION_TEMPERATURE),
+            temperature,
         )
         .await?;
 

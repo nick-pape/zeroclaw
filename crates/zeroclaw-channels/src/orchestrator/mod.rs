@@ -3082,6 +3082,7 @@ async fn process_channel_message_body(
                 &mut history,
                 active_model_provider.as_ref(),
                 route.model.as_str(),
+                ctx.temperature,
             )
             .await
         {
@@ -3667,10 +3668,14 @@ async fn process_channel_message_body(
                 strip_old_tool_context(ctx.as_ref(), &history_key, keep_tool_turns);
             }
 
-            // Fire-and-forget LLM-driven memory consolidation.
+            // Fire-and-forget LLM-driven memory consolidation. Passes the
+            // agent's resolved temperature through unchanged — `None`
+            // means the provider sends no `temperature` field (necessary
+            // for models that reject it, e.g. claude-opus-4-7).
             if ctx.auto_save_memory && msg.content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
                 let model_provider = Arc::clone(&ctx.model_provider);
                 let model = ctx.model.to_string();
+                let temperature = ctx.temperature;
                 let memory = Arc::clone(&ctx.memory);
                 let user_msg = msg.content.clone();
                 let assistant_resp = delivered_response.clone();
@@ -3678,6 +3683,7 @@ async fn process_channel_message_body(
                     if let Err(e) = zeroclaw_memory::consolidation::consolidate_turn(
                         model_provider.as_ref(),
                         &model,
+                        temperature,
                         memory.as_ref(),
                         &user_msg,
                         &assistant_resp,

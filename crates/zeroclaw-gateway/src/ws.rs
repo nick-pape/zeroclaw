@@ -976,12 +976,14 @@ async fn process_chat_message(
                 let mem = state.mem.clone();
                 let model_provider = state.model_provider.clone();
                 let model = state.model.clone();
+                let temperature = state.temperature;
                 let user_msg = content.to_string();
                 let assistant_resp = response.clone();
                 tokio::spawn(async move {
                     if let Err(e) = zeroclaw_memory::consolidation::consolidate_turn(
                         model_provider.as_ref(),
                         &model,
+                        temperature,
                         mem.as_ref(),
                         &user_msg,
                         &assistant_resp,

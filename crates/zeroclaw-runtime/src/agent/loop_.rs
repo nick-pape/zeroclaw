@@ -3188,6 +3188,7 @@ pub async fn run(
                                     &mut history,
                                     model_provider.as_ref(),
                                     &model_name,
+                                    temperature,
                                     &error_msg,
                                 )
                                 .await
@@ -3242,7 +3243,12 @@ pub async fn run(
                 )
                 .with_memory(mem.clone());
                 match compressor
-                    .compress_if_needed(&mut history, model_provider.as_ref(), &model_name)
+                    .compress_if_needed(
+                        &mut history,
+                        model_provider.as_ref(),
+                        &model_name,
+                        temperature,
+                    )
                     .await
                 {
                     Ok(result) if result.compressed => {

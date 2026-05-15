@@ -171,10 +171,9 @@ pub async fn handle_api_status(
                     .as_ref()
                     .and_then(|(_, _, cfg)| cfg.model.clone())
                     .unwrap_or_default();
-                let temperature = resolved
+                let temperature: Option<f64> = resolved
                     .as_ref()
-                    .and_then(|(_, _, cfg)| cfg.temperature)
-                    .unwrap_or(0.7);
+                    .and_then(|(_, _, cfg)| cfg.temperature);
                 let backend_kind = agent.memory.backend;
                 let backend = serde_json::to_value(backend_kind)
                     .ok()
@@ -1542,7 +1541,7 @@ mod tests {
             config: Arc::new(RwLock::new(config)),
             model_provider: Arc::new(MockModelProvider),
             model: "test-model".into(),
-            temperature: 0.0,
+            temperature: None,
             mem: Arc::new(MockMemory),
             auto_save: false,
             webhook_secret_hash: None,

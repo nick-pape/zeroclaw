@@ -30,10 +30,6 @@ const PROBE_TIERS: &[usize] = &[
     2_000_000, 1_000_000, 512_000, 200_000, 128_000, 64_000, 32_000,
 ];
 
-/// Low temperature for near-deterministic summarization; history compression
-/// must faithfully reflect the source conversation, not invent or embellish.
-const SUMMARIZER_TEMPERATURE: f64 = 0.1;
-
 fn next_probe_tier(current: usize) -> usize {
     PROBE_TIERS
         .iter()
@@ -190,11 +186,16 @@ impl ContextCompressor {
     }
 
     /// Main entry point. Compresses history in-place if over threshold.
+    ///
+    /// `temperature` is forwarded verbatim to the summarizer LLM call.
+    /// Pass `None` to let the provider decide (required for models that
+    /// reject `temperature`, e.g. claude-opus-4-7).
     pub async fn compress_if_needed(
         &self,
         history: &mut Vec<ChatMessage>,
         model_provider: &dyn ModelProvider,
         model: &str,
+        temperature: Option<f64>,
     ) -> Result<CompressionResult> {
         if !self.config.enabled {
             let tokens = estimate_tokens(history);
@@ -236,7 +237,9 @@ impl ContextCompressor {
 
         let mut passes_used = 0;
         for _ in 0..self.config.max_passes {
-            let did_compress = self.compress_once(history, model_provider, model).await?;
+            let did_compress = self
+                .compress_once(history, model_provider, model, temperature)
+                .await?;
             if did_compress {
                 passes_used += 1;
             }
@@ -261,6 +264,7 @@ impl ContextCompressor {
         history: &mut Vec<ChatMessage>,
         model_provider: &dyn ModelProvider,
         model: &str,
+        temperature: Option<f64>,
         error_msg: &str,
     ) -> Result<bool> {
         // Try to extract actual limit from error message
@@ -277,7 +281,7 @@ impl ContextCompressor {
         );
 
         let result = self
-            .compress_if_needed(history, model_provider, model)
+            .compress_if_needed(history, model_provider, model, temperature)
             .await?;
         Ok(result.compressed)
     }
@@ -288,6 +292,7 @@ impl ContextCompressor {
         history: &mut Vec<ChatMessage>,
         model_provider: &dyn ModelProvider,
         model: &str,
+        temperature: Option<f64>,
     ) -> Result<bool> {
         let n = history.len();
         let protected_total = self.config.protect_first_n + self.config.protect_last_n;
@@ -340,7 +345,7 @@ impl ContextCompressor {
                 Some(SUMMARIZER_SYSTEM),
                 &user_prompt,
                 summary_model,
-                Some(SUMMARIZER_TEMPERATURE),
+                temperature,
             ),
         )
         .await
@@ -857,7 +862,7 @@ mod tests {
         ];
 
         let result = compressor
-            .compress_if_needed(&mut history, &model_provider, "model")
+            .compress_if_needed(&mut history, &model_provider, "model", None)
             .await
             .expect("compression should succeed");
 

@@ -359,7 +359,10 @@ pub struct AppState {
     pub config: Arc<RwLock<Config>>,
     pub model_provider: Arc<dyn ModelProvider>,
     pub model: String,
-    pub temperature: f64,
+    /// `None` means "let the provider decide" — required for models
+    /// (e.g. claude-opus-4-7) that reject the field. Always preserve
+    /// `Option<f64>` end-to-end; never substitute a hardcoded default.
+    pub temperature: Option<f64>,
     pub mem: Arc<dyn Memory>,
     pub auto_save: bool,
     /// SHA-256 hash of `X-Webhook-Secret` (hex-encoded), never plaintext.
@@ -529,7 +532,10 @@ pub async fn run_gateway(
             }
         },
     };
-    let temperature = fallback.and_then(|e| e.temperature).unwrap_or(0.7);
+    // Preserve `Option<f64>` end-to-end. Substituting a hardcoded default
+    // here would clobber the "let the provider decide" intent for models
+    // (e.g. claude-opus-4-7) that reject `temperature`.
+    let temperature: Option<f64> = fallback.and_then(|e| e.temperature);
     // Skip the install-wide memory backend init when zero agents are
     // configured. Building a SQLite (or other) backend here would
     // synthesize `<workspace_dir>/memory/brain.db` on a fresh install
@@ -1785,7 +1791,7 @@ async fn run_gateway_chat_with_tools(
         let _ = session_id;
         let response = state
             .model_provider
-            .chat_with_system(None, message, &state.model, Some(state.temperature))
+            .chat_with_system(None, message, &state.model, state.temperature)
             .await?;
         Ok(GatewayChatOutcome {
             response,
@@ -3155,7 +3161,7 @@ mod tests {
             config: Arc::new(RwLock::new(Config::default())),
             model_provider: Arc::new(MockModelProvider::default()),
             model: "test-model".into(),
-            temperature: 0.0,
+            temperature: None,
             mem: Arc::new(MockMemory),
             auto_save: false,
             webhook_secret_hash: None,
@@ -3225,7 +3231,7 @@ mod tests {
             config: Arc::new(RwLock::new(Config::default())),
             model_provider: Arc::new(MockModelProvider::default()),
             model: "test-model".into(),
-            temperature: 0.0,
+            temperature: None,
             mem: Arc::new(MockMemory),
             auto_save: false,
             webhook_secret_hash: None,
@@ -3736,7 +3742,7 @@ mod tests {
             config: Arc::new(RwLock::new(Config::default())),
             model_provider,
             model: "test-model".into(),
-            temperature: 0.0,
+            temperature: None,
             mem: memory,
             auto_save: false,
             webhook_secret_hash: None,
@@ -3819,7 +3825,7 @@ mod tests {
             config: Arc::new(RwLock::new(Config::default())),
             model_provider,
             model: "test-model".into(),
-            temperature: 0.0,
+            temperature: None,
             mem: memory,
             auto_save: true,
             webhook_secret_hash: None,
@@ -3914,7 +3920,7 @@ mod tests {
             config: Arc::new(RwLock::new(Config::default())),
             model_provider,
             model: "test-model".into(),
-            temperature: 0.0,
+            temperature: None,
             mem: memory,
             auto_save: false,
             webhook_secret_hash: Some(Arc::from(hash_webhook_secret(&secret))),
@@ -3981,7 +3987,7 @@ mod tests {
             config: Arc::new(RwLock::new(Config::default())),
             model_provider,
             model: "test-model".into(),
-            temperature: 0.0,
+            temperature: None,
             mem: memory,
             auto_save: false,
             webhook_secret_hash: Some(Arc::from(hash_webhook_secret(&valid_secret))),
@@ -4053,7 +4059,7 @@ mod tests {
             config: Arc::new(RwLock::new(Config::default())),
             model_provider,
             model: "test-model".into(),
-            temperature: 0.0,
+            temperature: None,
             mem: memory,
             auto_save: false,
             webhook_secret_hash: Some(Arc::from(hash_webhook_secret(&secret))),
@@ -4130,7 +4136,7 @@ mod tests {
             config: Arc::new(RwLock::new(Config::default())),
             model_provider,
             model: "test-model".into(),
-            temperature: 0.0,
+            temperature: None,
             mem: memory,
             auto_save: false,
             webhook_secret_hash: None,
@@ -4207,7 +4213,7 @@ mod tests {
             config: Arc::new(RwLock::new(Config::default())),
             model_provider,
             model: "test-model".into(),
-            temperature: 0.0,
+            temperature: None,
             mem: memory,
             auto_save: false,
             webhook_secret_hash: None,
@@ -4319,7 +4325,7 @@ mod tests {
             config: Arc::new(RwLock::new(Config::default())),
             model_provider: provider,
             model: "test-model".into(),
-            temperature: 0.0,
+            temperature: None,
             mem: memory,
             auto_save: false,
             webhook_secret_hash: None,
