@@ -130,6 +130,9 @@ export interface ModelStats {
   model: string;
   cost_usd: number;
   total_tokens: number;
+  input_tokens: number;
+  output_tokens: number;
+  cached_input_tokens: number;
   request_count: number;
 }
 
@@ -137,6 +140,9 @@ export interface AgentCostStats {
   agent_alias: string;
   cost_usd: number;
   total_tokens: number;
+  input_tokens: number;
+  output_tokens: number;
+  cached_input_tokens: number;
   request_count: number;
 }
 

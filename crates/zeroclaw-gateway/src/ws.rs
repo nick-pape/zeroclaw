@@ -1015,6 +1015,7 @@ async fn process_chat_message(
                 &state.model,
                 total_input_tokens,
                 total_output_tokens,
+                None,
             );
 
             let done = serde_json::json!({
@@ -1121,6 +1122,7 @@ fn record_turn_cost(
     model: &str,
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
+    cached_input_tokens: Option<u64>,
 ) -> Option<f64> {
     let tracker = state.cost_tracker.as_ref()?;
     if input_tokens.is_none() && output_tokens.is_none() {
@@ -1128,6 +1130,7 @@ fn record_turn_cost(
     }
     let input = input_tokens.unwrap_or(0);
     let output = output_tokens.unwrap_or(0);
+    let cached_input = cached_input_tokens.unwrap_or(0);
     if input == 0 && output == 0 {
         return None;
     }
@@ -1148,9 +1151,9 @@ fn record_turn_cost(
         .collect::<std::collections::HashMap<String, std::collections::HashMap<String, f64>>>();
     drop(config);
     let model_pricing = pricing_map.get(provider_name);
-    let try_lookup = |key: &str| -> (f64, f64) {
+    let try_lookup = |key: &str| -> (f64, f64, f64) {
         let Some(map) = model_pricing else {
-            return (0.0, 0.0);
+            return (0.0, 0.0, 0.0);
         };
         let in_rate = map
             .get(&format!("{key}.input"))
@@ -1162,21 +1165,27 @@ fn record_turn_cost(
             .copied()
             .or_else(|| map.get(key).copied())
             .unwrap_or(0.0);
-        (in_rate, out_rate)
+        let cached_rate = map
+            .get(&format!("{key}.cached_input"))
+            .copied()
+            .unwrap_or(0.0);
+        (in_rate, out_rate, cached_rate)
     };
-    let (input_rate, output_rate) = match try_lookup(model) {
-        (0.0, 0.0) => model
+    let (input_rate, output_rate, cached_rate) = match try_lookup(model) {
+        (0.0, 0.0, 0.0) => model
             .rsplit_once('/')
             .map(|(_, suffix)| try_lookup(suffix))
-            .unwrap_or((0.0, 0.0)),
+            .unwrap_or((0.0, 0.0, 0.0)),
         rates => rates,
     };
     let usage = zeroclaw_runtime::cost::types::TokenUsage::new(
         model,
         input,
         output,
+        cached_input,
         input_rate,
         output_rate,
+        cached_rate,
     );
     let cost_usd = usage.cost_usd;
     if let Err(error) = tracker.record_usage(usage) {

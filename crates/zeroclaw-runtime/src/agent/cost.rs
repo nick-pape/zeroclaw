@@ -69,38 +69,50 @@ tokio::task_local! {
     pub static TOOL_LOOP_COST_TRACKING_CONTEXT: Option<ToolLoopCostTrackingContext>;
 }
 
-/// Resolve `(input, output)` per-1M-token rates for a given model on a given
-/// model provider's pricing map. Lookup order:
+/// Resolve `(input, output, cached_input)` per-1M-token rates for a given
+/// model on a model provider's pricing map. Lookup order:
 ///
-/// 1. Dimension-specific keys: `{model}.input` / `{model}.output`.
+/// 1. Dimension-specific keys: `{model}.input` / `{model}.output` /
+///    `{model}.cached_input`.
 /// 2. Bare model key as a flat fallback applied to whichever dimension
 ///    didn't match in step 1.
 /// 3. The model alias path's last segment (`.../suffix`) tried under the
 ///    same rules.
 ///
-/// Returns `(0.0, 0.0)` if no entry matches; the caller logs a one-shot
-/// debug message in that case.
-fn resolve_rates(pricing: &HashMap<String, f64>, model: &str) -> (f64, f64) {
-    let try_lookup = |key: &str| -> Option<(Option<f64>, Option<f64>)> {
+/// Returns `(0.0, 0.0, 0.0)` if no entry matches; the caller logs a
+/// one-shot warn in that case. A zero `cached_input` rate means "no
+/// discount" — the per-token caller bills the cached subset at the
+/// standard input rate.
+fn resolve_rates(pricing: &HashMap<String, f64>, model: &str) -> (f64, f64, f64) {
+    let try_lookup = |key: &str| -> Option<(Option<f64>, Option<f64>, Option<f64>)> {
         let input = pricing.get(&format!("{key}.input")).copied();
         let output = pricing.get(&format!("{key}.output")).copied();
+        let cached = pricing.get(&format!("{key}.cached_input")).copied();
         let flat = pricing.get(key).copied();
-        if input.is_none() && output.is_none() && flat.is_none() {
+        if input.is_none() && output.is_none() && cached.is_none() && flat.is_none() {
             None
         } else {
-            Some((input.or(flat), output.or(flat)))
+            Some((input.or(flat), output.or(flat), cached))
         }
     };
 
-    if let Some((input, output)) = try_lookup(model) {
-        return (input.unwrap_or(0.0), output.unwrap_or(0.0));
+    if let Some((input, output, cached)) = try_lookup(model) {
+        return (
+            input.unwrap_or(0.0),
+            output.unwrap_or(0.0),
+            cached.unwrap_or(0.0),
+        );
     }
     if let Some((_, suffix)) = model.rsplit_once('/')
-        && let Some((input, output)) = try_lookup(suffix)
+        && let Some((input, output, cached)) = try_lookup(suffix)
     {
-        return (input.unwrap_or(0.0), output.unwrap_or(0.0));
+        return (
+            input.unwrap_or(0.0),
+            output.unwrap_or(0.0),
+            cached.unwrap_or(0.0),
+        );
     }
-    (0.0, 0.0)
+    (0.0, 0.0, 0.0)
 }
 
 /// Record token usage from an LLM response via the task-local cost tracker.
@@ -112,6 +124,7 @@ pub fn record_tool_loop_cost_usage(
 ) -> Option<(u64, f64)> {
     let input_tokens = usage.input_tokens.unwrap_or(0);
     let output_tokens = usage.output_tokens.unwrap_or(0);
+    let cached_input_tokens = usage.cached_input_tokens.unwrap_or(0);
     let total_tokens = input_tokens.saturating_add(output_tokens);
     if total_tokens == 0 {
         return None;
@@ -122,12 +135,19 @@ pub fn record_tool_loop_cost_usage(
         .ok()
         .flatten()?;
     let pricing = ctx.model_provider_pricing.get(model_provider_name);
-    let (input_rate, output_rate) = pricing
+    let (input_rate, output_rate, cached_rate) = pricing
         .map(|map| resolve_rates(map, model))
-        .unwrap_or((0.0, 0.0));
+        .unwrap_or((0.0, 0.0, 0.0));
 
-    let cost_usage =
-        CostTokenUsage::new(model, input_tokens, output_tokens, input_rate, output_rate);
+    let cost_usage = CostTokenUsage::new(
+        model,
+        input_tokens,
+        output_tokens,
+        cached_input_tokens,
+        input_rate,
+        output_rate,
+        cached_rate,
+    );
 
     // Promote first sighting of (model_provider, model) without pricing to a WARN
     // so operators notice the silent zero-cost record before they need to

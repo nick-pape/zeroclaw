@@ -8069,8 +8069,10 @@ Let me check the result."#;
                 "mock-model",
                 100_000,
                 50_000,
+                0,
                 1.0,
                 1.0,
+                0.0,
             ))
             .unwrap();
 

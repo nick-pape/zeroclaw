@@ -170,12 +170,12 @@ impl CostTracker {
         let (daily_cost, monthly_cost, daily_records) = {
             let mut storage = self.lock_storage();
             let (d, m) = storage.get_aggregated_costs()?;
-            let daily = if self.config.track_per_agent || agent_filter.is_some() {
-                storage.daily_records()?
-            } else {
-                Vec::new()
-            };
-            (d, m, daily)
+            // Always pull daily_records: per-model and per-agent rollups
+            // both want today's slice. The optional-skip optimisation tied
+            // to `track_per_agent` made the by-model rollup session-scoped,
+            // which surprised operators after a daemon restart and clashes
+            // with the daily totals in the same response.
+            (d, m, storage.daily_records()?)
         };
 
         let session_costs = self.lock_session_costs();
@@ -184,11 +184,20 @@ impl CostTracker {
             None => true,
         };
 
+        // Session view is kept on `CostSummary` for backward-compat with
+        // callers that still want it (CLI `cost` command, etc.), but the
+        // dashboard reads the daily-scoped rollups below.
         let scoped: Vec<&CostRecord> = session_costs.iter().filter(|r| matches_agent(r)).collect();
         let session_cost: f64 = scoped.iter().map(|record| record.usage.cost_usd).sum();
         let total_tokens: u64 = scoped.iter().map(|record| record.usage.total_tokens).sum();
         let request_count = scoped.len();
-        let by_model = build_model_stats(scoped.iter().copied());
+
+        // Daily-scoped per-model rollup. Filter by agent when scoped.
+        let model_records: Vec<&CostRecord> = daily_records
+            .iter()
+            .filter(|r| matches_agent(r))
+            .collect();
+        let by_model = build_model_stats(model_records.iter().copied());
 
         let (daily_total, monthly_total, by_agent) = if let Some(alias) = agent_filter {
             // Per-agent view: re-aggregate day/month from persisted records.
@@ -311,11 +320,17 @@ where
                 model: record.usage.model.clone(),
                 cost_usd: 0.0,
                 total_tokens: 0,
+                input_tokens: 0,
+                output_tokens: 0,
+                cached_input_tokens: 0,
                 request_count: 0,
             });
 
         entry.cost_usd += record.usage.cost_usd;
         entry.total_tokens += record.usage.total_tokens;
+        entry.input_tokens += record.usage.input_tokens;
+        entry.output_tokens += record.usage.output_tokens;
+        entry.cached_input_tokens += record.usage.cached_input_tokens;
         entry.request_count += 1;
     }
 
@@ -335,11 +350,17 @@ fn build_agent_stats(records: &[CostRecord]) -> HashMap<String, AgentCostStats> 
                 agent_alias: alias.to_string(),
                 cost_usd: 0.0,
                 total_tokens: 0,
+                input_tokens: 0,
+                output_tokens: 0,
+                cached_input_tokens: 0,
                 request_count: 0,
             });
 
         entry.cost_usd += record.usage.cost_usd;
         entry.total_tokens += record.usage.total_tokens;
+        entry.input_tokens += record.usage.input_tokens;
+        entry.output_tokens += record.usage.output_tokens;
+        entry.cached_input_tokens += record.usage.cached_input_tokens;
         entry.request_count += 1;
     }
 
@@ -576,7 +597,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let tracker = CostTracker::new(enabled_config(), tmp.path()).unwrap();
 
-        let usage = TokenUsage::new("test/model", 1000, 500, 1.0, 2.0);
+        let usage = TokenUsage::new("test/model", 1000, 500, 0, 1.0, 2.0, 0.0);
         tracker.record_usage(usage).unwrap();
 
         let summary = tracker.get_summary().unwrap();
@@ -597,7 +618,7 @@ mod tests {
         let tracker = CostTracker::new(config, tmp.path()).unwrap();
 
         // Record a usage that exceeds the limit
-        let usage = TokenUsage::new("test/model", 10000, 5000, 1.0, 2.0); // ~0.02 USD
+        let usage = TokenUsage::new("test/model", 10000, 5000, 0, 1.0, 2.0, 0.0); // ~0.02 USD
         tracker.record_usage(usage).unwrap();
 
         let check = tracker.check_budget(0.01).unwrap();
@@ -605,34 +626,44 @@ mod tests {
     }
 
     #[test]
-    fn summary_by_model_is_session_scoped() {
+    fn summary_by_model_is_daily_scoped() {
+        // by_model rollup pulls from today's persisted records so the
+        // dashboard's per-model breakdown survives daemon restarts (matches
+        // by_agent's behaviour). A record from another session that
+        // happened today still shows up; only ones outside the day fall
+        // off — exercised by the storage layer's get_aggregated_costs.
         let tmp = TempDir::new().unwrap();
         let storage_path = resolve_storage_path(tmp.path()).unwrap();
         if let Some(parent) = storage_path.parent() {
             fs::create_dir_all(parent).unwrap();
         }
 
-        let old_record = CostRecord::new(
-            "old-session",
-            TokenUsage::new("legacy/model", 500, 500, 1.0, 1.0),
+        let prior_today = CostRecord::new(
+            "prior-session",
+            TokenUsage::new("prior/model", 500, 500, 0, 1.0, 1.0, 0.0),
         );
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(storage_path)
             .unwrap();
-        writeln!(file, "{}", serde_json::to_string(&old_record).unwrap()).unwrap();
+        writeln!(file, "{}", serde_json::to_string(&prior_today).unwrap()).unwrap();
         file.sync_all().unwrap();
 
         let tracker = CostTracker::new(enabled_config(), tmp.path()).unwrap();
         tracker
-            .record_usage(TokenUsage::new("session/model", 1000, 1000, 1.0, 1.0))
+            .record_usage(TokenUsage::new("session/model", 1000, 1000, 0, 1.0, 1.0, 0.0))
             .unwrap();
 
         let summary = tracker.get_summary().unwrap();
-        assert_eq!(summary.by_model.len(), 1);
+        assert_eq!(
+            summary.by_model.len(),
+            2,
+            "by_model must include every model that recorded today, \
+             regardless of which session wrote the record"
+        );
         assert!(summary.by_model.contains_key("session/model"));
-        assert!(!summary.by_model.contains_key("legacy/model"));
+        assert!(summary.by_model.contains_key("prior/model"));
     }
 
     #[test]
@@ -643,7 +674,7 @@ mod tests {
             fs::create_dir_all(parent).unwrap();
         }
 
-        let valid_usage = TokenUsage::new("test/model", 1000, 0, 1.0, 1.0);
+        let valid_usage = TokenUsage::new("test/model", 1000, 0, 0, 1.0, 1.0, 0.0);
         let valid_record = CostRecord::new("session-a", valid_usage.clone());
 
         let mut file = OpenOptions::new()
@@ -668,19 +699,19 @@ mod tests {
 
         tracker
             .record_usage_with_agent(
-                TokenUsage::new("test/model", 1_000, 1_000, 1.0, 1.0),
+                TokenUsage::new("test/model", 1_000, 1_000, 0, 1.0, 1.0, 0.0),
                 Some("scout"),
             )
             .unwrap();
         tracker
             .record_usage_with_agent(
-                TokenUsage::new("test/model", 2_000, 0, 1.0, 1.0),
+                TokenUsage::new("test/model", 2_000, 0, 0, 1.0, 1.0, 0.0),
                 Some("scout"),
             )
             .unwrap();
         tracker
             .record_usage_with_agent(
-                TokenUsage::new("test/model", 500, 500, 1.0, 1.0),
+                TokenUsage::new("test/model", 500, 500, 0, 1.0, 1.0, 0.0),
                 Some("scribe"),
             )
             .unwrap();
@@ -718,7 +749,7 @@ mod tests {
 
         tracker
             .record_usage_with_agent(
-                TokenUsage::new("test/model", 1_000, 1_000, 1.0, 1.0),
+                TokenUsage::new("test/model", 1_000, 1_000, 0, 1.0, 1.0, 0.0),
                 Some("scout"),
             )
             .unwrap();

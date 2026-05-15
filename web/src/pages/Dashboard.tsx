@@ -43,6 +43,7 @@ import {
   storeMemory,
   deleteMemory,
   getMapKeys,
+  getProp,
 } from '@/lib/api';
 import type { MemoryEntry } from '@/types/api';
 import { loadAgentSummaries, toggleAgentEnabled, type AgentSummary } from '@/lib/agents';
@@ -1502,9 +1503,49 @@ function HealthTab({ status }: { status: StatusResponse }) {
 // Cost Tab — full by-model + by-agent rollup
 // ---------------------------------------------------------------------------
 
+// Cost dashboard: per-day totals plus per-agent and per-model rollups
+// with input / output / cached token splits. Both rollups are daily-scoped
+// at the tracker level so they survive daemon restarts. The model row
+// click-through resolves the provider type by walking configured
+// `providers.models.<type>.<alias>.model` (the model id is the rate
+// sheet key; the alias is its home) and lands on that type's Costs tab.
 function CostTab({ cost }: { cost: CostSummary }) {
   const byModel = Object.values(cost.by_model);
   const byAgent = Object.values(cost.by_agent);
+  const [modelToType, setModelToType] = useState<Record<string, string>>({});
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const { keys: types } = await getMapKeys('providers.models');
+        const out: Record<string, string> = {};
+        for (const type of types) {
+          const { keys: aliases } = await getMapKeys(
+            `providers.models.${type}`,
+          );
+          const propResults = await Promise.all(
+            aliases.map((alias) =>
+              getProp(`providers.models.${type}.${alias}.model`).catch(
+                () => null,
+              ),
+            ),
+          );
+          for (const r of propResults) {
+            const v = r && typeof r.value === 'string' ? r.value : '';
+            if (v && v !== '<unset>' && !out[v]) out[v] = type;
+          }
+        }
+        if (!cancelled) setModelToType(out);
+      } catch {
+        /* swallow: model→type lookup is a UI nicety, not load-bearing */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   return (
     <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
       <div className="card p-5 animate-slide-in-up">
@@ -1514,16 +1555,13 @@ function CostTab({ cost }: { cost: CostSummary }) {
             className="text-sm font-semibold uppercase tracking-wider"
             style={{ color: 'var(--pc-text-primary)' }}
           >
-            {t('dashboard.cost_overview')}
+            Spend totals
           </h2>
         </div>
         <dl className="space-y-2 text-sm">
           {[
-            [t('dashboard.session_label'), formatUSD(cost.session_cost_usd)],
-            [t('dashboard.daily_label'), formatUSD(cost.daily_cost_usd)],
-            [t('dashboard.monthly_label'), formatUSD(cost.monthly_cost_usd)],
-            [t('dashboard.total_tokens_label'), cost.total_tokens.toLocaleString()],
-            [t('dashboard.requests_label'), cost.request_count.toLocaleString()],
+            ['Today', formatUSD(cost.daily_cost_usd)],
+            ['This month', formatUSD(cost.monthly_cost_usd)],
           ].map(([label, value]) => (
             <div key={label} className="flex justify-between">
               <dt style={{ color: 'var(--pc-text-muted)' }}>{label}</dt>
@@ -1533,6 +1571,13 @@ function CostTab({ cost }: { cost: CostSummary }) {
             </div>
           ))}
         </dl>
+        <p
+          className="text-xs mt-3"
+          style={{ color: 'var(--pc-text-faint)' }}
+        >
+          Daily and monthly aggregates over <code>state/costs.jsonl</code>.
+          Per-agent and per-model rows below are scoped to today.
+        </p>
       </div>
 
       <div className="card p-5 animate-slide-in-up">
@@ -1542,7 +1587,7 @@ function CostTab({ cost }: { cost: CostSummary }) {
             className="text-sm font-semibold uppercase tracking-wider"
             style={{ color: 'var(--pc-text-primary)' }}
           >
-            Spend by agent
+            Spend by agent · today
           </h2>
         </div>
         {byAgent.length === 0 ? (
@@ -1557,23 +1602,35 @@ function CostTab({ cost }: { cost: CostSummary }) {
               .map((row) => (
                 <li
                   key={row.agent_alias}
-                  className="flex items-center justify-between gap-3 rounded-xl px-3 py-2"
+                  className="flex flex-col gap-1 rounded-xl px-3 py-2"
                   style={{ background: 'var(--pc-bg-elevated)' }}
                 >
-                  <EntityLink
-                    kind="agent"
-                    id={row.agent_alias}
-                    className="font-mono hover:underline"
-                    title={`Open agents.${row.agent_alias} config`}
+                  <div className="flex items-center justify-between gap-3">
+                    <EntityLink
+                      kind="agent"
+                      id={row.agent_alias}
+                      className="font-mono hover:underline"
+                      title={`agents.${row.agent_alias}`}
+                    >
+                      agents.{row.agent_alias}
+                    </EntityLink>
+                    <span className="font-mono" style={{ color: 'var(--pc-text-primary)' }}>
+                      {formatUSD(row.cost_usd)}
+                    </span>
+                  </div>
+                  <div
+                    className="flex items-center gap-3 text-xs flex-wrap"
+                    style={{ color: 'var(--pc-text-muted)' }}
                   >
-                    {row.agent_alias}
-                  </EntityLink>
-                  <span className="font-mono" style={{ color: 'var(--pc-text-primary)' }}>
-                    {formatUSD(row.cost_usd)}
-                  </span>
-                  <span className="text-xs" style={{ color: 'var(--pc-text-muted)' }}>
-                    {row.request_count} req · {row.total_tokens.toLocaleString()} tok
-                  </span>
+                    <span>{row.request_count} responses</span>
+                    <span>
+                      in {row.input_tokens.toLocaleString()}
+                      {row.cached_input_tokens > 0
+                        ? ` (${row.cached_input_tokens.toLocaleString()} cached)`
+                        : ''}
+                    </span>
+                    <span>out {row.output_tokens.toLocaleString()}</span>
+                  </div>
                 </li>
               ))}
           </ul>
@@ -1587,35 +1644,63 @@ function CostTab({ cost }: { cost: CostSummary }) {
             className="text-sm font-semibold uppercase tracking-wider"
             style={{ color: 'var(--pc-text-primary)' }}
           >
-            Spend by model
+            Spend by model · today
           </h2>
         </div>
         {byModel.length === 0 ? (
           <p className="text-sm" style={{ color: 'var(--pc-text-faint)' }}>
-            No model usage recorded yet.
+            No model usage recorded today.
           </p>
         ) : (
           <ul className="space-y-2 text-sm">
             {byModel
               .slice()
               .sort((a, b) => b.cost_usd - a.cost_usd)
-              .map((row) => (
-                <li
-                  key={row.model}
-                  className="flex items-center justify-between gap-3 rounded-xl px-3 py-2"
-                  style={{ background: 'var(--pc-bg-elevated)' }}
-                >
-                  <span className="font-mono break-all" style={{ color: 'var(--pc-text-primary)' }}>
-                    {row.model}
-                  </span>
-                  <span className="font-mono" style={{ color: 'var(--pc-text-primary)' }}>
-                    {formatUSD(row.cost_usd)}
-                  </span>
-                  <span className="text-xs" style={{ color: 'var(--pc-text-muted)' }}>
-                    {row.request_count} req · {row.total_tokens.toLocaleString()} tok
-                  </span>
-                </li>
-              ))}
+              .map((row) => {
+                const type = modelToType[row.model];
+                const target = type
+                  ? `/config/providers.models/${encodeURIComponent(type)}?tab=costs`
+                  : `/config/cost?tab=rates`;
+                const label = type ? `models.${type}.${row.model}` : row.model;
+                return (
+                  <li
+                    key={row.model}
+                    className="flex flex-col gap-1 rounded-xl px-3 py-2"
+                    style={{ background: 'var(--pc-bg-elevated)' }}
+                  >
+                    <div className="flex items-center justify-between gap-3">
+                      <Link
+                        to={target}
+                        className="font-mono break-all hover:underline"
+                        style={{ color: 'var(--pc-text-primary)' }}
+                        title={
+                          type
+                            ? `Open cost.rates.providers.models.${type}.${row.model}`
+                            : 'Open cost.rates editor'
+                        }
+                      >
+                        {label}
+                      </Link>
+                      <span className="font-mono" style={{ color: 'var(--pc-text-primary)' }}>
+                        {formatUSD(row.cost_usd)}
+                      </span>
+                    </div>
+                    <div
+                      className="flex items-center gap-3 text-xs flex-wrap"
+                      style={{ color: 'var(--pc-text-muted)' }}
+                    >
+                      <span>{row.request_count} responses</span>
+                      <span>
+                        in {row.input_tokens.toLocaleString()}
+                        {row.cached_input_tokens > 0
+                          ? ` (${row.cached_input_tokens.toLocaleString()} cached)`
+                          : ''}
+                      </span>
+                      <span>out {row.output_tokens.toLocaleString()}</span>
+                    </div>
+                  </li>
+                );
+              })}
           </ul>
         )}
       </div>
