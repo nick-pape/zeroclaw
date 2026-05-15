@@ -240,7 +240,6 @@ pub async fn run(
 
     if config.heartbeat.enabled {
         let heartbeat_cfg = config.clone();
-        let heartbeat_event_tx = event_tx.clone();
         handles.push(spawn_component_supervisor(
             "heartbeat",
             initial_backoff,
@@ -248,8 +247,7 @@ pub async fn run(
             Some(event_tx.clone()),
             move || {
                 let cfg = heartbeat_cfg.clone();
-                let tx = heartbeat_event_tx.clone();
-                async move { Box::pin(run_heartbeat_worker(cfg, tx)).await }
+                async move { Box::pin(run_heartbeat_worker(cfg)).await }
             },
         ));
     }
@@ -391,22 +389,21 @@ where
     })
 }
 
-async fn run_heartbeat_worker(
-    config: Config,
-    event_tx: tokio::sync::broadcast::Sender<serde_json::Value>,
-) -> Result<()> {
+async fn run_heartbeat_worker(config: Config) -> Result<()> {
     use crate::heartbeat::engine::{
         HeartbeatEngine, HeartbeatTask, TaskPriority, TaskStatus, compute_adaptive_interval,
     };
     use std::sync::Arc;
 
-    let observer: std::sync::Arc<dyn crate::observability::Observer> = std::sync::Arc::new(
-        crate::observability::SseBroadcastObserver::new(event_tx.clone()),
-    );
+    // Use the full configured observer (log / Prometheus / OTel + SSE via BROADCAST_HOOK)
+    // for the engine so HeartbeatTick/Error events reach the primary backend.
+    // The agent::run() calls below pass None so loop_::run() calls create_observer()
+    // internally, preserving the configured backend alongside the gateway's SSE hook.
+    // See: crates/zeroclaw-runtime/src/observability/mod.rs — set_broadcast_hook.
     let engine = HeartbeatEngine::new(
         config.heartbeat.clone(),
         config.workspace_dir.clone(),
-        observer.clone(),
+        std::sync::Arc::from(crate::observability::create_observer(&config.observability)),
     );
     let metrics = engine.metrics();
     let delivery = resolve_heartbeat_delivery(&config)?;
@@ -517,7 +514,7 @@ async fn run_heartbeat_worker(
                 false,
                 None,
                 None,
-                Some(Arc::clone(&observer)),
+                None,
             ));
             let phase1_result = if config.heartbeat.task_timeout_secs > 0 {
                 match tokio::time::timeout(
@@ -643,7 +640,7 @@ async fn run_heartbeat_worker(
                 false,
                 None,
                 None,
-                Some(Arc::clone(&observer)),
+                None,
             ));
             let phase2_result = if config.heartbeat.task_timeout_secs > 0 {
                 match tokio::time::timeout(

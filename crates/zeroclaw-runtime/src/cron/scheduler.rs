@@ -79,15 +79,12 @@ pub async fn run(config: Config, event_tx: EventBroadcast) -> Result<()> {
     //    if the machine was off for a while. The catch-up phase fetches
     //    without the `max_tasks` limit so every missed job fires once.
     //    Controlled by `[cron] catch_up_on_startup` (default: true).
-    // Create a broadcast observer from event_tx so agent jobs emit to SSE.
-    let cron_observer: Option<Arc<dyn crate::observability::Observer>> =
-        event_tx.as_ref().map(|tx| {
-            Arc::new(crate::observability::SseBroadcastObserver::new(tx.clone()))
-                as Arc<dyn crate::observability::Observer>
-        });
-
+    // Observer fan-out is handled by create_observer + the gateway's BROADCAST_HOOK
+    // (TeeObserver). Passing None here lets loop_::run() call create_observer() so
+    // the configured log/Prometheus/OTel backend is preserved alongside SSE output.
+    // See: crates/zeroclaw-runtime/src/observability/mod.rs — set_broadcast_hook.
     if config.cron.catch_up_on_startup {
-        catch_up_overdue_jobs(&config, &security, &event_tx, cron_observer.clone()).await;
+        catch_up_overdue_jobs(&config, &security, &event_tx, None).await;
     } else {
         tracing::info!("Scheduler startup: catch-up disabled by config");
     }
@@ -112,7 +109,7 @@ pub async fn run(config: Config, event_tx: EventBroadcast) -> Result<()> {
             jobs,
             SCHEDULER_COMPONENT,
             &event_tx,
-            cron_observer.clone(),
+            None,
         )
         .await;
     }

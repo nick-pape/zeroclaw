@@ -1412,11 +1412,20 @@ impl Agent {
 
         // ── Turn loop ──────────────────────────────────────────────────
         for _ in 0..self.config.max_tool_iterations {
-            // Early exit if the caller cancelled this turn (e.g. user abort)
+            // Early exit if the caller cancelled this turn (e.g. user abort).
+            // Emit AgentEnd so the observer sequence is balanced even on an
+            // already-cancelled token (common in rapid user-abort scenarios).
             if cancel_token
                 .as_ref()
                 .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
             {
+                self.observer.record_event(&ObserverEvent::AgentEnd {
+                    provider: self.provider_name.clone(),
+                    model: effective_model.clone(),
+                    duration: turn_started_at.elapsed(),
+                    tokens_used: None,
+                    cost_usd: None,
+                });
                 return Err(crate::agent::loop_::ToolLoopCancelled.into());
             }
 
@@ -1470,7 +1479,22 @@ impl Agent {
                 });
             }
 
-            let prepared_messages = self.prepare_provider_messages(&messages).await?;
+            // Expand the error case so AgentEnd is emitted before propagating;
+            // the bare `?` would leave AgentStart unmatched on any preparation
+            // failure (context compression error, MCP tool spec fetch, etc.).
+            let prepared_messages = match self.prepare_provider_messages(&messages).await {
+                Ok(msgs) => msgs,
+                Err(err) => {
+                    self.observer.record_event(&ObserverEvent::AgentEnd {
+                        provider: self.provider_name.clone(),
+                        model: effective_model.clone(),
+                        duration: turn_started_at.elapsed(),
+                        tokens_used: None,
+                        cost_usd: None,
+                    });
+                    return Err(err);
+                }
+            };
 
             let llm_started_at = Instant::now();
             self.observer.record_event(&ObserverEvent::LlmRequest {
@@ -3424,6 +3448,82 @@ mod tests {
         assert!(
             last.contains("data:image/png;base64,"),
             "expected normalized data URI in provider request, got: {last}"
+        );
+    }
+
+    /// Regression test: if the `CancellationToken` is already cancelled
+    /// before the first loop iteration, `turn_streamed` must emit a matching
+    /// `AgentEnd` for every `AgentStart` so observer consumers (SSE dashboard,
+    /// metrics backends) see a properly closed turn. See PR #6553 review.
+    #[tokio::test]
+    async fn turn_streamed_pre_cancelled_token_emits_balanced_agent_start_end() {
+        struct RecordingObserver {
+            events: Mutex<Vec<&'static str>>,
+        }
+
+        impl Observer for RecordingObserver {
+            fn record_event(&self, event: &ObserverEvent) {
+                let tag = match event {
+                    ObserverEvent::AgentStart { .. } => "AgentStart",
+                    ObserverEvent::AgentEnd { .. } => "AgentEnd",
+                    _ => return,
+                };
+                self.events.lock().push(tag);
+            }
+
+            fn record_metric(&self, _metric: &zeroclaw_api::observability_traits::ObserverMetric) {}
+
+            fn name(&self) -> &str {
+                "recording"
+            }
+
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+        }
+
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+
+        let recorder = Arc::new(RecordingObserver {
+            events: Mutex::new(Vec::new()),
+        });
+        let observer: Arc<dyn Observer> = recorder.clone();
+
+        let mut agent = Agent::builder()
+            .provider(Box::new(MockProvider {
+                responses: Mutex::new(vec![]),
+            }))
+            .tools(vec![])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        // Pre-cancel the token BEFORE the call so the first-iteration
+        // cancel guard fires immediately after AgentStart.
+        let token = tokio_util::sync::CancellationToken::new();
+        token.cancel();
+
+        let (event_tx, _rx) = tokio::sync::mpsc::channel::<TurnEvent>(8);
+        let result = agent.turn_streamed("hello", event_tx, Some(token)).await;
+
+        assert!(result.is_err(), "expected Err on pre-cancelled token");
+
+        let events = recorder.events.lock();
+        assert_eq!(
+            events.as_slice(),
+            &["AgentStart", "AgentEnd"],
+            "observer must receive AgentStart then AgentEnd even when the \
+             token is pre-cancelled; got: {events:?}"
         );
     }
 
