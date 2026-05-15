@@ -16,11 +16,12 @@ impl FileReadTool {
         Self { security }
     }
 
-    /// Validate and resolve a caller-supplied path to an absolute candidate.
-    /// Mirrors the logic in `FileWriteTool::resolve_candidate`.
+    /// Resolve a caller-supplied path to an absolute candidate. Reject
+    /// only path-shape attacks (null byte, `..` traversal); the
+    /// allowlist gate is `SecurityPolicy::is_resolved_path_readable`
+    /// after canonicalize, which already unions `allowed_roots` and
+    /// `allowed_roots_read_only`.
     fn resolve_candidate(&self, path: &str) -> anyhow::Result<std::path::PathBuf> {
-        let workspace_dir = &self.security.workspace_dir;
-
         if path.contains('\0') {
             anyhow::bail!("Path not allowed: contains null byte");
         }
@@ -33,32 +34,10 @@ impl FileReadTool {
 
         let p = std::path::Path::new(path);
         if p.is_absolute() {
-            #[cfg(not(target_os = "windows"))]
-            if p == std::path::Path::new("/dev/null") {
-                return Ok(p.to_path_buf());
-            }
-            #[cfg(target_os = "windows")]
-            {
-                let lower = path.to_ascii_lowercase();
-                if lower == "nul" || lower == r"\\.\nul" {
-                    return Ok(p.to_path_buf());
-                }
-            }
-            let workspace_canonical = workspace_dir
-                .canonicalize()
-                .unwrap_or_else(|_| workspace_dir.clone());
-            if p.starts_with(&workspace_canonical) || p.starts_with(workspace_dir.as_path()) {
-                return Ok(p.to_path_buf());
-            }
-            for root in &self.security.allowed_roots {
-                let root_canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
-                if p.starts_with(&root_canonical) || p.starts_with(root.as_path()) {
-                    return Ok(p.to_path_buf());
-                }
-            }
-            anyhow::bail!("Path not allowed by security policy: {path}");
+            return Ok(p.to_path_buf());
         }
 
+        let workspace_dir = &self.security.workspace_dir;
         if let Ok(workspace_rootless) = workspace_dir.strip_prefix("/")
             && let Ok(stripped) = p.strip_prefix(workspace_rootless)
         {
@@ -405,7 +384,7 @@ mod tests {
 
         let result = tool.execute(json!({"path": target})).await.unwrap();
         assert!(!result.success);
-        assert!(result.error.as_ref().unwrap().contains("not allowed"));
+        assert!(result.error.as_ref().unwrap().contains("escapes workspace"));
     }
 
     #[tokio::test]
@@ -524,7 +503,41 @@ mod tests {
             .unwrap();
 
         assert!(!result.success);
-        assert!(result.error.as_ref().unwrap().contains("not allowed"));
+        assert!(result.error.as_ref().unwrap().contains("escapes workspace"));
+
+        let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    #[tokio::test]
+    async fn file_read_admits_absolute_path_under_read_only_root() {
+        let root =
+            std::env::temp_dir().join("zeroclaw_test_file_read_admits_absolute_path_under_ro_root");
+        let workspace = root.join("workspace");
+        let ro_root = root.join("shared");
+        let ro_file = ro_root.join("notes.txt");
+
+        let _ = tokio::fs::remove_dir_all(&root).await;
+        tokio::fs::create_dir_all(&workspace).await.unwrap();
+        tokio::fs::create_dir_all(&ro_root).await.unwrap();
+        tokio::fs::write(&ro_file, "cross-agent read")
+            .await
+            .unwrap();
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: workspace,
+            allowed_roots_read_only: vec![ro_root.clone()],
+            ..SecurityPolicy::default()
+        });
+        let tool = FileReadTool::new(security);
+
+        let result = tool
+            .execute(json!({"path": ro_file.to_string_lossy().to_string()}))
+            .await
+            .unwrap();
+
+        assert!(result.success, "absolute path under read-only root must read: {result:?}");
+        assert!(result.output.contains("cross-agent read"));
 
         let _ = tokio::fs::remove_dir_all(&root).await;
     }

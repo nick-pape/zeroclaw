@@ -165,18 +165,9 @@ impl Tool for ContentSearchTool {
         // RateLimitedTool + PathGuardedTool wrappers at registration time
         // (see zeroclaw-runtime::tools::mod).
 
-        // --- Path security checks (tool-specific formatting) ---
-        // Reject absolute paths unless they fall under an explicit allowed root.
-        if std::path::Path::new(search_path).is_absolute()
-            && !self.security.is_under_allowed_root(search_path)
-        {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Absolute paths are not allowed. Use a relative path.".into()),
-            });
-        }
-
+        // Path-shape checks only; the allowlist gate is
+        // `SecurityPolicy::is_resolved_path_readable` after canonicalize
+        // (sees `allowed_roots` ∪ `allowed_roots_read_only`).
         if search_path.contains("../") || search_path.contains("..\\") || search_path == ".." {
             return Ok(ToolResult {
                 success: false,
@@ -851,7 +842,7 @@ mod tests {
     // --- Security tests ---
 
     #[tokio::test]
-    async fn content_search_rejects_absolute_path() {
+    async fn content_search_rejects_absolute_path_outside_allowlist() {
         let tool = ContentSearchTool::new(test_security(std::env::temp_dir()));
         let result = tool
             .execute(json!({"pattern": "test", "path": "/etc"}))
@@ -859,7 +850,37 @@ mod tests {
             .unwrap();
 
         assert!(!result.success);
-        assert!(result.error.as_ref().unwrap().contains("Absolute paths"));
+        let err = result.error.as_ref().unwrap();
+        assert!(
+            err.contains("outside the allowed workspace") || err.contains("Cannot resolve path"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn content_search_admits_absolute_path_under_read_only_root() {
+        let workspace = TempDir::new().unwrap();
+        let ro_root = TempDir::new().unwrap();
+        std::fs::write(ro_root.path().join("notes.rs"), "fn shared() {}\n").unwrap();
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: workspace.path().to_path_buf(),
+            allowed_roots_read_only: vec![ro_root.path().to_path_buf()],
+            ..SecurityPolicy::default()
+        });
+        let tool = ContentSearchTool::new(security);
+
+        let result = tool
+            .execute(json!({
+                "pattern": "fn shared",
+                "path": ro_root.path().to_string_lossy().to_string(),
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "absolute path under read-only root must search: {result:?}");
+        assert!(result.output.contains("shared"));
     }
 
     #[tokio::test]
