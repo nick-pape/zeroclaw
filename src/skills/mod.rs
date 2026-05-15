@@ -450,7 +450,7 @@ fn handle_bundle_show(config: &crate::config::Config, alias: String) -> Result<(
                 zeroclaw_runtime::i18n::get_required_cli_string_with_args(
                     "cli-skills-bundle-show-skill",
                     &[
-                        ("name", &s.r#ref.name().to_string()),
+                        ("name", s.r#ref.name()),
                         ("description", &s.frontmatter.description),
                     ],
                 )
