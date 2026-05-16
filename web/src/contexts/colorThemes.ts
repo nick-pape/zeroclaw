@@ -12,7 +12,11 @@ export type ColorThemeId =
   | 'cobalt2'
   | 'flexoki-dark' | 'flexoki-light'
   | 'hacker-green'
-  | 'material-dark' | 'material-light';
+  | 'material-dark' | 'material-light'
+  // Brand themes for per-agent deployments (Home Assistant, H-E-B).
+  // Pair with the matching ha-blue / heb-red accents in ThemeContext.
+  | 'homeassistant'
+  | 'heb-dark' | 'heb-light';
 
 export interface ColorThemeDef {
   id: ColorThemeId;
