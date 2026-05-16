@@ -123,12 +123,17 @@ fn glob_match(pattern: &str, name: &str) -> bool {
 /// Returns the subset of `tool_specs` that should be sent to the LLM for this turn.
 ///
 /// Rules (mirrors NullClaw `filterToolSpecsForTurn`):
-/// - Built-in tools (names that do not start with `"mcp_"`) always pass through.
+/// - Built-in tools (names that do not contain `"__"`) always pass through.
 /// - When `groups` is empty, all tools pass through (backward compatible default).
 /// - An MCP tool is included if at least one group matches it:
 ///   - `always` group: included unconditionally if any pattern matches the tool name.
 ///   - `dynamic` group: included if any pattern matches AND the user message contains
 ///     at least one keyword (case-insensitive substring).
+///
+/// MCP tools are named `<server>__<tool>` by `McpRegistry::connect_all` (see
+/// `crates/zeroclaw-tools/src/mcp_client.rs` — `format!("{}__{}", config.name,
+/// tool.name)`). The previous `starts_with("mcp_")` check matched no real MCP
+/// tools and silently disabled `tool_filter_groups` for every production agent.
 pub fn filter_tool_specs_for_turn(
     tool_specs: Vec<crate::tools::ToolSpec>,
     groups: &[zeroclaw_config::schema::ToolFilterGroup],
@@ -145,8 +150,8 @@ pub fn filter_tool_specs_for_turn(
     tool_specs
         .into_iter()
         .filter(|spec| {
-            // Built-in tools always pass through.
-            if !spec.name.starts_with("mcp_") {
+            // Built-in tools (no `__` separator in the name) always pass through.
+            if !spec.name.contains("__") {
                 return true;
             }
             // MCP tool: include if any active group matches.
@@ -7550,12 +7555,16 @@ Let me check the result."#;
         }
     }
 
+    // Tool specs in these tests use the real `<server>__<tool>` naming format
+    // that McpRegistry produces (see crates/zeroclaw-tools/src/mcp_client.rs
+    // — `format!("{}__{}", config.name, tool.name)`). Built-ins have no `__`.
+
     #[test]
     fn filter_tool_specs_no_groups_returns_all() {
         let specs = vec![
             make_spec("shell_exec"),
-            make_spec("mcp_browser_navigate"),
-            make_spec("mcp_filesystem_read"),
+            make_spec("browser__navigate"),
+            make_spec("filesystem__read_file"),
         ];
         let result = filter_tool_specs_for_turn(specs, &[], "hello");
         assert_eq!(result.len(), 3);
@@ -7567,12 +7576,12 @@ Let me check the result."#;
 
         let specs = vec![
             make_spec("shell_exec"),
-            make_spec("mcp_browser_navigate"),
-            make_spec("mcp_filesystem_read"),
+            make_spec("browser__navigate"),
+            make_spec("filesystem__read_file"),
         ];
         let groups = vec![ToolFilterGroup {
             mode: ToolFilterGroupMode::Always,
-            tools: vec!["mcp_filesystem_*".into()],
+            tools: vec!["filesystem__*".into()],
             keywords: vec![],
             filter_builtins: false,
         }];
@@ -7580,57 +7589,88 @@ Let me check the result."#;
         let names: Vec<&str> = result.iter().map(|s| s.name.as_str()).collect();
         // Built-in passes through, matched MCP passes, unmatched MCP excluded.
         assert!(names.contains(&"shell_exec"));
-        assert!(names.contains(&"mcp_filesystem_read"));
-        assert!(!names.contains(&"mcp_browser_navigate"));
+        assert!(names.contains(&"filesystem__read_file"));
+        assert!(!names.contains(&"browser__navigate"));
     }
 
     #[test]
     fn filter_tool_specs_dynamic_group_included_on_keyword_match() {
         use zeroclaw_config::schema::{ToolFilterGroup, ToolFilterGroupMode};
 
-        let specs = vec![make_spec("shell_exec"), make_spec("mcp_browser_navigate")];
+        let specs = vec![make_spec("shell_exec"), make_spec("browser__navigate")];
         let groups = vec![ToolFilterGroup {
             mode: ToolFilterGroupMode::Dynamic,
-            tools: vec!["mcp_browser_*".into()],
+            tools: vec!["browser__*".into()],
             keywords: vec!["browse".into(), "website".into()],
             filter_builtins: false,
         }];
         let result = filter_tool_specs_for_turn(specs, &groups, "please browse this page");
         let names: Vec<&str> = result.iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"shell_exec"));
-        assert!(names.contains(&"mcp_browser_navigate"));
+        assert!(names.contains(&"browser__navigate"));
     }
 
     #[test]
     fn filter_tool_specs_dynamic_group_excluded_on_no_keyword_match() {
         use zeroclaw_config::schema::{ToolFilterGroup, ToolFilterGroupMode};
 
-        let specs = vec![make_spec("shell_exec"), make_spec("mcp_browser_navigate")];
+        let specs = vec![make_spec("shell_exec"), make_spec("browser__navigate")];
         let groups = vec![ToolFilterGroup {
             mode: ToolFilterGroupMode::Dynamic,
-            tools: vec!["mcp_browser_*".into()],
+            tools: vec!["browser__*".into()],
             keywords: vec!["browse".into(), "website".into()],
             filter_builtins: false,
         }];
         let result = filter_tool_specs_for_turn(specs, &groups, "read the file /etc/hosts");
         let names: Vec<&str> = result.iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"shell_exec"));
-        assert!(!names.contains(&"mcp_browser_navigate"));
+        assert!(!names.contains(&"browser__navigate"));
     }
 
     #[test]
     fn filter_tool_specs_dynamic_keyword_match_is_case_insensitive() {
         use zeroclaw_config::schema::{ToolFilterGroup, ToolFilterGroupMode};
 
-        let specs = vec![make_spec("mcp_browser_navigate")];
+        let specs = vec![make_spec("browser__navigate")];
         let groups = vec![ToolFilterGroup {
             mode: ToolFilterGroupMode::Dynamic,
-            tools: vec!["mcp_browser_*".into()],
+            tools: vec!["browser__*".into()],
             keywords: vec!["Browse".into()],
             filter_builtins: false,
         }];
         let result = filter_tool_specs_for_turn(specs, &groups, "BROWSE the site");
         assert_eq!(result.len(), 1);
+    }
+
+    /// Regression: the prior `starts_with("mcp_")` gate let every real MCP
+    /// tool slip past `tool_filter_groups` (since real names use `__`, not
+    /// `mcp_`). A pattern with no matching MCP tool MUST exclude all MCP
+    /// tools — not silently let them pass through as if they were builtins.
+    #[test]
+    fn filter_tool_specs_real_mcp_names_are_filtered() {
+        use zeroclaw_config::schema::{ToolFilterGroup, ToolFilterGroupMode};
+
+        let specs = vec![
+            make_spec("shell_exec"),                    // builtin: no `__`
+            make_spec("homeassistant__get_state"),      // real MCP shape
+            make_spec("myserver__list_files"),
+        ];
+        // Group restricts MCP tools to ONLY the homeassistant prefix.
+        let groups = vec![ToolFilterGroup {
+            mode: ToolFilterGroupMode::Always,
+            tools: vec!["homeassistant__*".into()],
+            keywords: vec![],
+            filter_builtins: false,
+        }];
+        let result = filter_tool_specs_for_turn(specs, &groups, "anything");
+        let names: Vec<&str> = result.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"shell_exec"));
+        assert!(names.contains(&"homeassistant__get_state"));
+        // The pre-fix bug let this one through unconditionally. Lock it out.
+        assert!(
+            !names.contains(&"myserver__list_files"),
+            "non-matching real MCP tool must be filtered; was the prefix-check fix reverted?"
+        );
     }
 
     // ── Token-based compaction tests ──────────────────────────
