@@ -14,6 +14,7 @@
 
 pub mod acp;
 pub mod api;
+pub mod api_branding;
 pub mod api_browse;
 pub mod api_config;
 pub mod api_logs;
@@ -1264,6 +1265,14 @@ pub async fn run_gateway(
         .route("/metrics", get(handle_metrics))
         .route("/pair", post(handle_pair))
         .route("/pair/code", get(handle_pair_code))
+        // ── Branding (public, unauthenticated) ──
+        // Read pre-pairing so the dialog can show "alfred" / custom logo
+        // before the user enters a code. See api_branding.rs docstring.
+        .route("/api/branding", get(api_branding::handle_branding_get))
+        .route(
+            "/branding/{*path}",
+            get(api_branding::handle_branding_file),
+        )
         .route("/webhook", post(handle_webhook))
         .route("/whatsapp", get(handle_whatsapp_verify))
         .route("/whatsapp", post(handle_whatsapp_message))

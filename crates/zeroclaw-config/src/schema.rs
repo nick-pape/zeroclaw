@@ -196,6 +196,13 @@ pub struct Config {
     #[nested]
     pub skills: SkillsConfig,
 
+    /// Per-instance branding for the dashboard (`[branding]`). Lets each
+    /// deployment declare its own display name, theme, accent, and logo
+    /// so multiple ZeroClaw instances are visually distinguishable.
+    #[serde(default)]
+    #[nested]
+    pub branding: BrandingConfig,
+
     /// Pipeline tool configuration (`[pipeline]`).
     #[serde(default)]
     #[nested]
@@ -5296,6 +5303,59 @@ impl Default for PairingDashboardConfig {
             lockout_secs: default_pairing_lockout_secs(),
         }
     }
+}
+
+// ── Branding (per-instance visual identity) ─────────────────────────
+
+/// Per-instance branding for the dashboard (`[branding]` section).
+///
+/// When running multiple ZeroClaw instances side-by-side (e.g., per-agent
+/// deployments at `alfred.example/`, `grocery.example/`, etc.) the
+/// hardcoded "ZeroClaw" name and crab logo make every dashboard look
+/// identical. This block lets each deploy declare its own display name,
+/// default theme, default accent, and logo so the user can tell instances
+/// apart at a glance without checking the URL.
+///
+/// All fields are optional and exposed via the public, unauthenticated
+/// `GET /api/branding` endpoint — the pairing dialog reads them so the
+/// instance identity is visible **before** the user enters a pairing
+/// code (defense against DNS-spoofing onto the wrong agent).
+///
+/// Theme + accent values that don't match a known ID are silently ignored
+/// by the dashboard (fall back to hardcoded defaults). A typo in
+/// `config.toml` will not brick a deploy.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "branding"]
+pub struct BrandingConfig {
+    /// Replaces "ZeroClaw" in the sidebar logo, pairing dialog title, and
+    /// browser tab. Plain string; emoji are fine. Null → keep "ZeroClaw".
+    #[serde(default)]
+    pub display_name: Option<String>,
+
+    /// Color theme ID applied as the default for first-time visitors
+    /// (no `localStorage["zeroclaw-theme"]` yet). Must match one of the
+    /// IDs in `web/src/contexts/themes.json` — e.g. `"default-dark"`,
+    /// `"kanagawa-wave"`, `"dracula"`. The user can still pick another
+    /// theme via the dashboard; this is the boot default only.
+    #[serde(default)]
+    pub default_color_theme: Option<String>,
+
+    /// Accent color applied for first-time visitors. One of:
+    /// `cyan`, `violet`, `emerald`, `amber`, `rose`, `blue`.
+    /// Orthogonal to `default_color_theme` — accent overlays whichever
+    /// theme is active.
+    #[serde(default)]
+    pub default_accent: Option<String>,
+
+    /// URL for the sidebar logo + favicon. Absolute URLs (https://...)
+    /// are fetched by the browser directly. Relative URLs starting with
+    /// `/branding/` are served by the gateway from
+    /// `${workspace_dir}/branding/<file>` — drop a PNG/SVG/ICO in that
+    /// directory and reference it as e.g. `"/branding/alfred.png"`.
+    /// Null → keep the default ZeroClaw crab logo.
+    #[serde(default)]
+    pub logo_url: Option<String>,
 }
 
 /// TLS configuration for the gateway server (`[gateway.tls]`).
@@ -12720,6 +12780,7 @@ impl Default for Config {
             scheduler: SchedulerConfig::default(),
             pacing: PacingConfig::default(),
             skills: SkillsConfig::default(),
+            branding: BrandingConfig::default(),
             pipeline: PipelineConfig::default(),
             heartbeat: HeartbeatConfig::default(),
             cron: HashMap::new(),
@@ -15927,6 +15988,7 @@ auto_save = true
             reliability: ReliabilityConfig::default(),
             scheduler: SchedulerConfig::default(),
             skills: SkillsConfig::default(),
+            branding: BrandingConfig::default(),
             pipeline: PipelineConfig::default(),
             query_classification: QueryClassificationConfig::default(),
             heartbeat: HeartbeatConfig {
@@ -16587,6 +16649,7 @@ default_temperature = 0.7
             reliability: ReliabilityConfig::default(),
             scheduler: SchedulerConfig::default(),
             skills: SkillsConfig::default(),
+            branding: BrandingConfig::default(),
             pipeline: PipelineConfig::default(),
             query_classification: QueryClassificationConfig::default(),
             heartbeat: HeartbeatConfig::default(),
