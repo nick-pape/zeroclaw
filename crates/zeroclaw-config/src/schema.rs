@@ -8704,6 +8704,13 @@ fn default_auto_approve() -> Vec<String> {
         "weather".into(),
         "browser".into(),
         "browser_open".into(),
+        // Required when `[mcp] deferred_loading = true`: the LLM calls
+        // tool_search to discover MCP tools on demand. Without auto-approve,
+        // the first call hangs on the approval oneshot waiter (120s timeout
+        // → auto-deny) in webhook-mode channels — the "post-inference
+        // gateway hang". Side-effect-free (read-only against the local
+        // deferred-tool registry), so safe to auto-approve.
+        "tool_search".into(),
     ]
 }
 
