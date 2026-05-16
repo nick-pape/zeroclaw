@@ -2832,9 +2832,6 @@ pub struct AliasedAgentConfig {
     #[nested]
     #[serde(default)]
     pub history_pruning: crate::scattered_types::HistoryPrunerConfig,
-    /// Enable context-aware tool filtering (only surface relevant tools per iteration).
-    #[serde(default)]
-    pub context_aware_tools: bool,
     /// Post-response quality evaluator configuration.
     #[nested]
     #[serde(default)]
@@ -2921,7 +2918,6 @@ impl Default for AliasedAgentConfig {
             max_system_prompt_chars: default_max_system_prompt_chars(),
             thinking: crate::scattered_types::ThinkingConfig::default(),
             history_pruning: crate::scattered_types::HistoryPrunerConfig::default(),
-            context_aware_tools: false,
             eval: crate::scattered_types::EvalConfig::default(),
             auto_classify: None,
             context_compression: crate::scattered_types::ContextCompressionConfig::default(),
@@ -8897,8 +8893,6 @@ pub struct RuntimeProfileConfig {
     pub tool_call_dedup_exempt: Vec<String>,
     /// Maximum characters for the assembled system prompt. `None` inherits.
     pub max_system_prompt_chars: Option<usize>,
-    /// Enable context-aware tool filtering per iteration. `None` inherits.
-    pub context_aware_tools: Option<bool>,
     /// Maximum characters for a single tool result. `None` inherits.
     pub max_tool_result_chars: Option<usize>,
     /// Number of recent turns whose full tool context is preserved. `None` inherits.
@@ -8923,7 +8917,6 @@ impl Default for RuntimeProfileConfig {
             tool_dispatcher: None,
             tool_call_dedup_exempt: Vec::new(),
             max_system_prompt_chars: None,
-            context_aware_tools: None,
             max_tool_result_chars: None,
             keep_tool_context_turns: None,
         }
