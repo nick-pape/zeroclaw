@@ -3476,6 +3476,18 @@ async fn process_channel_message(
                         route.model = new_model;
                         clear_model_switch_request();
 
+                        // Persist the route override so subsequent messages
+                        // from this sender continue using the switched model.
+                        set_route_selection(
+                            ctx.as_ref(),
+                            &history_key,
+                            ChannelRouteSelection {
+                                provider: route.provider.clone(),
+                                model: route.model.clone(),
+                                api_key: route.api_key.clone(),
+                            },
+                        );
+
                         ctx.observer.record_event(&ObserverEvent::AgentStart {
                             provider: route.provider.clone(),
                             model: route.model.clone(),

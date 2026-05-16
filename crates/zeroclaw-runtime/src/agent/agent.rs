@@ -1386,7 +1386,7 @@ impl Agent {
         self.history
             .push(ConversationMessage::Chat(ChatMessage::user(enriched)));
 
-        let effective_model = self.classify_model(user_message);
+        let mut effective_model = self.classify_model(user_message);
 
         // ── Turn loop ──────────────────────────────────────────────────
         for _ in 0..self.config.max_tool_iterations {
@@ -1710,6 +1710,42 @@ impl Agent {
             let formatted = self.tool_dispatcher.format_results(&results);
             self.history.push(formatted);
             self.trim_history();
+
+            // Check if model_switch tool was called during tool execution.
+            // If so, update the agent's model for subsequent iterations of this
+            // turn and for future turns (the Agent persists across turns in the
+            // gateway/WebSocket path).
+            if let Ok(guard) = crate::agent::loop_::get_model_switch_state().lock()
+                && let Some((ref new_provider, ref new_model)) = *guard
+                && *new_model != effective_model
+            {
+                tracing::info!(
+                    "Model switch detected in turn_streamed: {} -> {} {}",
+                    effective_model,
+                    new_provider,
+                    new_model
+                );
+                effective_model = new_model.clone();
+                self.model_name = new_model.clone();
+                // Attempt to create a new provider for the switched model.
+                // On failure, log and continue with the existing provider.
+                match zeroclaw_providers::create_resilient_provider(
+                    new_provider,
+                    None,
+                    None,
+                    &Default::default(),
+                ) {
+                    Ok(new_prov) => {
+                        self.provider = new_prov;
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            "Failed to create provider for model switch in turn_streamed: {e}"
+                        );
+                    }
+                }
+                crate::agent::loop_::clear_model_switch_request();
+            }
         }
 
         anyhow::bail!(
