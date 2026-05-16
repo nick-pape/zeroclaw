@@ -13016,6 +13016,89 @@ auto_approve = ["my_custom_tool", "another_tool"]
         }
     }
 
+    // ── Branding (per-instance display name + theme + logo) ──
+
+    #[test]
+    async fn branding_defaults_all_none() {
+        let cfg = BrandingConfig::default();
+        assert!(cfg.display_name.is_none());
+        assert!(cfg.default_color_theme.is_none());
+        assert!(cfg.default_accent.is_none());
+        assert!(cfg.logo_url.is_none());
+    }
+
+    #[test]
+    async fn branding_parses_from_minimal_toml() {
+        let raw = r#"
+default_temperature = 0.7
+
+[branding]
+display_name = "alfred"
+default_color_theme = "kanagawa-wave"
+default_accent = "violet"
+logo_url = "/branding/alfred.png"
+"#;
+        let parsed = parse_test_config(raw);
+        assert_eq!(parsed.branding.display_name.as_deref(), Some("alfred"));
+        assert_eq!(
+            parsed.branding.default_color_theme.as_deref(),
+            Some("kanagawa-wave")
+        );
+        assert_eq!(parsed.branding.default_accent.as_deref(), Some("violet"));
+        assert_eq!(
+            parsed.branding.logo_url.as_deref(),
+            Some("/branding/alfred.png")
+        );
+    }
+
+    #[test]
+    async fn branding_omitted_block_yields_default() {
+        let raw = r#"
+default_temperature = 0.7
+"#;
+        let parsed = parse_test_config(raw);
+        assert!(parsed.branding.display_name.is_none());
+        assert!(parsed.branding.logo_url.is_none());
+    }
+
+    #[test]
+    async fn branding_partial_block_only_fills_provided_fields() {
+        // Operator just wants to rename the instance; logo + theme stay default.
+        let raw = r#"
+default_temperature = 0.7
+
+[branding]
+display_name = "grocery"
+"#;
+        let parsed = parse_test_config(raw);
+        assert_eq!(parsed.branding.display_name.as_deref(), Some("grocery"));
+        assert!(parsed.branding.default_color_theme.is_none());
+        assert!(parsed.branding.default_accent.is_none());
+        assert!(parsed.branding.logo_url.is_none());
+    }
+
+    /// We deliberately accept any string for default_color_theme /
+    /// default_accent — typos in config.toml fall through to hardcoded
+    /// defaults on the dashboard rather than blocking config load.
+    /// This test locks in that lax acceptance so a future "strict
+    /// validation" PR doesn't silently brick deployments.
+    #[test]
+    async fn branding_accepts_unknown_theme_id_without_rejecting_config() {
+        let raw = r#"
+default_temperature = 0.7
+
+[branding]
+default_color_theme = "definitely-not-a-real-theme"
+default_accent = "neon-magenta"
+"#;
+        let parsed = parse_test_config(raw);
+        assert_eq!(
+            parsed.branding.default_color_theme.as_deref(),
+            Some("definitely-not-a-real-theme")
+        );
+        assert_eq!(parsed.branding.default_accent.as_deref(), Some("neon-magenta"));
+    }
+
     /// Regression test: empty auto_approve still gets defaults merged.
     #[test]
     async fn auto_approve_empty_list_gets_defaults() {
