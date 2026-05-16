@@ -3,6 +3,7 @@ import { useLocation, useNavigate } from 'react-router-dom';
 import { ThemeProvider } from './contexts/ThemeContext';
 
 import { loadLocale, saveLocale } from './contexts/ThemeContext';
+import { useBranding } from './contexts/BrandingContext';
 import { AuthProvider, useAuth } from './hooks/useAuth';
 import { DraftContext, useDraftStore } from './hooks/useDraft';
 import { getAdminPairCode, getOnboardStatus } from './lib/api';
@@ -80,6 +81,12 @@ export class ErrorBoundary extends Component<
 
 // Pairing dialog component
 function PairingDialog({ onPair }: { onPair: (code: string) => Promise<void> }) {
+  // Per-instance branding so the operator can confirm they're pairing
+  // with the right agent (alfred vs grocery vs ...) before entering the
+  // code. Defends against DNS-spoofing onto a sibling agent instance.
+  const { displayName, logoUrl } = useBranding();
+  const brandName = displayName ?? 'ZeroClaw';
+  const brandLogo = logoUrl ?? `${basePath}/_app/zeroclaw-trans.png`;
   const [code, setCode] = useState('');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
@@ -125,12 +132,12 @@ function PairingDialog({ onPair }: { onPair: (code: string) => Promise<void> }) 
 
         <div className="text-center mb-8">
           <img
-            src={`${basePath}/_app/zeroclaw-trans.png`}
-            alt="ZeroClaw"
+            src={brandLogo}
+            alt={brandName}
             className="h-20 w-20 rounded-2xl object-cover mx-auto mb-4 animate-float"
             onError={(e) => { e.currentTarget.style.display = 'none'; }}
           />
-          <h1 className="text-2xl font-bold mb-2 text-gradient-blue">ZeroClaw</h1>
+          <h1 className="text-2xl font-bold mb-2 text-gradient-blue">{brandName}</h1>
           <p className="text-sm" style={{ color: 'var(--pc-text-muted)' }}>
             {displayCode ? 'Your pairing code — click Pair to connect' : 'Enter the pairing code from your terminal'}
           </p>
