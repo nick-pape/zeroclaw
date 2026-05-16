@@ -16,6 +16,10 @@ pub struct OpenAiModelProvider {
     base_url: String,
     credential: Option<String>,
     max_tokens: Option<u32>,
+    /// HTTP request timeout in seconds. Defaults to 120; override via
+    /// [`Self::with_timeout_secs`]. Used by `http_client()` instead of the
+    /// previous hardcoded 120s.
+    timeout_secs: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -203,12 +207,24 @@ impl OpenAiModelProvider {
                 .unwrap_or_else(|| BASE_URL.to_string()),
             credential: credential.map(ToString::to_string),
             max_tokens: None,
+            timeout_secs: 120,
         }
     }
 
     /// Set the maximum output tokens for API requests.
     pub fn with_max_tokens(mut self, max_tokens: Option<u32>) -> Self {
         self.max_tokens = max_tokens;
+        self
+    }
+
+    /// Override the HTTP request timeout for LLM API calls.
+    ///
+    /// Matches the pattern used by [`crate::compatible::CompatibleProvider`] and
+    /// [`crate::llamacpp::LlamaCppProvider`]. Without this, the native openai
+    /// provider hardcoded 120s and silently ignored the `timeout_secs` config
+    /// field that every other provider honors.
+    pub fn with_timeout_secs(mut self, timeout_secs: u64) -> Self {
+        self.timeout_secs = timeout_secs;
         self
     }
 
@@ -355,7 +371,7 @@ impl OpenAiModelProvider {
     fn http_client(&self) -> Client {
         zeroclaw_config::schema::build_runtime_proxy_client_with_timeouts(
             "model_provider.openai",
-            120,
+            self.timeout_secs,
             10,
         )
     }
