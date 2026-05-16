@@ -5,7 +5,10 @@ import { useBranding } from './BrandingContext';
 // ── Types (was ThemeContextDef.ts) ───────────────────────────────────────────
 
 export type ThemeMode = 'system' | 'dark' | 'light' | 'oled';
-export type AccentColor = 'cyan' | 'violet' | 'emerald' | 'amber' | 'rose' | 'blue';
+// `ha-blue` (#18BCF2) and `heb-red` (#E32219) are brand-derived accents
+// for the homeassistant + heb themes. They're regular accents — any
+// user can pick them from the picker — but the names reflect their origin.
+export type AccentColor = 'cyan' | 'violet' | 'emerald' | 'amber' | 'rose' | 'blue' | 'ha-blue' | 'heb-red';
 export type UiFont = 'system' | 'inter' | 'segoe' | 'sf';
 export type MonoFont = 'jetbrains' | 'fira' | 'cascadia' | 'system-mono';
 
@@ -123,7 +126,7 @@ const DEFAULTS: StoredTheme = {
 };
 
 const validThemes: ThemeMode[] = ['dark', 'light', 'oled', 'system'];
-const validAccents: AccentColor[] = ['cyan', 'violet', 'emerald', 'amber', 'rose', 'blue'];
+const validAccents: AccentColor[] = ['cyan', 'violet', 'emerald', 'amber', 'rose', 'blue', 'ha-blue', 'heb-red'];
 
 function migrateThemeToColorTheme(themeMode: ThemeMode): ColorThemeId {
   switch (themeMode) {
@@ -216,6 +219,16 @@ const accents: Record<AccentColor, Record<string, string>> = {
   blue: {
     '--pc-accent': '#3b82f6', '--pc-accent-light': '#60a5fa',
     '--pc-accent-dim': 'rgba(59,130,246,0.3)', '--pc-accent-glow': 'rgba(59,130,246,0.1)', '--pc-accent-rgb': '59,130,246',
+  },
+  // Home Assistant's signature primary (`--ha-primary-color`).
+  'ha-blue': {
+    '--pc-accent': '#18BCF2', '--pc-accent-light': '#5dd1ff',
+    '--pc-accent-dim': 'rgba(24,188,242,0.3)', '--pc-accent-glow': 'rgba(24,188,242,0.1)', '--pc-accent-rgb': '24,188,242',
+  },
+  // H-E-B's signature brand red (the storefront / logo / button color).
+  'heb-red': {
+    '--pc-accent': '#E32219', '--pc-accent-light': '#ff4d44',
+    '--pc-accent-dim': 'rgba(227,34,25,0.3)', '--pc-accent-glow': 'rgba(227,34,25,0.1)', '--pc-accent-rgb': '227,34,25',
   },
 };
 
