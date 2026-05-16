@@ -4,8 +4,13 @@
 //! - **Stage 1 (Hot cache):** In-memory LRU of recent recall results.
 //! - **Stage 2 (FTS):** FTS5 keyword search with optional early-return.
 //! - **Stage 3 (Vector):** Vector similarity search + hybrid merge.
+//! - **Stage 4 (Rerank, optional):** External cross-encoder reranking gated by
+//!   `rerank_enabled` + `rerank_threshold` + `rerank_url`. Silent fallback on
+//!   any failure preserves the hybrid-merge order.
 //!
-//! Configurable via `[memory]` settings: `retrieval_stages`, `fts_early_return_score`.
+//! Configurable via `[memory]` settings: `retrieval_stages`,
+//! `fts_early_return_score`, `rerank_enabled`, `rerank_threshold`,
+//! `rerank_url`.
 
 use super::traits::{Memory, MemoryEntry};
 use parking_lot::Mutex;
@@ -30,6 +35,14 @@ pub struct RetrievalConfig {
     pub cache_max_entries: usize,
     /// TTL for cached results.
     pub cache_ttl: Duration,
+    /// Enable cross-encoder reranking. Mirrors `MemoryConfig.rerank_enabled`.
+    pub rerank_enabled: bool,
+    /// Minimum candidate count to trigger reranking (smaller result sets
+    /// skip the network round-trip).
+    pub rerank_threshold: usize,
+    /// Reranker server URL (e.g. `"http://localhost:8787"`). When `None`
+    /// or empty, reranking is a no-op even with `rerank_enabled = true`.
+    pub rerank_url: Option<String>,
 }
 
 impl Default for RetrievalConfig {
@@ -39,6 +52,9 @@ impl Default for RetrievalConfig {
             fts_early_return_score: 0.85,
             cache_max_entries: 256,
             cache_ttl: Duration::from_secs(300),
+            rerank_enabled: false,
+            rerank_threshold: 5,
+            rerank_url: None,
         }
     }
 }
@@ -84,6 +100,80 @@ impl RetrievalPipeline {
             return Some(cached.entries.clone());
         }
         None
+    }
+
+    /// Call an external cross-encoder reranker to reorder results by relevance.
+    ///
+    /// Silent fallback on any failure (network error, non-2xx response,
+    /// malformed JSON) — returns the input unchanged. This is deliberate:
+    /// rerank is a quality-improving optimization; a reranker outage MUST
+    /// NOT degrade the user's recall path into "no results."
+    ///
+    /// Endpoint contract: `POST {rerank_url}/rerank` with body
+    /// `{"query": str, "documents": [str]}`, expecting a response shape
+    /// of `{"results": [{"index": usize, "score": f64}, ...]}`. The
+    /// `index` references positions in the original `documents` array;
+    /// the helper reorders the input `Vec<MemoryEntry>` accordingly via
+    /// [`reorder_by_rerank`], appending any indices the reranker omitted
+    /// to preserve total recall.
+    async fn rerank_results(
+        &self,
+        query: &str,
+        results: Vec<MemoryEntry>,
+    ) -> Vec<MemoryEntry> {
+        let url = match &self.config.rerank_url {
+            Some(u) if !u.is_empty() => u.clone(),
+            _ => return results,
+        };
+        if results.len() < self.config.rerank_threshold {
+            return results;
+        }
+
+        let documents: Vec<String> = results
+            .iter()
+            .map(|e| format!("{}: {}", e.key, e.content))
+            .collect();
+        let body = serde_json::json!({
+            "query": query,
+            "documents": documents,
+        });
+
+        let client = zeroclaw_config::schema::build_runtime_proxy_client("memory.reranker");
+        let endpoint = format!("{}/rerank", url.trim_end_matches('/'));
+        let resp = match client
+            .post(&endpoint)
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("reranker request failed: {e}");
+                return results;
+            }
+        };
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            tracing::warn!("reranker returned {status}: {text}");
+            return results;
+        }
+        let parsed: RerankResponse = match resp.json().await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("reranker response parse failed: {e}");
+                return results;
+            }
+        };
+
+        tracing::debug!(
+            "reranker returned {} scored results for {} candidates",
+            parsed.results.len(),
+            results.len(),
+        );
+        reorder_by_rerank(results, &parsed.results)
     }
 
     /// Store a result in the hot cache with LRU eviction.
@@ -153,9 +243,20 @@ impl RetrievalPipeline {
                             tracing::debug!(
                                 "retrieval pipeline: FTS early return (score={top_score:.3})"
                             );
+                            // FTS early-return implies a confident top hit;
+                            // skip rerank to keep the fast path fast.
                             self.store_in_cache(ck, results.clone());
                             return Ok(results);
                         }
+
+                        // Apply rerank to the full hybrid-merged set. Gated
+                        // by rerank_enabled; threshold + URL absence are
+                        // handled inside rerank_results.
+                        let results = if self.config.rerank_enabled {
+                            self.rerank_results(query, results).await
+                        } else {
+                            results
+                        };
 
                         self.store_in_cache(ck, results.clone());
                         return Ok(results);
@@ -180,6 +281,51 @@ impl RetrievalPipeline {
     pub fn cache_size(&self) -> usize {
         self.hot_cache.lock().len()
     }
+}
+
+// ── Rerank response types + pure reorder helper ──────────────────────────
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct RerankResult {
+    index: usize,
+    score: f64,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RerankResponse {
+    results: Vec<RerankResult>,
+}
+
+/// Apply a reranker's index-and-score output to a candidate list.
+///
+/// Reordered entries come first (with their reranker score overwriting
+/// `entry.score`); any indices the reranker omitted are appended in their
+/// original order so the caller never loses a candidate to a flaky
+/// response. Out-of-bounds indices are silently skipped — a misbehaving
+/// reranker can't crash the recall path.
+fn reorder_by_rerank(
+    results: Vec<MemoryEntry>,
+    reranked: &[RerankResult],
+) -> Vec<MemoryEntry> {
+    let mut reordered: Vec<MemoryEntry> = Vec::with_capacity(results.len());
+    for rr in reranked {
+        if rr.index < results.len() {
+            let mut entry = results[rr.index].clone();
+            entry.score = Some(rr.score);
+            reordered.push(entry);
+        }
+    }
+    let used: std::collections::HashSet<usize> = reranked
+        .iter()
+        .filter(|r| r.index < results.len())
+        .map(|r| r.index)
+        .collect();
+    for (i, entry) in results.into_iter().enumerate() {
+        if !used.contains(&i) {
+            reordered.push(entry);
+        }
+    }
+    reordered
 }
 
 #[cfg(test)]
@@ -221,6 +367,83 @@ mod tests {
 
         assert_ne!(k1, k2);
         assert_ne!(k1, k3);
+    }
+
+    fn make_entry(key: &str, content: &str, score: Option<f64>) -> MemoryEntry {
+        MemoryEntry {
+            id: key.into(),
+            key: key.into(),
+            content: content.into(),
+            category: crate::traits::MemoryCategory::Core,
+            timestamp: "now".into(),
+            session_id: None,
+            score,
+            namespace: "default".into(),
+            importance: None,
+            superseded_by: None,
+        }
+    }
+
+    #[test]
+    fn rerank_config_defaults() {
+        let cfg = RetrievalConfig::default();
+        assert!(!cfg.rerank_enabled);
+        assert_eq!(cfg.rerank_threshold, 5);
+        assert!(cfg.rerank_url.is_none());
+    }
+
+    #[test]
+    fn reorder_by_rerank_applies_scores_and_order() {
+        let input = vec![
+            make_entry("a", "alpha", Some(0.10)),
+            make_entry("b", "beta", Some(0.20)),
+            make_entry("c", "gamma", Some(0.30)),
+        ];
+        // Reranker says b is best, then c, then a.
+        let rerank = vec![
+            RerankResult { index: 1, score: 0.95 },
+            RerankResult { index: 2, score: 0.80 },
+            RerankResult { index: 0, score: 0.40 },
+        ];
+        let out = reorder_by_rerank(input, &rerank);
+        assert_eq!(out[0].key, "b");
+        assert_eq!(out[0].score, Some(0.95));
+        assert_eq!(out[1].key, "c");
+        assert_eq!(out[1].score, Some(0.80));
+        assert_eq!(out[2].key, "a");
+        assert_eq!(out[2].score, Some(0.40));
+    }
+
+    #[test]
+    fn reorder_by_rerank_appends_missing_to_preserve_recall() {
+        let input = vec![
+            make_entry("a", "alpha", None),
+            make_entry("b", "beta", None),
+            make_entry("c", "gamma", None),
+        ];
+        // Reranker only scored one of three; the other two must still appear.
+        let rerank = vec![RerankResult { index: 2, score: 0.99 }];
+        let out = reorder_by_rerank(input, &rerank);
+        assert_eq!(out.len(), 3, "no candidate must be dropped");
+        assert_eq!(out[0].key, "c");
+        // Appended in original order.
+        assert_eq!(out[1].key, "a");
+        assert_eq!(out[2].key, "b");
+    }
+
+    #[test]
+    fn reorder_by_rerank_ignores_out_of_bounds_indices() {
+        // Misbehaving reranker returns an index larger than the input —
+        // we must NOT panic and we must NOT drop the good entry.
+        let input = vec![make_entry("a", "alpha", None)];
+        let rerank = vec![
+            RerankResult { index: 42, score: 0.99 },
+            RerankResult { index: 0, score: 0.50 },
+        ];
+        let out = reorder_by_rerank(input, &rerank);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].key, "a");
+        assert_eq!(out[0].score, Some(0.50));
     }
 
     #[tokio::test]
