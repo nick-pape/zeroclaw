@@ -4989,7 +4989,20 @@ fn collect_configured_channels(
     }
 
     if let Some(ref sig) = config.channels.signal {
-        if sig.enabled {
+        if !sig.enabled {
+            tracing::info!("Signal channel configured but disabled (enabled = false)");
+        } else if sig.http_url.trim().is_empty() || sig.account.trim().is_empty() {
+            // Toggling the channel on in the UX without filling these used to
+            // construct a SignalChannel with empty strings; the failure landed
+            // later (first listen / HTTP poll) and the channel supervisor
+            // crashlooped restarting it. Validate up front and skip with a
+            // clear log so the supervisor sees a clean start_channels result.
+            tracing::error!(
+                "Signal channel is enabled but http_url or account is empty. \
+                 Set `http_url` and `account` in `[channels.signal]` of \
+                 config.toml. Skipping Signal channel."
+            );
+        } else {
             channels.push(ConfiguredChannel {
                 display_name: "Signal",
                 channel: Arc::new(
@@ -5005,8 +5018,6 @@ fn collect_configured_channels(
                     .with_approval_timeout_secs(sig.approval_timeout_secs),
                 ),
             });
-        } else {
-            tracing::info!("Signal channel configured but disabled (enabled = false)");
         }
     }
 
@@ -5467,13 +5478,28 @@ fn collect_configured_channels(
 
     #[cfg(feature = "channel-voice-call")]
     if let Some(ref vc) = config.channels.voice_call {
-        if vc.enabled {
+        if !vc.enabled {
+            tracing::info!("Voice Call channel configured but disabled (enabled = false)");
+        } else if vc.account_id.trim().is_empty()
+            || vc.auth_token.trim().is_empty()
+            || vc.from_number.trim().is_empty()
+        {
+            // Same shape as Signal: toggling voice on in the UX without
+            // creds previously built a VoiceCallChannel with empty
+            // account_id/auth_token, the webhook server bound but every
+            // outbound provider API call failed, and the channel supervisor
+            // crashlooped. Validate up front and skip cleanly.
+            tracing::error!(
+                "Voice Call channel is enabled but account_id, auth_token, \
+                 or from_number is empty. Set these in `[channels.voice_call]` \
+                 of config.toml (provider = {}). Skipping Voice Call channel.",
+                vc.provider
+            );
+        } else {
             channels.push(ConfiguredChannel {
                 display_name: "Voice Call",
                 channel: Arc::new(VoiceCallChannel::new(vc.clone())),
             });
-        } else {
-            tracing::info!("Voice Call channel configured but disabled (enabled = false)");
         }
     }
 
