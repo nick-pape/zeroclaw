@@ -1297,6 +1297,9 @@ fn create_provider_with_url_and_options(
             if let Some(mt) = options.provider_max_tokens {
                 p = p.with_max_tokens(Some(mt));
             }
+            if let Some(t) = options.provider_timeout_secs {
+                p = p.with_timeout_secs(t);
+            }
             Ok(Box::new(p))
         }
         // Ollama uses api_url for custom base URL (e.g. remote Ollama instance)

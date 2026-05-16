@@ -165,6 +165,13 @@ pub struct Config {
     #[nested]
     pub skills: SkillsConfig,
 
+    /// Per-instance branding for the dashboard (`[branding]`). Lets each
+    /// deployment declare its own display name, theme, accent, and logo
+    /// so multiple ZeroClaw instances are visually distinguishable.
+    #[serde(default)]
+    #[nested]
+    pub branding: BrandingConfig,
+
     /// Pipeline tool configuration (`[pipeline]`).
     #[serde(default)]
     #[nested]
@@ -1426,9 +1433,6 @@ pub struct ToolFilterGroup {
     /// Ignored when `mode = "always"`.
     #[serde(default)]
     pub keywords: Vec<String>,
-    /// When true, also filter built-in tools (not just MCP tools).
-    #[serde(default)]
-    pub filter_builtins: bool,
 }
 
 /// OpenAI Whisper STT provider configuration (`[transcription.openai]`).
@@ -1616,10 +1620,6 @@ pub struct AgentConfig {
     #[serde(default)]
     pub history_pruning: crate::scattered_types::HistoryPrunerConfig,
 
-    /// Enable context-aware tool filtering (only surface relevant tools per iteration).
-    #[serde(default)]
-    pub context_aware_tools: bool,
-
     /// Post-response quality evaluator configuration.
     #[nested]
     #[serde(default)]
@@ -1701,7 +1701,6 @@ impl Default for AgentConfig {
             max_system_prompt_chars: default_max_system_prompt_chars(),
             thinking: crate::scattered_types::ThinkingConfig::default(),
             history_pruning: crate::scattered_types::HistoryPrunerConfig::default(),
-            context_aware_tools: false,
             eval: crate::scattered_types::EvalConfig::default(),
             auto_classify: None,
             context_compression: crate::scattered_types::ContextCompressionConfig::default(),
@@ -2539,6 +2538,59 @@ impl Default for PairingDashboardConfig {
             lockout_secs: default_pairing_lockout_secs(),
         }
     }
+}
+
+// ── Branding (per-instance visual identity) ─────────────────────────
+
+/// Per-instance branding for the dashboard (`[branding]` section).
+///
+/// When running multiple ZeroClaw instances side-by-side (e.g., per-agent
+/// deployments at `alfred.example/`, `grocery.example/`, etc.) the
+/// hardcoded "ZeroClaw" name and crab logo make every dashboard look
+/// identical. This block lets each deploy declare its own display name,
+/// default theme, default accent, and logo so the user can tell instances
+/// apart at a glance without checking the URL.
+///
+/// All fields are optional and exposed via the public, unauthenticated
+/// `GET /api/branding` endpoint — the pairing dialog reads them so the
+/// instance identity is visible **before** the user enters a pairing
+/// code (defense against DNS-spoofing onto the wrong agent).
+///
+/// Theme + accent values that don't match a known ID are silently ignored
+/// by the dashboard (fall back to hardcoded defaults). A typo in
+/// `config.toml` will not brick a deploy.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "branding"]
+pub struct BrandingConfig {
+    /// Replaces "ZeroClaw" in the sidebar logo, pairing dialog title, and
+    /// browser tab. Plain string; emoji are fine. Null → keep "ZeroClaw".
+    #[serde(default)]
+    pub display_name: Option<String>,
+
+    /// Color theme ID applied as the default for first-time visitors
+    /// (no `localStorage["zeroclaw-theme"]` yet). Must match one of the
+    /// IDs in `web/src/contexts/themes.json` — e.g. `"default-dark"`,
+    /// `"kanagawa-wave"`, `"dracula"`. The user can still pick another
+    /// theme via the dashboard; this is the boot default only.
+    #[serde(default)]
+    pub default_color_theme: Option<String>,
+
+    /// Accent color applied for first-time visitors. One of:
+    /// `cyan`, `violet`, `emerald`, `amber`, `rose`, `blue`.
+    /// Orthogonal to `default_color_theme` — accent overlays whichever
+    /// theme is active.
+    #[serde(default)]
+    pub default_accent: Option<String>,
+
+    /// URL for the sidebar logo + favicon. Absolute URLs (https://...)
+    /// are fetched by the browser directly. Relative URLs starting with
+    /// `/branding/` are served by the gateway from
+    /// `${workspace_dir}/branding/<file>` — drop a PNG/SVG/ICO in that
+    /// directory and reference it as e.g. `"/branding/alfred.png"`.
+    /// Null → keep the default ZeroClaw crab logo.
+    #[serde(default)]
+    pub logo_url: Option<String>,
 }
 
 /// TLS configuration for the gateway server (`[gateway.tls]`).
@@ -5540,12 +5592,21 @@ pub struct MemoryConfig {
     /// Retrieval stages to execute in order. Valid: "cache", "fts", "vector".
     #[serde(default = "default_retrieval_stages")]
     pub retrieval_stages: Vec<String>,
-    /// Enable LLM reranking when candidate count exceeds threshold.
+    /// Enable cross-encoder reranking when candidate count exceeds threshold.
     #[serde(default)]
     pub rerank_enabled: bool,
     /// Minimum candidate count to trigger reranking.
     #[serde(default = "default_rerank_threshold")]
     pub rerank_threshold: usize,
+    /// Reranker server URL (e.g. `"http://localhost:8787"`). When set and
+    /// `rerank_enabled = true`, retrieval results are re-ordered by an
+    /// external cross-encoder server (POST `{url}/rerank` with body
+    /// `{"query": ..., "documents": [...]}`, expecting a response of
+    /// `{"results": [{"index": usize, "score": f64}, ...]}`). On any
+    /// transport or parse failure the pipeline silently falls back to the
+    /// original hybrid-merge order — no crash, no degradation.
+    #[serde(default)]
+    pub rerank_url: Option<String>,
     /// FTS score above which to early-return without vector search (0.0–1.0).
     #[serde(default = "default_fts_early_return_score")]
     pub fts_early_return_score: f64,
@@ -5712,6 +5773,7 @@ impl Default for MemoryConfig {
             retrieval_stages: default_retrieval_stages(),
             rerank_enabled: false,
             rerank_threshold: default_rerank_threshold(),
+            rerank_url: None,
             fts_early_return_score: default_fts_early_return_score(),
             default_namespace: default_namespace(),
             conflict_threshold: default_conflict_threshold(),
@@ -5963,6 +6025,13 @@ fn default_auto_approve() -> Vec<String> {
         "weather".into(),
         "browser".into(),
         "browser_open".into(),
+        // Required when `[mcp] deferred_loading = true`: the LLM calls
+        // tool_search to discover MCP tools on demand. Without auto-approve,
+        // the first call hangs on the approval oneshot waiter (120s timeout
+        // → auto-deny) in webhook-mode channels — the "post-inference
+        // gateway hang". Side-effect-free (read-only against the local
+        // deferred-tool registry), so safe to auto-approve.
+        "tool_search".into(),
     ]
 }
 
@@ -9687,6 +9756,7 @@ impl Default for Config {
             agent: AgentConfig::default(),
             pacing: PacingConfig::default(),
             skills: SkillsConfig::default(),
+            branding: BrandingConfig::default(),
             pipeline: PipelineConfig::default(),
             heartbeat: HeartbeatConfig::default(),
             cron: CronConfig::default(),
@@ -12689,6 +12759,7 @@ auto_save = true
             reliability: ReliabilityConfig::default(),
             scheduler: SchedulerConfig::default(),
             skills: SkillsConfig::default(),
+            branding: BrandingConfig::default(),
             pipeline: PipelineConfig::default(),
             query_classification: QueryClassificationConfig::default(),
             heartbeat: HeartbeatConfig {
@@ -12952,6 +13023,89 @@ auto_approve = ["my_custom_tool", "another_tool"]
                 "default tool '{default_tool}' must be present in auto_approve even when user provides custom list"
             );
         }
+    }
+
+    // ── Branding (per-instance display name + theme + logo) ──
+
+    #[test]
+    async fn branding_defaults_all_none() {
+        let cfg = BrandingConfig::default();
+        assert!(cfg.display_name.is_none());
+        assert!(cfg.default_color_theme.is_none());
+        assert!(cfg.default_accent.is_none());
+        assert!(cfg.logo_url.is_none());
+    }
+
+    #[test]
+    async fn branding_parses_from_minimal_toml() {
+        let raw = r#"
+default_temperature = 0.7
+
+[branding]
+display_name = "alfred"
+default_color_theme = "kanagawa-wave"
+default_accent = "violet"
+logo_url = "/branding/alfred.png"
+"#;
+        let parsed = parse_test_config(raw);
+        assert_eq!(parsed.branding.display_name.as_deref(), Some("alfred"));
+        assert_eq!(
+            parsed.branding.default_color_theme.as_deref(),
+            Some("kanagawa-wave")
+        );
+        assert_eq!(parsed.branding.default_accent.as_deref(), Some("violet"));
+        assert_eq!(
+            parsed.branding.logo_url.as_deref(),
+            Some("/branding/alfred.png")
+        );
+    }
+
+    #[test]
+    async fn branding_omitted_block_yields_default() {
+        let raw = r#"
+default_temperature = 0.7
+"#;
+        let parsed = parse_test_config(raw);
+        assert!(parsed.branding.display_name.is_none());
+        assert!(parsed.branding.logo_url.is_none());
+    }
+
+    #[test]
+    async fn branding_partial_block_only_fills_provided_fields() {
+        // Operator just wants to rename the instance; logo + theme stay default.
+        let raw = r#"
+default_temperature = 0.7
+
+[branding]
+display_name = "grocery"
+"#;
+        let parsed = parse_test_config(raw);
+        assert_eq!(parsed.branding.display_name.as_deref(), Some("grocery"));
+        assert!(parsed.branding.default_color_theme.is_none());
+        assert!(parsed.branding.default_accent.is_none());
+        assert!(parsed.branding.logo_url.is_none());
+    }
+
+    /// We deliberately accept any string for default_color_theme /
+    /// default_accent — typos in config.toml fall through to hardcoded
+    /// defaults on the dashboard rather than blocking config load.
+    /// This test locks in that lax acceptance so a future "strict
+    /// validation" PR doesn't silently brick deployments.
+    #[test]
+    async fn branding_accepts_unknown_theme_id_without_rejecting_config() {
+        let raw = r#"
+default_temperature = 0.7
+
+[branding]
+default_color_theme = "definitely-not-a-real-theme"
+default_accent = "neon-magenta"
+"#;
+        let parsed = parse_test_config(raw);
+        assert_eq!(
+            parsed.branding.default_color_theme.as_deref(),
+            Some("definitely-not-a-real-theme")
+        );
+        assert_eq!(parsed.branding.default_accent.as_deref(), Some("neon-magenta"));
     }
 
     /// Regression test: empty auto_approve still gets defaults merged.
@@ -13323,6 +13477,7 @@ default_temperature = 0.7
             reliability: ReliabilityConfig::default(),
             scheduler: SchedulerConfig::default(),
             skills: SkillsConfig::default(),
+            branding: BrandingConfig::default(),
             pipeline: PipelineConfig::default(),
             query_classification: QueryClassificationConfig::default(),
             heartbeat: HeartbeatConfig::default(),

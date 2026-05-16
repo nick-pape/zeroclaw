@@ -1,10 +1,14 @@
 import { createContext, useState, useEffect, useCallback, type ReactNode } from 'react';
 import { colorThemeMap, DEFAULT_DARK_THEME, DEFAULT_LIGHT_THEME, type ColorThemeId } from './colorThemes';
+import { useBranding } from './BrandingContext';
 
 // ── Types (was ThemeContextDef.ts) ───────────────────────────────────────────
 
 export type ThemeMode = 'system' | 'dark' | 'light' | 'oled';
-export type AccentColor = 'cyan' | 'violet' | 'emerald' | 'amber' | 'rose' | 'blue';
+// `ha-blue` (#18BCF2) and `heb-red` (#E32219) are brand-derived accents
+// for the homeassistant + heb themes. They're regular accents — any
+// user can pick them from the picker — but the names reflect their origin.
+export type AccentColor = 'cyan' | 'violet' | 'emerald' | 'amber' | 'rose' | 'blue' | 'ha-blue' | 'heb-red';
 export type UiFont = 'system' | 'inter' | 'segoe' | 'sf';
 export type MonoFont = 'jetbrains' | 'fira' | 'cascadia' | 'system-mono';
 
@@ -122,7 +126,7 @@ const DEFAULTS: StoredTheme = {
 };
 
 const validThemes: ThemeMode[] = ['dark', 'light', 'oled', 'system'];
-const validAccents: AccentColor[] = ['cyan', 'violet', 'emerald', 'amber', 'rose', 'blue'];
+const validAccents: AccentColor[] = ['cyan', 'violet', 'emerald', 'amber', 'rose', 'blue', 'ha-blue', 'heb-red'];
 
 function migrateThemeToColorTheme(themeMode: ThemeMode): ColorThemeId {
   switch (themeMode) {
@@ -132,7 +136,37 @@ function migrateThemeToColorTheme(themeMode: ThemeMode): ColorThemeId {
   }
 }
 
-function loadStored(): StoredTheme {
+/// Server-provided defaults from the `[branding]` config block. The
+/// dashboard validates these on apply — unknown theme IDs / accent
+/// names are silently ignored so a typo in `config.toml` can't brick
+/// a deploy. Branding *seeds* first-time visitors; once the user has
+/// touched a theme picker, localStorage wins.
+interface BrandingThemeDefaults {
+  colorTheme?: string | null;
+  accent?: string | null;
+}
+
+/// Build a StoredTheme from DEFAULTS overlaid with whatever branding
+/// supplied (validated). Used as the cold-start fallback when
+/// localStorage is empty / corrupt.
+function brandingFallback(branding?: BrandingThemeDefaults): StoredTheme {
+  let { theme, accent, colorTheme } = DEFAULTS;
+  if (branding?.colorTheme && colorThemeMap[branding.colorTheme as ColorThemeId]) {
+    colorTheme = branding.colorTheme as ColorThemeId;
+    // Sync theme mode to the color theme's scheme so OLED-black stays OLED
+    // and a light color theme implies light mode. Branding doesn't carry
+    // a separate `theme` knob — it's implied by the color theme.
+    if (colorTheme === 'oled-black') theme = 'oled';
+    else if (colorThemeMap[colorTheme].scheme === 'light') theme = 'light';
+    else theme = 'dark';
+  }
+  if (branding?.accent && validAccents.includes(branding.accent as AccentColor)) {
+    accent = branding.accent as AccentColor;
+  }
+  return { ...DEFAULTS, theme, accent, colorTheme };
+}
+
+function loadStored(branding?: BrandingThemeDefaults): StoredTheme {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (raw) {
@@ -156,7 +190,7 @@ function loadStored(): StoredTheme {
       }
     }
   } catch { /* ignore corrupt storage */ }
-  return DEFAULTS;
+  return brandingFallback(branding);
 }
 
 // ── Provider ─────────────────────────────────────────────────────────────────
@@ -185,6 +219,16 @@ const accents: Record<AccentColor, Record<string, string>> = {
   blue: {
     '--pc-accent': '#3b82f6', '--pc-accent-light': '#60a5fa',
     '--pc-accent-dim': 'rgba(59,130,246,0.3)', '--pc-accent-glow': 'rgba(59,130,246,0.1)', '--pc-accent-rgb': '59,130,246',
+  },
+  // Home Assistant's signature primary (`--ha-primary-color`).
+  'ha-blue': {
+    '--pc-accent': '#18BCF2', '--pc-accent-light': '#5dd1ff',
+    '--pc-accent-dim': 'rgba(24,188,242,0.3)', '--pc-accent-glow': 'rgba(24,188,242,0.1)', '--pc-accent-rgb': '24,188,242',
+  },
+  // H-E-B's signature brand red (the storefront / logo / button color).
+  'heb-red': {
+    '--pc-accent': '#E32219', '--pc-accent-light': '#ff4d44',
+    '--pc-accent-dim': 'rgba(227,34,25,0.3)', '--pc-accent-glow': 'rgba(227,34,25,0.1)', '--pc-accent-rgb': '227,34,25',
   },
 };
 
@@ -229,7 +273,16 @@ function fontVars(uiFont: UiFont, monoFont: MonoFont, uiFontSize: number, monoFo
 }
 
 export function ThemeProvider({ children }: { children: ReactNode }) {
-  const [stored] = useState(loadStored);
+  // Branding defaults from the [branding] config block seed first-time
+  // visitors. Once a user touches a theme picker, localStorage wins
+  // and branding is ignored on subsequent loads — config is a default,
+  // not a lock. The useBranding hook returns EMPTY_BRANDING when no
+  // provider is mounted (e.g. some tests), so this is safe everywhere.
+  const branding = useBranding();
+  const [stored] = useState(() => loadStored({
+    colorTheme: branding.defaultColorTheme,
+    accent: branding.defaultAccent,
+  }));
   const [theme, setThemeState] = useState<ThemeMode>(stored.theme);
   const [accent, setAccentState] = useState<AccentColor>(stored.accent);
   const [colorTheme, setColorThemeState] = useState<ColorThemeId>(stored.colorTheme);
