@@ -81,6 +81,18 @@ is 1234 ready to merge
 4. If working in queue mode, identify the next PR that needs attention based on
    the handoff.
 
+### Phase 1.5 — Load architecture review (if available)
+
+Check whether `tmp/arch-review-<number>.md` exists for the target PR. If it
+does, read it — the `pr-architecture-check` skill has already run an advisory
+architecture analysis. Incorporate its findings into your review body as a
+collapsible `<details>` section titled "Architecture Review (advisory)". If
+the file does not exist, do not auto-invoke `pr-architecture-check`.
+
+> **Tip:** If the PR touches core crates (`zeroclaw-api`, `zeroclaw-runtime`,
+> `zeroclaw-gateway`, `zeroclaw-plugins`), consider running `arch-check #<N>`
+> first to get an architecture analysis before starting your review.
+
 ### Phase 2 — Execute the protocol
 
 Follow `docs/book/src/contributing/pr-review-protocol.md` exactly for every PR.
