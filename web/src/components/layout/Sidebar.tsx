@@ -14,6 +14,7 @@ import {
 import { t } from '@/lib/i18n';
 import { useEffect, useState } from 'react';
 import { getStatus } from '@/lib/api';
+import { useBranding } from '@/contexts/BrandingContext';
 
 interface NavItem {
   to: string;
@@ -160,6 +161,11 @@ export default function Sidebar({ open, onClose, collapsed }: SidebarProps) {
 // Extracted sub-components to keep markup DRY
 
 function SidebarLogo({ collapsed }: { collapsed: boolean }) {
+  // Per-instance branding from the [branding] config block.
+  // Falls back to "ZeroClaw" + default crab logo when unset.
+  const { displayName, logoUrl } = useBranding();
+  const name = displayName ?? 'ZeroClaw';
+  const src = logoUrl ?? `${basePath}/_app/zeroclaw-trans.png`;
   return (
     <div
       className="flex items-center border-b shrink-0 overflow-hidden"
@@ -173,8 +179,8 @@ function SidebarLogo({ collapsed }: { collapsed: boolean }) {
       <div className="relative shrink-0">
         <div className="absolute -inset-1.5 rounded-xl" style={{ background: 'linear-gradient(135deg, rgba(var(--pc-accent-rgb), 0.15), rgba(var(--pc-accent-rgb), 0.05))' }} />
         <img
-          src={`${basePath}/_app/zeroclaw-trans.png`}
-          alt="ZeroClaw"
+          src={src}
+          alt={name}
           className="relative h-9 w-9 rounded-xl object-cover"
           onError={(e) => {
             e.currentTarget.style.display = 'none';
@@ -189,7 +195,7 @@ function SidebarLogo({ collapsed }: { collapsed: boolean }) {
           pointerEvents: collapsed ? 'none' : 'auto',
         }}
       >
-        ZeroClaw
+        {name}
       </span>
     </div>
   );
@@ -197,6 +203,10 @@ function SidebarLogo({ collapsed }: { collapsed: boolean }) {
 
 function SidebarFooter({ collapsed, layout }: { collapsed: boolean; layout: 'desktop' | 'mobile' }) {
   const [version, setVersion] = useState<string | null>(null);
+  // Branded footer: "<name> Gateway v0.7.5" instead of "ZeroClaw Gateway".
+  // For unbranded deployments this still renders "ZeroClaw Gateway".
+  const { displayName } = useBranding();
+  const footer = `${displayName ?? 'ZeroClaw'} Gateway`;
 
   useEffect(() => {
     getStatus()
@@ -210,7 +220,7 @@ function SidebarFooter({ collapsed, layout }: { collapsed: boolean; layout: 'des
         className="px-5 py-4 border-t text-[10px] uppercase tracking-wider"
         style={{ borderColor: 'var(--pc-border)', color: 'var(--pc-text-faint)' }}
       >
-        ZeroClaw Gateway
+        {footer}
         {version && (
           <div className="mt-0.5 normal-case tracking-normal" style={{ fontSize: '9px' }}>
             v{version}
@@ -233,7 +243,7 @@ function SidebarFooter({ collapsed, layout }: { collapsed: boolean; layout: 'des
         textAlign: collapsed ? 'center' : 'left',
       }}
     >
-      {!collapsed && 'ZeroClaw Gateway'}
+      {!collapsed && footer}
       {!collapsed && version && (
         <div style={{ marginTop: '2px', fontSize: '9px', textTransform: 'none', letterSpacing: 'normal' }}>
           v{version}

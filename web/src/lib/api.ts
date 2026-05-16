@@ -168,6 +168,23 @@ export async function getPublicHealth(): Promise<{ require_pairing: boolean; pai
 }
 
 // ---------------------------------------------------------------------------
+// Branding (no auth required) — read pre-pairing so the pairing dialog can
+// show the configured display name + logo before the user enters a code.
+// Mirrors the Rust BrandingConfig in crates/zeroclaw-config/src/schema.rs.
+// ---------------------------------------------------------------------------
+
+import type { BrandingResponse } from '../contexts/BrandingContext';
+export type { BrandingResponse };
+
+export async function getBranding(): Promise<BrandingResponse> {
+  const response = await fetch(`${basePath}/api/branding`);
+  if (!response.ok) {
+    throw new Error(`Branding fetch failed (${response.status})`);
+  }
+  return response.json() as Promise<BrandingResponse>;
+}
+
+// ---------------------------------------------------------------------------
 // Status / Health
 // ---------------------------------------------------------------------------
 
