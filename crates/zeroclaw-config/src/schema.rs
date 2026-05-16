@@ -1616,10 +1616,6 @@ pub struct AgentConfig {
     #[serde(default)]
     pub history_pruning: crate::scattered_types::HistoryPrunerConfig,
 
-    /// Enable context-aware tool filtering (only surface relevant tools per iteration).
-    #[serde(default)]
-    pub context_aware_tools: bool,
-
     /// Post-response quality evaluator configuration.
     #[nested]
     #[serde(default)]
@@ -1701,7 +1697,6 @@ impl Default for AgentConfig {
             max_system_prompt_chars: default_max_system_prompt_chars(),
             thinking: crate::scattered_types::ThinkingConfig::default(),
             history_pruning: crate::scattered_types::HistoryPrunerConfig::default(),
-            context_aware_tools: false,
             eval: crate::scattered_types::EvalConfig::default(),
             auto_classify: None,
             context_compression: crate::scattered_types::ContextCompressionConfig::default(),
