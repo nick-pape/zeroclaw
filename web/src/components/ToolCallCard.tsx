@@ -6,6 +6,10 @@ import {
 } from 'lucide-react';
 
 export interface ToolCallInfo {
+  /// Correlation id from the gateway's TurnEvent::ToolCall/ToolResult pair.
+  /// Optional for backward compat with persisted cards from before this
+  /// field was added — those fall through to first-pending matching.
+  id?: string;
   name: string;
   args?: unknown;
   output?: string;       // undefined = executing; string = completed

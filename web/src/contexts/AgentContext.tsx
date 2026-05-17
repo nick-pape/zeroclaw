@@ -210,8 +210,22 @@ export function AgentProvider({ children }: { children: React.ReactNode }) {
       case 'tool_call': {
         const toolName = msg.name ?? 'unknown';
         const toolArgs = msg.args;
+        // `id` is the gateway's correlation id (see crates/zeroclaw-api/src/agent.rs
+        // TurnEvent::ToolCall.id). Tracked here so the matching `tool_result`
+        // can find this card by id instead of the legacy "first-pending"
+        // heuristic. Optional because older frames pre-dating this field
+        // arrive without one — those fall back to first-pending.
+        const toolId = typeof msg.id === 'string' ? msg.id : undefined;
         localMessageMutationVersionRef.current += 1;
         setMessages((prev) => {
+          // Strict id-based dedup: if an in-flight or resolved card with
+          // this id already exists, drop. Prevents the "two pending cards
+          // for one logical call" race when upstream emits ToolCall twice
+          // (PreExecuted streaming path AND dispatcher path firing for
+          // the same call — see agent.rs:1527 vs 1688).
+          if (toolId && prev.some((m) => m.toolCall?.id === toolId)) {
+            return prev;
+          }
           const argsKey = JSON.stringify(toolArgs ?? {});
           if (pendingContentRef.current) {
             const isDuplicate = prev.some(
@@ -229,7 +243,7 @@ export function AgentProvider({ children }: { children: React.ReactNode }) {
               id: generateUUID(),
               role: 'agent' as const,
               content: `${t('agent.tool_call_prefix')} ${toolName}(${argsKey})`,
-              toolCall: { name: toolName, args: toolArgs },
+              toolCall: { id: toolId, name: toolName, args: toolArgs },
               timestamp: new Date(),
             },
           ];
@@ -238,28 +252,68 @@ export function AgentProvider({ children }: { children: React.ReactNode }) {
       }
 
       case 'tool_result': {
+        // Three-tier matching, in order of strictness:
+        //   1. By `id` (the gateway's TurnEvent correlation id — strict,
+        //      handles parallel tool calls and duplicate-result emission)
+        //   2. By first-pending (the legacy heuristic, kept for backward
+        //      compat with cards persisted before id tracking landed)
+        //   3. Drop silently — a result with no matching pending is noise.
+        //      The legacy "unknown" orphan card it used to create caused
+        //      visual phantoms on every duplicate-result emission upstream
+        //      (e.g., approval flow + AlwaysApprove edge cases). Drop instead.
+        const resultId = typeof msg.id === 'string' ? msg.id : undefined;
+        const resultOutput = msg.output ?? '';
         localMessageMutationVersionRef.current += 1;
         setMessages((prev) => {
-          const idx = prev.findIndex((m) => m.toolCall && m.toolCall.output === undefined);
+          // Tier 1: id match (any state).
+          if (resultId) {
+            const idx = prev.findIndex((m) => m.toolCall?.id === resultId);
+            if (idx !== -1) {
+              const existing = prev[idx]!;
+              // Idempotent: if this card already has output, the upstream
+              // re-emitted the result. Drop silently to avoid overwriting
+              // with stale data, and to not double-trigger any side effects.
+              if (existing.toolCall?.output !== undefined) {
+                if (typeof console !== 'undefined') {
+                  console.warn(
+                    '[ZeroClaw] dropping duplicate tool_result for id',
+                    resultId,
+                  );
+                }
+                return prev;
+              }
+              const updated = [...prev];
+              updated[idx] = {
+                ...existing,
+                toolCall: { ...existing.toolCall!, output: resultOutput },
+              };
+              return updated;
+            }
+          }
+          // Tier 2: first-pending fallback (only for cards with no id —
+          // i.e. localStorage hydration from before this fix shipped).
+          const idx = prev.findIndex(
+            (m) => m.toolCall
+              && m.toolCall.output === undefined
+              && m.toolCall.id === undefined,
+          );
           if (idx !== -1) {
-            const updated = [...prev];
             const existing = prev[idx]!;
+            const updated = [...prev];
             updated[idx] = {
               ...existing,
-              toolCall: { ...existing.toolCall!, output: msg.output ?? '' },
+              toolCall: { ...existing.toolCall!, output: resultOutput },
             };
             return updated;
           }
-          return [
-            ...prev,
-            {
-              id: generateUUID(),
-              role: 'agent' as const,
-              content: `${t('agent.tool_result_prefix')} ${msg.output ?? ''}`,
-              toolCall: { name: msg.name ?? 'unknown', output: msg.output ?? '' },
-              timestamp: new Date(),
-            },
-          ];
+          // Tier 3: drop. Was previously creating an "unknown" phantom card.
+          if (typeof console !== 'undefined') {
+            console.warn(
+              '[ZeroClaw] dropping orphan tool_result (no matching pending tool_call)',
+              { id: resultId, name: msg.name },
+            );
+          }
+          return prev;
         });
         break;
       }
