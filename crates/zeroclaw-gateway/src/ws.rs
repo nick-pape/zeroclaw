@@ -739,6 +739,21 @@ async fn process_chat_message(
     // the timeout fired.
     let forward_fut = async {
         let mut cancel_drained = false;
+        // Per-turn dedup against duplicate TurnEvent emission. The agent
+        // runtime has two parallel emit paths — the streamed
+        // `PreExecutedToolCall`/`PreExecutedToolResult` events at
+        // `agent.rs:1527`/`1544`, and the dispatched
+        // `ToolCall`/`ToolResult` events at `agent.rs:1688`/`1702`. When
+        // both fire for the same logical call (e.g. AlwaysApprove flows
+        // and certain openai-compatible streaming providers), the
+        // frontend previously rendered an orphan "unknown" phantom card
+        // for the second `ToolResult`. Per-id dedup at the gateway is
+        // belt+suspenders to the frontend id-match — old clients that
+        // don't carry the fix still won't see phantoms. forward_fut
+        // lives for exactly one turn, so per-closure-scope sets are
+        // naturally per-turn (no manual clear needed).
+        let mut seen_call_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut seen_result_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
         loop {
             tokio::select! {
                 biased;
@@ -858,9 +873,26 @@ async fn process_chat_message(
                             serde_json::json!({ "type": "thinking", "content": delta })
                         }
                         TurnEvent::ToolCall { id, name, args } => {
+                            if !seen_call_ids.insert(id.clone()) {
+                                tracing::warn!(
+                                    id = %id,
+                                    name = %name,
+                                    "dropping duplicate TurnEvent::ToolCall (already forwarded this turn)",
+                                );
+                                continue;
+                            }
                             serde_json::json!({ "type": "tool_call", "id": id, "name": name, "args": args })
                         }
                         TurnEvent::ToolResult { id, name, output } => {
+                            if !seen_result_ids.insert(id.clone()) {
+                                tracing::warn!(
+                                    id = %id,
+                                    name = %name,
+                                    "dropping duplicate TurnEvent::ToolResult (already forwarded this turn) \
+                                     — this is the upstream double-emit bug between agent.rs:1544 and :1702",
+                                );
+                                continue;
+                            }
                             serde_json::json!({ "type": "tool_result", "id": id, "name": name, "output": output })
                         }
                         TurnEvent::ApprovalRequest {

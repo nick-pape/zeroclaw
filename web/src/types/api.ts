@@ -152,6 +152,14 @@ export interface WsMessage {
     | 'aborted';
   content?: string;
   full_response?: string;
+  /**
+   * Correlation id from the gateway's TurnEvent::ToolCall/ToolResult pair
+   * (set on `type: 'tool_call'` and `type: 'tool_result'` frames). Used by
+   * AgentContext to strictly match results to their pending calls instead
+   * of the legacy first-pending heuristic, and to deduplicate accidental
+   * upstream double-emission of the same result.
+   */
+  id?: string;
   name?: string;
   args?: any;
   output?: string;
