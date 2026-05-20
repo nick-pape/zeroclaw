@@ -5549,6 +5549,16 @@ fn collect_configured_channels(
         if !sig.enabled {
             continue;
         }
+        if sig.http_url.trim().is_empty() || sig.account.trim().is_empty() {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({ "channel_alias": format!("signal.{alias}") })),
+                "Signal channel is enabled but http_url or account is empty; skipping channel (would otherwise crashloop the supervisor). Set http_url and account under [channels.signal.<alias>]."
+            );
+            continue;
+        }
         let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
             let cfg_arc = config_arc.clone();
             let alias = alias.clone();
@@ -6194,6 +6204,19 @@ fn collect_configured_channels(
             continue;
         }
         if !vc.enabled {
+            continue;
+        }
+        if vc.account_id.trim().is_empty()
+            || vc.auth_token.trim().is_empty()
+            || vc.from_number.trim().is_empty()
+        {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({ "channel_alias": format!("voice_call.{alias}") })),
+                "Voice Call channel is enabled but account_id, auth_token, or from_number is empty; skipping channel (would otherwise crashloop the supervisor). Set these under [channels.voice_call.<alias>]."
+            );
             continue;
         }
         channels.push(ConfiguredChannel {
