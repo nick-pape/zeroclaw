@@ -148,16 +148,23 @@ pub fn apply_policy_tool_filter(
 /// Returns the subset of `tool_specs` that should be sent to the LLM for this turn.
 ///
 /// Rules (mirrors NullClaw `filterToolSpecsForTurn`):
-/// - Built-in tools (names that do not start with `"mcp_"`) always pass through.
+/// - Tools not in `mcp_tool_names` (built-ins and skills) always pass through.
 /// - When `groups` is empty, all tools pass through (backward compatible default).
 /// - An MCP tool is included if at least one group matches it:
 ///   - `always` group: included unconditionally if any pattern matches the tool name.
 ///   - `dynamic` group: included if any pattern matches AND the user message contains
 ///     at least one keyword (case-insensitive substring).
+///
+/// `mcp_tool_names` is the set of real MCP tool names sourced from the MCP
+/// registry / deferred MCP set. Classification is by **origin, not name shape**:
+/// skill tools are also named `<skill>__<tool>` (see `tools/skill_tool.rs`), so a
+/// `contains("__")` heuristic would wrongly filter them. Only registry-sourced MCP
+/// tools are subject to `tool_filter_groups`; builtins and skills always pass.
 pub fn filter_tool_specs_for_turn(
     tool_specs: Vec<crate::tools::ToolSpec>,
     groups: &[zeroclaw_config::schema::ToolFilterGroup],
     user_message: &str,
+    mcp_tool_names: &std::collections::HashSet<String>,
 ) -> Vec<crate::tools::ToolSpec> {
     use zeroclaw_config::schema::ToolFilterGroupMode;
 
@@ -170,8 +177,9 @@ pub fn filter_tool_specs_for_turn(
     tool_specs
         .into_iter()
         .filter(|spec| {
-            // Built-in tools always pass through.
-            if !spec.name.starts_with("mcp_") {
+            // Only tools that come from the MCP registry are subject to filtering;
+            // built-ins and skills (also `<x>__<y>`) always pass through.
+            if !mcp_tool_names.contains(&spec.name) {
                 return true;
             }
             // MCP tool: include if any active group matches.
@@ -190,6 +198,60 @@ pub fn filter_tool_specs_for_turn(
             })
         })
         .collect()
+}
+
+/// Pre-activate deferred MCP stubs matched by any `tool_filter_groups` entry
+/// with `mode = "always"`, returning the number newly activated.
+///
+/// Under `mcp.deferred_loading = true`, MCP tools start out as unloaded stubs;
+/// the agent must call `tool_search` to bring them into the activated set
+/// before the LLM sees their schemas. Users who configure
+/// `tool_filter_groups.mode = "always"` expect the listed tools to be
+/// available without that round-trip — that's the whole semantic of the
+/// `always` mode. Calling this at startup honors that promise.
+///
+/// Composes with `filter_tool_specs_for_turn`: that filter decides which
+/// activated tools to surface per turn; this function decides which stubs
+/// are activated in the first place. Without this pre-pass the prefix-fix
+/// in `filter_tool_specs_for_turn` had nothing to filter under deferred
+/// loading — the activated set was empty until the LLM searched.
+pub fn preactivate_filter_groups_always(
+    deferred: &crate::tools::DeferredMcpToolSet,
+    activated: &std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>,
+    groups: &[zeroclaw_config::schema::ToolFilterGroup],
+) -> usize {
+    use zeroclaw_config::schema::ToolFilterGroupMode;
+
+    let always_patterns: Vec<&str> = groups
+        .iter()
+        .filter(|g| matches!(g.mode, ToolFilterGroupMode::Always))
+        .flat_map(|g| g.tools.iter().map(String::as_str))
+        .collect();
+    if always_patterns.is_empty() {
+        return 0;
+    }
+
+    let mut activated_count = 0usize;
+    let mut guard = match activated.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    for stub in &deferred.stubs {
+        if guard.is_activated(&stub.prefixed_name) {
+            continue;
+        }
+        let matched = always_patterns
+            .iter()
+            .any(|pat| glob_match(pat, &stub.prefixed_name));
+        if !matched {
+            continue;
+        }
+        if let Some(tool) = deferred.activate(&stub.prefixed_name) {
+            guard.activate(stub.prefixed_name.clone(), std::sync::Arc::from(tool));
+            activated_count += 1;
+        }
+    }
+    activated_count
 }
 
 /// Filters a tool spec list by an optional capability allowlist.
@@ -249,6 +311,7 @@ fn compute_excluded_mcp_tools(
     tools_registry: &[Box<dyn Tool>],
     groups: &[zeroclaw_config::schema::ToolFilterGroup],
     user_message: &str,
+    mcp_tool_names: &std::collections::HashSet<String>,
 ) -> Vec<String> {
     if groups.is_empty() {
         return Vec::new();
@@ -257,11 +320,12 @@ fn compute_excluded_mcp_tools(
         tools_registry.iter().map(|t| t.spec()).collect(),
         groups,
         user_message,
+        mcp_tool_names,
     );
     let included: HashSet<&str> = filtered_specs.iter().map(|s| s.name.as_str()).collect();
     tools_registry
         .iter()
-        .filter(|t| t.name().starts_with("mcp_") && !included.contains(t.name()))
+        .filter(|t| mcp_tool_names.contains(t.name()) && !included.contains(t.name()))
         .map(|t| t.name().to_string())
         .collect()
 }
@@ -2532,6 +2596,10 @@ pub async fn run(
         let mut activated_handle: Option<
             std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>,
         > = None;
+        // Real MCP tool names (from the registry) — the origin signal for
+        // tool_filter_groups, so skills (also `<x>__<y>`) are never filtered.
+        let mut mcp_tool_names: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
         if config.mcp.enabled && !config.mcp.servers.is_empty() {
             ::zeroclaw_log::record!(
                 INFO,
@@ -2544,6 +2612,7 @@ pub async fn run(
             match crate::tools::McpRegistry::connect_all(&config.mcp.servers).await {
                 Ok(registry) => {
                     let registry = std::sync::Arc::new(registry);
+                    mcp_tool_names.extend(registry.tool_names());
                     if config.mcp.deferred_loading {
                         // Deferred path: build stubs and register tool_search
                         let deferred_set = crate::tools::DeferredMcpToolSet::from_registry(
@@ -2568,6 +2637,26 @@ pub async fn run(
                             crate::tools::ActivatedToolSet::new(),
                         ));
                         activated_handle = Some(std::sync::Arc::clone(&activated));
+                        // Honor `tool_filter_groups.mode = "always"` under deferred
+                        // loading: pre-activate matched stubs so the LLM doesn't have
+                        // to tool_search for tools the user declared always-on.
+                        let preactivated = preactivate_filter_groups_always(
+                            &deferred_set,
+                            &activated,
+                            &agent.tool_filter_groups,
+                        );
+                        if preactivated > 0 {
+                            ::zeroclaw_log::record!(
+                                INFO,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                ),
+                                &format!(
+                                    "MCP deferred: pre-activated {preactivated} tool(s) via tool_filter_groups.always"
+                                )
+                            );
+                        }
                         tools_registry.push(Box::new(crate::tools::ToolSearchTool::new(
                             deferred_set,
                             activated,
@@ -3024,6 +3113,7 @@ pub async fn run(
                 &tools_registry,
                 &agent.tool_filter_groups,
                 &effective_msg,
+                &mcp_tool_names,
             );
 
             #[allow(unused_assignments)]
@@ -3371,6 +3461,7 @@ pub async fn run(
                     &tools_registry,
                     &agent.tool_filter_groups,
                     &effective_input,
+                    &mcp_tool_names,
                 );
 
                 // Set up streaming channel so tool progress and response
@@ -3781,6 +3872,10 @@ pub async fn process_message(
         let mut activated_handle_pm: Option<
             std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>,
         > = None;
+        // Real MCP tool names (from the registry) — the origin signal for
+        // tool_filter_groups, so skills (also `<x>__<y>`) are never filtered.
+        let mut mcp_tool_names: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
         if config.mcp.enabled && !config.mcp.servers.is_empty() {
             ::zeroclaw_log::record!(
                 INFO,
@@ -3793,6 +3888,7 @@ pub async fn process_message(
             match crate::tools::McpRegistry::connect_all(&config.mcp.servers).await {
                 Ok(registry) => {
                     let registry = std::sync::Arc::new(registry);
+                    mcp_tool_names.extend(registry.tool_names());
                     if config.mcp.deferred_loading {
                         let deferred_set = crate::tools::DeferredMcpToolSet::from_registry(
                             std::sync::Arc::clone(&registry),
@@ -3816,6 +3912,26 @@ pub async fn process_message(
                             crate::tools::ActivatedToolSet::new(),
                         ));
                         activated_handle_pm = Some(std::sync::Arc::clone(&activated));
+                        // Honor `tool_filter_groups.mode = "always"` under deferred
+                        // loading: pre-activate matched stubs so the LLM doesn't have
+                        // to tool_search for tools the user declared always-on.
+                        let preactivated = preactivate_filter_groups_always(
+                            &deferred_set,
+                            &activated,
+                            &agent.tool_filter_groups,
+                        );
+                        if preactivated > 0 {
+                            ::zeroclaw_log::record!(
+                                INFO,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                ),
+                                &format!(
+                                    "MCP deferred: pre-activated {preactivated} tool(s) via tool_filter_groups.always"
+                                )
+                            );
+                        }
                         tools_registry.push(Box::new(crate::tools::ToolSearchTool::new(
                             deferred_set,
                             activated,
@@ -4105,6 +4221,7 @@ pub async fn process_message(
             &tools_registry,
             &agent.tool_filter_groups,
             effective_msg_ref,
+            &mcp_tool_names,
         );
         {
             let active_profile = &risk_profile;
@@ -8199,14 +8316,26 @@ Let me check the result."#;
         }
     }
 
+    // Tools are classified as MCP by ORIGIN — membership in the MCP name set
+    // passed to the gate — not by name shape. Skills are also `<skill>__<tool>`
+    // (see tools/skill_tool.rs), so a name-shape check would wrongly filter them.
+    fn mcp_set(names: &[&str]) -> std::collections::HashSet<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
     #[test]
     fn filter_tool_specs_no_groups_returns_all() {
         let specs = vec![
             make_spec("shell_exec"),
-            make_spec("mcp_browser_navigate"),
-            make_spec("mcp_filesystem_read"),
+            make_spec("browser__navigate"),
+            make_spec("filesystem__read_file"),
         ];
-        let result = filter_tool_specs_for_turn(specs, &[], "hello");
+        let result = filter_tool_specs_for_turn(
+            specs,
+            &[],
+            "hello",
+            &mcp_set(&["browser__navigate", "filesystem__read_file"]),
+        );
         assert_eq!(result.len(), 3);
     }
 
@@ -8216,70 +8345,244 @@ Let me check the result."#;
 
         let specs = vec![
             make_spec("shell_exec"),
-            make_spec("mcp_browser_navigate"),
-            make_spec("mcp_filesystem_read"),
+            make_spec("browser__navigate"),
+            make_spec("filesystem__read_file"),
         ];
         let groups = vec![ToolFilterGroup {
             mode: ToolFilterGroupMode::Always,
-            tools: vec!["mcp_filesystem_*".into()],
+            tools: vec!["filesystem__*".into()],
             keywords: vec![],
-            filter_builtins: false,
         }];
-        let result = filter_tool_specs_for_turn(specs, &groups, "anything");
+        let result = filter_tool_specs_for_turn(
+            specs,
+            &groups,
+            "anything",
+            &mcp_set(&["browser__navigate", "filesystem__read_file"]),
+        );
         let names: Vec<&str> = result.iter().map(|s| s.name.as_str()).collect();
         // Built-in passes through, matched MCP passes, unmatched MCP excluded.
         assert!(names.contains(&"shell_exec"));
-        assert!(names.contains(&"mcp_filesystem_read"));
-        assert!(!names.contains(&"mcp_browser_navigate"));
+        assert!(names.contains(&"filesystem__read_file"));
+        assert!(!names.contains(&"browser__navigate"));
     }
 
     #[test]
     fn filter_tool_specs_dynamic_group_included_on_keyword_match() {
         use zeroclaw_config::schema::{ToolFilterGroup, ToolFilterGroupMode};
 
-        let specs = vec![make_spec("shell_exec"), make_spec("mcp_browser_navigate")];
+        let specs = vec![make_spec("shell_exec"), make_spec("browser__navigate")];
         let groups = vec![ToolFilterGroup {
             mode: ToolFilterGroupMode::Dynamic,
-            tools: vec!["mcp_browser_*".into()],
+            tools: vec!["browser__*".into()],
             keywords: vec!["browse".into(), "website".into()],
-            filter_builtins: false,
         }];
-        let result = filter_tool_specs_for_turn(specs, &groups, "please browse this page");
+        let result = filter_tool_specs_for_turn(
+            specs,
+            &groups,
+            "please browse this page",
+            &mcp_set(&["browser__navigate"]),
+        );
         let names: Vec<&str> = result.iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"shell_exec"));
-        assert!(names.contains(&"mcp_browser_navigate"));
+        assert!(names.contains(&"browser__navigate"));
     }
 
     #[test]
     fn filter_tool_specs_dynamic_group_excluded_on_no_keyword_match() {
         use zeroclaw_config::schema::{ToolFilterGroup, ToolFilterGroupMode};
 
-        let specs = vec![make_spec("shell_exec"), make_spec("mcp_browser_navigate")];
+        let specs = vec![make_spec("shell_exec"), make_spec("browser__navigate")];
         let groups = vec![ToolFilterGroup {
             mode: ToolFilterGroupMode::Dynamic,
-            tools: vec!["mcp_browser_*".into()],
+            tools: vec!["browser__*".into()],
             keywords: vec!["browse".into(), "website".into()],
-            filter_builtins: false,
         }];
-        let result = filter_tool_specs_for_turn(specs, &groups, "read the file /etc/hosts");
+        let result = filter_tool_specs_for_turn(
+            specs,
+            &groups,
+            "read the file /etc/hosts",
+            &mcp_set(&["browser__navigate"]),
+        );
         let names: Vec<&str> = result.iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"shell_exec"));
-        assert!(!names.contains(&"mcp_browser_navigate"));
+        assert!(!names.contains(&"browser__navigate"));
     }
 
     #[test]
     fn filter_tool_specs_dynamic_keyword_match_is_case_insensitive() {
         use zeroclaw_config::schema::{ToolFilterGroup, ToolFilterGroupMode};
 
-        let specs = vec![make_spec("mcp_browser_navigate")];
+        let specs = vec![make_spec("browser__navigate")];
         let groups = vec![ToolFilterGroup {
             mode: ToolFilterGroupMode::Dynamic,
-            tools: vec!["mcp_browser_*".into()],
+            tools: vec!["browser__*".into()],
             keywords: vec!["Browse".into()],
-            filter_builtins: false,
         }];
-        let result = filter_tool_specs_for_turn(specs, &groups, "BROWSE the site");
+        let result = filter_tool_specs_for_turn(
+            specs,
+            &groups,
+            "BROWSE the site",
+            &mcp_set(&["browser__navigate"]),
+        );
         assert_eq!(result.len(), 1);
+    }
+
+    /// Regression: a group with no matching MCP tool MUST exclude all MCP tools
+    /// (origin-based), not let them pass as if they were builtins.
+    #[test]
+    fn filter_tool_specs_real_mcp_names_are_filtered() {
+        use zeroclaw_config::schema::{ToolFilterGroup, ToolFilterGroupMode};
+
+        let specs = vec![
+            make_spec("shell_exec"),               // builtin
+            make_spec("homeassistant__get_state"), // real MCP
+            make_spec("myserver__list_files"),     // real MCP
+        ];
+        let groups = vec![ToolFilterGroup {
+            mode: ToolFilterGroupMode::Always,
+            tools: vec!["homeassistant__*".into()],
+            keywords: vec![],
+        }];
+        let result = filter_tool_specs_for_turn(
+            specs,
+            &groups,
+            "anything",
+            &mcp_set(&["homeassistant__get_state", "myserver__list_files"]),
+        );
+        let names: Vec<&str> = result.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"shell_exec"));
+        assert!(names.contains(&"homeassistant__get_state"));
+        assert!(!names.contains(&"myserver__list_files"));
+    }
+
+    /// Origin-based regression: skill tools are ALSO named `<skill>__<tool>`,
+    /// but they are NOT in the MCP name set, so `tool_filter_groups` (an
+    /// MCP-only feature) must never filter them out — while a real MCP tool with
+    /// no matching group is still excluded.
+    #[test]
+    fn filter_tool_specs_skill_tool_not_filtered() {
+        use zeroclaw_config::schema::{ToolFilterGroup, ToolFilterGroupMode};
+
+        let specs = vec![
+            make_spec("shell_exec"),               // builtin
+            make_spec("pdf_skill__extract"),       // skill: has `__` but NOT MCP
+            make_spec("homeassistant__get_state"), // real MCP, matches group
+            make_spec("myserver__list_files"),     // real MCP, no match
+        ];
+        let groups = vec![ToolFilterGroup {
+            mode: ToolFilterGroupMode::Always,
+            tools: vec!["homeassistant__*".into()],
+            keywords: vec![],
+        }];
+        // Only the real MCP tools are in the origin set; the skill is not.
+        let result = filter_tool_specs_for_turn(
+            specs,
+            &groups,
+            "anything",
+            &mcp_set(&["homeassistant__get_state", "myserver__list_files"]),
+        );
+        let names: Vec<&str> = result.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"shell_exec"));
+        // The skill passes through despite its `__` — it is not an MCP tool.
+        assert!(names.contains(&"pdf_skill__extract"));
+        assert!(names.contains(&"homeassistant__get_state"));
+        // A real MCP tool with no matching group is still excluded.
+        assert!(!names.contains(&"myserver__list_files"));
+    }
+
+    // ── preactivate_filter_groups_always tests ────────────────
+
+    /// Builds an in-memory DeferredMcpToolSet with the given stub names so
+    /// preactivate_* can be tested without a real MCP server connection.
+    async fn make_deferred_set_with_stubs(names: &[&str]) -> crate::tools::DeferredMcpToolSet {
+        use zeroclaw_tools::mcp_deferred::DeferredMcpToolStub;
+        use zeroclaw_tools::mcp_protocol::McpToolDef;
+        let registry =
+            std::sync::Arc::new(crate::tools::McpRegistry::connect_all(&[]).await.unwrap());
+        let stubs = names
+            .iter()
+            .map(|name| {
+                let def = McpToolDef {
+                    name: (*name).to_string(),
+                    description: Some(format!("deferred stub for {name}")),
+                    input_schema: serde_json::json!({"type": "object", "properties": {}}),
+                };
+                DeferredMcpToolStub::new((*name).to_string(), def)
+            })
+            .collect();
+        crate::tools::DeferredMcpToolSet { stubs, registry }
+    }
+
+    #[tokio::test]
+    async fn preactivate_always_group_activates_matched_stubs() {
+        use zeroclaw_config::schema::{ToolFilterGroup, ToolFilterGroupMode};
+
+        let deferred = make_deferred_set_with_stubs(&[
+            "homeassistant__get_state",
+            "homeassistant__call_service",
+            "myserver__list_files",
+        ])
+        .await;
+        let activated =
+            std::sync::Arc::new(std::sync::Mutex::new(crate::tools::ActivatedToolSet::new()));
+        let groups = vec![ToolFilterGroup {
+            mode: ToolFilterGroupMode::Always,
+            tools: vec!["homeassistant__*".into()],
+            keywords: vec![],
+        }];
+
+        let count = preactivate_filter_groups_always(&deferred, &activated, &groups);
+        assert_eq!(count, 2);
+        let guard = activated.lock().unwrap();
+        assert!(guard.is_activated("homeassistant__get_state"));
+        assert!(guard.is_activated("homeassistant__call_service"));
+        assert!(
+            !guard.is_activated("myserver__list_files"),
+            "non-matching stubs must not be pre-activated"
+        );
+    }
+
+    #[tokio::test]
+    async fn preactivate_skips_dynamic_groups() {
+        use zeroclaw_config::schema::{ToolFilterGroup, ToolFilterGroupMode};
+
+        let deferred = make_deferred_set_with_stubs(&["homeassistant__get_state"]).await;
+        let activated =
+            std::sync::Arc::new(std::sync::Mutex::new(crate::tools::ActivatedToolSet::new()));
+        let groups = vec![ToolFilterGroup {
+            mode: ToolFilterGroupMode::Dynamic,
+            tools: vec!["homeassistant__*".into()],
+            keywords: vec!["whatever".into()],
+        }];
+
+        let count = preactivate_filter_groups_always(&deferred, &activated, &groups);
+        // dynamic groups are turn-time-only; never pre-activated at startup.
+        assert_eq!(count, 0);
+        assert!(
+            !activated
+                .lock()
+                .unwrap()
+                .is_activated("homeassistant__get_state")
+        );
+    }
+
+    #[tokio::test]
+    async fn preactivate_is_idempotent_on_repeat_call() {
+        use zeroclaw_config::schema::{ToolFilterGroup, ToolFilterGroupMode};
+
+        let deferred = make_deferred_set_with_stubs(&["homeassistant__get_state"]).await;
+        let activated =
+            std::sync::Arc::new(std::sync::Mutex::new(crate::tools::ActivatedToolSet::new()));
+        let groups = vec![ToolFilterGroup {
+            mode: ToolFilterGroupMode::Always,
+            tools: vec!["homeassistant__*".into()],
+            keywords: vec![],
+        }];
+
+        let first = preactivate_filter_groups_always(&deferred, &activated, &groups);
+        let second = preactivate_filter_groups_always(&deferred, &activated, &groups);
+        assert_eq!(first, 1);
+        assert_eq!(second, 0, "already-activated stubs must not double-count");
     }
 
     // ── Token-based compaction tests ──────────────────────────
