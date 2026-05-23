@@ -150,28 +150,50 @@ impl RetrievalPipeline {
         {
             Ok(r) => r,
             Err(e) => {
-                tracing::warn!("reranker request failed: {e}");
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": e.to_string()})),
+                    "reranker request failed"
+                );
                 return results;
             }
         };
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            tracing::warn!("reranker returned {status}: {text}");
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"status": status.as_u16(), "body": text})),
+                "reranker returned non-success status"
+            );
             return results;
         }
         let parsed: RerankResponse = match resp.json().await {
             Ok(r) => r,
             Err(e) => {
-                tracing::warn!("reranker response parse failed: {e}");
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": e.to_string()})),
+                    "reranker response parse failed"
+                );
                 return results;
             }
         };
 
-        tracing::debug!(
-            "reranker returned {} scored results for {} candidates",
-            parsed.results.len(),
-            results.len(),
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({
+                    "scored": parsed.results.len(),
+                    "candidates": results.len(),
+                })),
+            "reranker returned scored results"
         );
         reorder_by_rerank(results, &parsed.results)
     }

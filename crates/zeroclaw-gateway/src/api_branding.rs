@@ -10,7 +10,7 @@
 //!   `/api/config/prop` machinery and require auth like every other
 //!   config write.
 //! - `GET /branding/{*path}` — serves logo/favicon files from
-//!   `${workspace_dir}/branding/`. Restricted to a small allowlist of
+//!   `${shared_workspace_dir}/branding/`. Restricted to a small allowlist of
 //!   image content types and hardened against path traversal via
 //!   canonical-prefix check.
 
@@ -39,7 +39,7 @@ struct BrandingResponse {
 /// has a token. The fields are decorative; exposing them carries no
 /// secret-disclosure risk.
 pub async fn handle_branding_get(State(state): State<AppState>) -> Response {
-    let cfg = state.config.lock();
+    let cfg = state.config.read();
     let b = &cfg.branding;
     axum::Json(BrandingResponse {
         display_name: b.display_name.clone(),
@@ -107,7 +107,7 @@ fn validate_branding_path(path: &str) -> Option<String> {
     Some(ext)
 }
 
-/// Serves files from `${workspace_dir}/branding/<path>`. Hardened against:
+/// Serves files from `${shared_workspace_dir}/branding/<path>`. Hardened against:
 ///
 /// - Path traversal (`..`, absolute paths, drive letters on Windows)
 ///   via [`validate_branding_path`] and a canonical-root prefix check
@@ -129,12 +129,12 @@ pub async fn handle_branding_file(
         return StatusCode::NOT_FOUND.into_response();
     };
 
-    // Lock briefly, clone the path, drop the lock before any await.
-    // workspace_dir is computed at config load and stable for the
-    // process lifetime — no need to hold the mutex across I/O.
+    // Read briefly, clone the path, drop the guard before any await.
+    // shared_workspace_dir() (<install>/shared) is stable for the
+    // process lifetime — no need to hold the lock across I/O.
     let branding_dir = {
-        let cfg = state.config.lock();
-        cfg.workspace_dir.join("branding")
+        let cfg = state.config.read();
+        cfg.shared_workspace_dir().join("branding")
     };
 
     let file_path = branding_dir.join(&path);
