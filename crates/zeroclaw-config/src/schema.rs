@@ -16155,6 +16155,52 @@ auto_approve = ["file_read", "memory_recall", "http_request"]
         assert_eq!(runtime.max_actions_per_hour, 99);
     }
 
+    /// Regression: V1/V2's implicit single agent served every configured
+    /// channel. The V2→V3 migration synthesizes `[agents.default]`, which must
+    /// link those channels via `agent.channels` — otherwise the V3 channel
+    /// supervisor finds no agent-attached channels and crash-loops on
+    /// "No channels configured" despite `[channels.*]` being present.
+    #[test]
+    async fn v2_synthesized_default_agent_links_configured_channels() {
+        let raw = r#"
+schema_version = 2
+
+[providers.models.openai]
+model = "gpt-4o"
+base_url = "https://example.test/v1"
+
+[channels]
+cli = true
+
+[channels.telegram]
+enabled = true
+bot_token = "123:abc"
+
+[channels.webhook]
+enabled = true
+port = 42618
+"#;
+        let parsed = crate::migration::migrate_to_current(raw).unwrap();
+        let agent = parsed
+            .agents
+            .get("default")
+            .expect("synthesized default agent");
+        let channels: Vec<&str> = agent.channels.iter().map(|c| c.as_str()).collect();
+        assert!(
+            channels.contains(&"telegram.default"),
+            "telegram not linked; channels = {channels:?}"
+        );
+        assert!(
+            channels.contains(&"webhook.default"),
+            "webhook not linked; channels = {channels:?}"
+        );
+        // `cli` is a scalar flag, not a servable channel ref — never linked.
+        assert!(
+            !channels.iter().any(|c| c.starts_with("cli")),
+            "cli wrongly linked; channels = {channels:?}"
+        );
+    }
+
     /// Regression test for #4247: when a user provides a custom auto_approve
     /// list, the built-in defaults must still be present.
     #[test]

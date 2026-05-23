@@ -2099,6 +2099,18 @@ fn synthesize_default_agent_if_needed(passthrough: &toml::Table) -> toml::Table 
         toml::Value::String("default".into()),
     );
 
+    // V1/V2's implicit single agent served every configured channel. V3
+    // serves channels per-agent via `agent.channels`, so without this link
+    // the synthesized agent serves nothing and the channel supervisor
+    // crash-loops on "No channels configured" despite `[channels.*]` being
+    // present. The channels fold ran before agent synthesis, so reference
+    // each alias-wrapped channel as `<type>.<alias>`; `enabled` is still
+    // gated at registration, so linking a disabled channel is harmless.
+    let channel_refs = collect_synthesized_agent_channels(passthrough);
+    if !channel_refs.is_empty() {
+        default_agent.insert("channels".to_string(), toml::Value::Array(channel_refs));
+    }
+
     let mut agents = toml::Table::new();
     agents.insert("default".to_string(), toml::Value::Table(default_agent));
     ::zeroclaw_log::record!(
@@ -2107,6 +2119,28 @@ fn synthesize_default_agent_if_needed(passthrough: &toml::Table) -> toml::Table 
         "synthesized [agents.default] from V1/V2 implicit single-agent semantics"
     );
     agents
+}
+
+/// Collect `<type>.<alias>` channel refs from the already-folded
+/// `[channels.*]` passthrough, for the synthesized default agent's
+/// `channels` list. Only the implicit-single-agent (V1/V2) path calls this;
+/// explicitly-declared V2 agents keep their operator-authored `channels`
+/// (we don't guess linkage when the operator already modeled agents).
+fn collect_synthesized_agent_channels(passthrough: &toml::Table) -> Vec<toml::Value> {
+    let Some(toml::Value::Table(channels)) = passthrough.get("channels") else {
+        return Vec::new();
+    };
+    let mut refs: Vec<String> = Vec::new();
+    for ct in V3_CHANNEL_TYPES {
+        let Some(toml::Value::Table(aliases)) = channels.get(*ct) else {
+            continue;
+        };
+        for alias in aliases.keys() {
+            refs.push(format!("{ct}.{alias}"));
+        }
+    }
+    refs.sort();
+    refs.into_iter().map(toml::Value::String).collect()
 }
 
 /// V3 TTS provider type keys. Matches the V2 `TtsConfig` per-provider
