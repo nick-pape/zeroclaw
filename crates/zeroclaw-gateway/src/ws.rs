@@ -610,6 +610,7 @@ async fn handle_socket(
             event = broadcast_rx.recv() => {
                 if let Ok(event) = event
                     && event_matches_session(&event, &session_id)
+                    && !is_observability_broadcast(&event)
                 {
                     let _ = sender.send(Message::Text(event.to_string().into())).await;
                 }
@@ -691,6 +692,33 @@ fn event_matches_session(event: &serde_json::Value, session_id: &str) -> bool {
         Some(event_session_id) => event_session_id == session_id,
         None => true,
     }
+}
+
+/// True for dashboard activity-feed / observability frames produced by the SSE
+/// [`crate::sse::BroadcastObserver`] (`/api/events`).
+///
+/// The chat WebSocket subscribes to the same broadcast channel for genuinely
+/// global chat frames (e.g. `cron_result`), but these observability frames are
+/// not chat-transcript events and must not reach a chat client. The per-turn
+/// `event_rx` already delivers proper `tool_call` / `tool_result` frames — each
+/// carrying a correlation `id` — for this session. The activity-feed
+/// `tool_call`, by contrast, carries only a `tool` field (no `id`/`name`), so
+/// forwarding it made the web UI render a phantom "unknown" tool card that
+/// never resolved and poisoned the result-to-call matching on later turns.
+fn is_observability_broadcast(event: &serde_json::Value) -> bool {
+    matches!(
+        event.get("type").and_then(serde_json::Value::as_str),
+        Some(
+            "tool_call"
+                | "tool_call_start"
+                | "tool_result"
+                | "agent_start"
+                | "agent_end"
+                | "llm_request"
+                | "llm_response"
+                | "error"
+        )
+    )
 }
 
 /// Process a single chat message through the agent and send the response.
@@ -1362,6 +1390,65 @@ mod tests {
         assert!(event_matches_session(&target_event, "operator-1"));
         assert!(!event_matches_session(&other_event, "operator-1"));
         assert!(event_matches_session(&global_event, "operator-1"));
+    }
+
+    // The chat WebSocket shares a broadcast channel with the SSE dashboard
+    // activity feed. Observability frames (notably the activity-feed
+    // `tool_call`, which has a `tool` field but no `id`/`name`) must be
+    // filtered out of the chat stream, or the web UI renders phantom
+    // "unknown" tool cards. Genuinely chat-relevant broadcasts (cron_result,
+    // session notifications) must still pass.
+    #[test]
+    fn observability_broadcasts_are_filtered_from_chat() {
+        for ty in [
+            "tool_call",
+            "tool_call_start",
+            "tool_result",
+            "agent_start",
+            "agent_end",
+            "llm_request",
+            "llm_response",
+            "error",
+        ] {
+            let event = serde_json::json!({ "type": ty, "tool": "probe__ping" });
+            assert!(
+                is_observability_broadcast(&event),
+                "{ty} must be filtered from the chat WS broadcast stream"
+            );
+        }
+    }
+
+    #[test]
+    fn chat_relevant_broadcasts_are_not_filtered() {
+        let cron = serde_json::json!({ "type": "cron_result", "output": "done" });
+        let session_msg = serde_json::json!({
+            "type": "message",
+            "session_id": "operator-1",
+            "content": "deploy finished"
+        });
+        assert!(!is_observability_broadcast(&cron));
+        assert!(!is_observability_broadcast(&session_msg));
+    }
+
+    // The leak that produced phantom "unknown" cards: an activity-feed
+    // `tool_call` (no `id`/`name`, session-less) matched the session filter
+    // but must be dropped by the observability filter before reaching chat.
+    #[test]
+    fn activity_feed_tool_call_is_dropped_even_though_session_matches() {
+        let activity_tool_call = serde_json::json!({
+            "type": "tool_call",
+            "tool": "probe__ping",
+            "duration_ms": 12,
+            "success": true,
+        });
+        assert!(
+            event_matches_session(&activity_tool_call, "gw-123"),
+            "session-less events match any session"
+        );
+        assert!(
+            is_observability_broadcast(&activity_tool_call),
+            "but the observability filter must drop it from the chat WS"
+        );
     }
 
     #[test]

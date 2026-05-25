@@ -6,6 +6,9 @@ import {
 } from 'lucide-react';
 
 export interface ToolCallInfo {
+  /** Correlation id from the gateway's TurnEvent::ToolCall/ToolResult pair.
+   *  Optional for backward compat with cards persisted before id tracking. */
+  id?: string;
   name: string;
   args?: unknown;
   output?: string;       // undefined = executing; string = completed

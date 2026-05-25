@@ -243,28 +243,28 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
       }
 
       case 'tool_call': {
+        // Per-turn `tool_call` frames from the agent loop always carry a
+        // correlation `id` (crates/zeroclaw-runtime TurnEvent::ToolCall).
+        // Frames without one are not real per-turn calls — e.g. a dashboard
+        // activity-feed `tool_call` (it has a `tool` field but no `id`/`name`).
+        // Ignore them so they never render as a phantom "unknown" card.
+        const toolId = typeof msg.id === 'string' ? msg.id : undefined;
+        if (!toolId) break;
         const toolName = msg.name ?? 'unknown';
         const toolArgs = msg.args;
         localMessageMutationVersionRef.current += 1;
         setMessages((prev) => {
+          // Strict id-based dedup: a card with this id already exists (upstream
+          // re-emitted the same ToolCall). Drop the duplicate.
+          if (prev.some((m) => m.toolCall?.id === toolId)) return prev;
           const argsKey = JSON.stringify(toolArgs ?? {});
-          if (pendingContentRef.current) {
-            const isDuplicate = prev.some(
-              (m) => m.toolCall
-                && m.toolCall.output === undefined
-                && m.toolCall.name === toolName
-                && JSON.stringify(m.toolCall.args ?? {}) === argsKey,
-            );
-            if (isDuplicate) return prev;
-          }
-
           return [
             ...prev,
             {
               id: generateUUID(),
               role: 'agent' as const,
               content: `${t('agent.tool_call_prefix')} ${toolName}(${argsKey})`,
-              toolCall: { name: toolName, args: toolArgs },
+              toolCall: { id: toolId, name: toolName, args: toolArgs },
               timestamp: new Date(),
             },
           ];
@@ -273,28 +273,27 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
       }
 
       case 'tool_result': {
+        // Match the result to its pending call strictly by correlation `id`
+        // (handles parallel calls and out-of-order results). Frames without an
+        // `id` are not real per-turn results — ignore them rather than letting
+        // them resolve an arbitrary pending card or spawn an "unknown" phantom.
+        const resultId = typeof msg.id === 'string' ? msg.id : undefined;
+        if (!resultId) break;
+        const resultOutput = msg.output ?? '';
         localMessageMutationVersionRef.current += 1;
         setMessages((prev) => {
-          const idx = prev.findIndex((m) => m.toolCall && m.toolCall.output === undefined);
-          if (idx !== -1) {
-            const updated = [...prev];
-            const existing = prev[idx]!;
-            updated[idx] = {
-              ...existing,
-              toolCall: { ...existing.toolCall!, output: msg.output ?? '' },
-            };
-            return updated;
-          }
-          return [
-            ...prev,
-            {
-              id: generateUUID(),
-              role: 'agent' as const,
-              content: `${t('agent.tool_result_prefix')} ${msg.output ?? ''}`,
-              toolCall: { name: msg.name ?? 'unknown', output: msg.output ?? '' },
-              timestamp: new Date(),
-            },
-          ];
+          const idx = prev.findIndex((m) => m.toolCall?.id === resultId);
+          if (idx === -1) return prev; // orphan result: drop (was the phantom path)
+          const existing = prev[idx]!;
+          // Idempotent: a re-emitted result for an already-resolved card is
+          // dropped so it cannot overwrite output with stale data.
+          if (existing.toolCall?.output !== undefined) return prev;
+          const updated = [...prev];
+          updated[idx] = {
+            ...existing,
+            toolCall: { ...existing.toolCall!, output: resultOutput },
+          };
+          return updated;
         });
         break;
       }

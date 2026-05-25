@@ -225,6 +225,13 @@ export interface WsMessage {
     | 'aborted';
   content?: string;
   full_response?: string;
+  /**
+   * Correlation id from the gateway's TurnEvent::ToolCall/ToolResult pair
+   * (present on per-turn `tool_call` / `tool_result` frames). AgentContext
+   * matches results to their calls by this id rather than by position, and
+   * ignores tool frames that lack it (e.g. dashboard activity-feed frames).
+   */
+  id?: string;
   name?: string;
   args?: any;
   output?: string;
