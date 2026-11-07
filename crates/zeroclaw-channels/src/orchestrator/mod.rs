@@ -1899,7 +1899,10 @@ fn interruption_scope_key(msg: &zeroclaw_api::channel::ChannelMessage) -> String
 /// Returns `true` when `content` is a `/stop` command (with optional `@botname` suffix).
 /// Not gated on channel type — all non-CLI channels support `/stop`.
 fn is_stop_command(content: &str) -> bool {
-    let trimmed = content.trim();
+    // `!stop` / `//stop` too: Matrix clients swallow a leading `/` (see
+    // `normalize_matrix_command_prefix`). Ungated, like `/stop` itself.
+    let normalized = normalize_matrix_command_prefix("matrix", content.trim());
+    let trimmed: &str = normalized.as_ref();
     if !trimmed.starts_with('/') {
         return false;
     }
@@ -2795,8 +2798,35 @@ fn resolve_channel_thinking(
     }
 }
 
+/// Matrix clients (Element) intercept a leading `/` as their OWN slash
+/// command and refuse unknown ones, so a bot command typed as `/compact`
+/// never arrives as such. Accept the two forms Matrix users can actually
+/// send: `!compact` (the long-standing Matrix bot convention, untouched by
+/// Element) and `//compact` (Element's escape, which some clients deliver
+/// verbatim). Both are rewritten to the canonical `/` form; anything that is
+/// not a known command still falls through unchanged as an ordinary message.
+fn normalize_matrix_command_prefix<'a>(
+    channel_name: &str,
+    trimmed: &'a str,
+) -> std::borrow::Cow<'a, str> {
+    let is_matrix = channel_name == "matrix" || channel_name.starts_with("matrix.");
+    if !is_matrix {
+        return std::borrow::Cow::Borrowed(trimmed);
+    }
+    if let Some(rest) = trimmed.strip_prefix("//") {
+        return std::borrow::Cow::Owned(format!("/{rest}"));
+    }
+    if let Some(rest) = trimmed.strip_prefix('!')
+        && rest.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+    {
+        return std::borrow::Cow::Owned(format!("/{rest}"));
+    }
+    std::borrow::Cow::Borrowed(trimmed)
+}
+
 fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRuntimeCommand> {
-    let trimmed = content.trim();
+    let normalized = normalize_matrix_command_prefix(channel_name, content.trim());
+    let trimmed: &str = normalized.as_ref();
     if !trimmed.starts_with('/') {
         return None;
     }
@@ -59040,6 +59070,33 @@ mod compaction_channel_tests {
         );
         // Not a command when it is not the leading token.
         assert_eq!(parse_runtime_command("matrix", "please /compact"), None);
+    }
+
+    #[test]
+    fn matrix_accepts_bang_and_double_slash_command_prefixes() {
+        assert_eq!(
+            parse_runtime_command("matrix", "!compact keep the rules discussion"),
+            Some(ChannelRuntimeCommand::Compact(Some(
+                "keep the rules discussion".to_string()
+            )))
+        );
+        assert_eq!(
+            parse_runtime_command("matrix", "//compact Keep the categorization"),
+            Some(ChannelRuntimeCommand::Compact(Some(
+                "Keep the categorization".to_string()
+            )))
+        );
+        assert_eq!(
+            parse_runtime_command("matrix", "!new"),
+            Some(ChannelRuntimeCommand::NewSession)
+        );
+        assert!(is_stop_command("!stop"));
+        assert!(is_stop_command("//stop"));
+        // Ordinary text that merely starts with `!` stays a message.
+        assert_eq!(parse_runtime_command("matrix", "!!! wow"), None);
+        assert_eq!(parse_runtime_command("matrix", "!nice one"), None);
+        // Other channels keep `/`-only commands.
+        assert_eq!(parse_runtime_command("telegram", "!compact"), None);
     }
 
     #[test]
