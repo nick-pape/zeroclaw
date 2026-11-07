@@ -1527,77 +1527,120 @@ async fn auto_compact_if_over_budget(
         return false;
     }
     events::send_progress(on_delta, ProgressEvent::CompactingContext).await;
-    let retention_before = retention_layout(history, *crumb_present);
-    let mut lead = crate::agent::compaction::LeadProvenance::new(
-        *crumb_present,
-        compaction.scope.summary_present(),
-    );
-    let result = crate::agent::compaction::run_compaction(
-        trigger,
-        config,
-        agent_alias,
-        Some(fallback_route),
-        &compaction.settings,
-        compaction.scope.session_key(),
+    // Split the in-progress turn up front when summarising older turns alone
+    // cannot make the request fit (or there are none); otherwise try the
+    // whole-turn plan first and split only if the result still overflows.
+    let room = budget
+        .saturating_sub(tool_schema_tokens)
+        .saturating_sub(compaction.settings.summary_max_tokens);
+    let mut split = crate::agent::compaction::current_turn_needs_split(
         history,
-        &mut lead,
-        None,
-        budget,
+        *crumb_present,
+        &compaction.settings,
         ratio,
-    )
-    .await;
-    match result {
-        Ok(outcome) => {
-            *crumb_present = lead.crumb_present;
-            compaction.scope.set_summary_present(lead.summary_present);
+        room,
+    );
+    let mut projected_before = projected_before;
+    let mut compacted = false;
+    loop {
+        let retention_before = retention_layout(history, *crumb_present);
+        let mut lead = crate::agent::compaction::LeadProvenance::new(
+            *crumb_present,
+            compaction.scope.summary_present(),
+        );
+        let result = crate::agent::compaction::run_compaction(
+            trigger,
+            config,
+            agent_alias,
+            Some(fallback_route),
+            &compaction.settings,
+            compaction.scope.session_key(),
+            history,
+            &mut lead,
+            None,
+            budget,
+            ratio,
+            split,
+        )
+        .await;
+        let outcome = match result {
+            Ok(outcome) => outcome,
+            Err(crate::agent::compaction::CompactionError::NothingToCompact) if !split => {
+                split = true;
+                continue;
+            }
+            Err(_) => {
+                // Already logged by `run_compaction`; history is untouched and
+                // the whole-turn trim fallback applies.
+                compaction.gave_up = true;
+                return compacted;
+            }
+        };
+        compacted = true;
+        *crumb_present = lead.crumb_present;
+        compaction.scope.set_summary_present(lead.summary_present);
+        // A split keeps the in-progress turn's user message but moves it
+        // next to the summary; any memory preamble injected there moves too.
+        let moved_preamble = match (
+            outcome.current_turn_moved,
+            injected_memory_preamble.as_mut(),
+        ) {
+            (Some((from, to)), Some(target)) if target.index == from => {
+                target.index = to;
+                true
+            }
+            _ => false,
+        };
+        if !moved_preamble {
             remap_memory_after_trim(
                 injected_memory_preamble,
                 retention_before,
                 history,
                 *crumb_present,
             );
-            let projected_after = projected_provider_facing_tokens(
-                history,
-                multimodal_config,
-                degrade_strip_images,
-                image_cache,
-                tool_schema_tokens,
-                ratio,
+        }
+        let projected_after = projected_provider_facing_tokens(
+            history,
+            multimodal_config,
+            degrade_strip_images,
+            image_cache.as_deref_mut(),
+            tool_schema_tokens,
+            ratio,
+        )
+        .await;
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete)
+                .with_category(::zeroclaw_log::EventCategory::Agent)
+                .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                .with_attrs(::serde_json::json!({
+                    "event": "context_compaction_projection",
+                    "trigger": trigger,
+                    "tokens_before": projected_before,
+                    "tokens_after": projected_after,
+                    "tokens_source": "calibrated_provider_facing",
+                    "budget_tokens": budget,
+                    "turns_summarised": outcome.turns_summarised,
+                    "iterations_summarised": outcome.iterations_summarised,
+                    "split_current_turn": split,
+                    "kept_turns": outcome.kept_turns,
+                    "fits": projected_after <= budget,
+                })),
+            format!(
+                "Compaction reduced the next request {projected_before} -> {projected_after} tok (budget {budget})"
             )
-            .await;
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete)
-                    .with_category(::zeroclaw_log::EventCategory::Agent)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Success)
-                    .with_attrs(::serde_json::json!({
-                        "event": "context_compaction_projection",
-                        "trigger": trigger,
-                        "tokens_before": projected_before,
-                        "tokens_after": projected_after,
-                        "tokens_source": "calibrated_provider_facing",
-                        "budget_tokens": budget,
-                        "turns_summarised": outcome.turns_summarised,
-                        "kept_turns": outcome.kept_turns,
-                        "fits": projected_after <= budget,
-                    })),
-                format!(
-                    "Compaction reduced the next request {projected_before} -> {projected_after} tok (budget {budget})"
-                )
-            );
-            if projected_after > budget {
-                // The summary is kept (it is strictly smaller than what it
-                // replaced); the whole-turn trim below drops further turns.
-                compaction.gave_up = true;
-            }
-            true
+        );
+        if projected_after <= budget {
+            return true;
         }
-        Err(_) => {
-            // Already logged by `run_compaction`; history is untouched and the
-            // whole-turn trim fallback applies.
+        if split {
+            // The summary is kept (it is strictly smaller than what it
+            // replaced); the whole-turn trim below drops further turns.
             compaction.gave_up = true;
-            false
+            return true;
         }
+        split = true;
+        projected_before = projected_after;
     }
 }
 
@@ -10830,11 +10873,61 @@ mod compaction_seam_tests {
         assert!(compaction.scope.summary_present());
         // system -> summary -> the 2 newest turns verbatim.
         assert_eq!(history.len(), 1 + 1 + 4);
-        assert!(history[1].content.ends_with("compact summary"));
+        assert!(history[1].content.contains("compact summary"));
+        assert!(
+            history[1]
+                .content
+                .ends_with(crate::agent::compaction::SUMMARY_END_MARKER)
+        );
         assert_eq!(history[2].content, "request 6");
         assert_eq!(
             summarizer.calls.load(std::sync::atomic::Ordering::SeqCst),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn seam_splits_an_in_progress_turn_that_alone_overflows() {
+        // One older turn, then a turn whose three tool iterations alone are
+        // over budget: summarising the older turn cannot fit it, so the
+        // seam splits the turn and keeps only its latest iteration.
+        let mut history = heavy_history(0);
+        history.push(ChatMessage::user("old request"));
+        history.push(ChatMessage::assistant("old answer"));
+        history.push(ChatMessage::user("current request"));
+        for index in 0..3 {
+            history.push(ChatMessage::assistant(format!(
+                r#"{{"content":null,"tool_calls":[{{"id":"c{index}","name":"shell","arguments":"{{}}"}}]}}"#
+            )));
+            history.push(ChatMessage::tool(format!(
+                r#"{{"tool_call_id":"c{index}","content":"r{index} {}"}}"#,
+                "q".repeat(12_000)
+            )));
+        }
+        let mut crumb_present = false;
+        let mut compaction = compaction(4);
+        let summarizer = provider(false);
+        let compacted = run_seam(
+            &mut compaction,
+            &summarizer,
+            &mut history,
+            &mut crumb_present,
+            9_000,
+        )
+        .await;
+        assert!(compacted);
+        assert!(!compaction.gave_up);
+        assert_eq!(
+            history.len(),
+            5,
+            "system, summary, request, latest call + result"
+        );
+        assert_eq!(history[2].content, "current request");
+        assert!(history[4].content.contains("r2 "));
+        assert_eq!(
+            summarizer.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "split chosen up front, one summary call"
         );
     }
 

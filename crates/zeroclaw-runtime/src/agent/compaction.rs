@@ -68,6 +68,16 @@ amounts, prices, quantities, dates, times, URLs, file paths, commands, error \
 messages, and anything the user quoted. Never round numbers or paraphrase an \
 identifier.
 
+Tool results: record which tool I called, with its arguments, and what it \
+returned in substance (totals, counts, the records the user asked about or \
+that open work depends on, and every identifier I may need again). Do NOT \
+copy long raw listings (hundreds of rows, whole JSON payloads) into the \
+summary: say what was fetched and note that the same call can fetch it again.
+
+The headings in the material you are given (\"PREVIOUS SUMMARY\", \"SUMMARY \
+SO FAR\", \"CONVERSATION TURNS TO SUMMARISE\", \"NOTE\") are labels for you \
+only: never repeat them in your output.
+
 Organise the summary in these sections, in this order:
 
 1. What the user asked for and why: every request and goal, in the user's \
@@ -104,14 +114,76 @@ reconstruct the older summary.\n\n";
 /// Separates the carried summary from the summary of the turns after it.
 const LATER_TURNS_HEADING: &str = "LATER TURNS (summarised after everything above):";
 
-/// The carried summary's body: the slot text without the model-visible
-/// summary header (a fresh header is added when the slot is rebuilt).
-fn strip_summary_header(slot: &str) -> String {
+/// Closes the summary inside the synthetic slot. Loading a stored history
+/// merges consecutive user rows (`normalize_cached_channel_turns`), so the
+/// next real user message can end up appended to the slot; the marker tells
+/// a later compaction where the summary stops and that message starts.
+pub const SUMMARY_END_MARKER: &str = "[End of conversation summary]";
+
+/// Labels this module puts in summariser material; a model that echoes one
+/// at the top of its output has it stripped.
+const MATERIAL_LABELS: &[&str] = &[
+    "SUMMARY SO FAR",
+    "PREVIOUS SUMMARY",
+    "EARLIER-CONTEXT MARKER",
+    "CONVERSATION TURNS TO SUMMARISE",
+    "NOTE: a summary of even older turns",
+    "FOCUS REQUESTED BY THE USER",
+    "LATER TURNS",
+];
+
+/// Drop material labels the model echoed at the start of its summary.
+fn strip_echoed_labels(summary: &str) -> String {
+    let mut rest = summary.trim();
+    loop {
+        let first_line = rest.lines().next().unwrap_or("");
+        let bare = first_line.trim_start_matches(['#', '*', ' ', '_']);
+        if first_line.is_empty() || !MATERIAL_LABELS.iter().any(|label| bare.starts_with(label)) {
+            break;
+        }
+        rest = rest[first_line.len()..].trim_start();
+    }
+    rest.to_string()
+}
+
+/// True when `text` starts with a channel timestamp prefix such as
+/// `[2026-11-07 08:09:33 -06:00] `.
+fn starts_with_channel_timestamp(text: &str) -> bool {
+    let pattern = b"[dddd-dd-dd dd:dd:dd +dd:dd] ";
+    let bytes = text.as_bytes();
+    bytes.len() >= pattern.len()
+        && pattern.iter().zip(bytes).all(|(&p, &b)| match p {
+            b'd' => b.is_ascii_digit(),
+            b'+' => b == b'+' || b == b'-',
+            _ => p == b,
+        })
+}
+
+/// Split the previous slot into the carried summary body (header removed; a
+/// fresh header is added when the slot is rebuilt) and any user message that
+/// history loading merged onto its end. Slots written before the end marker
+/// existed fall back to the last timestamped paragraph after the last
+/// later-turns heading.
+fn split_carried_slot(slot: &str) -> (String, Option<String>) {
     let header = summary_header();
-    slot.strip_prefix(header.as_str())
-        .unwrap_or(slot)
-        .trim()
-        .to_string()
+    let body = slot.strip_prefix(header.as_str()).unwrap_or(slot);
+    let trailing = |text: &str| Some(text.trim().to_string()).filter(|text| !text.is_empty());
+    if let Some(at) = body.rfind(SUMMARY_END_MARKER) {
+        return (
+            body[..at].trim().to_string(),
+            trailing(&body[at + SUMMARY_END_MARKER.len()..]),
+        );
+    }
+    let search_from = body.rfind(LATER_TURNS_HEADING).unwrap_or(0);
+    let merged_at = body[search_from..]
+        .match_indices("\n\n[")
+        .map(|(at, _)| search_from + at)
+        .filter(|&at| starts_with_channel_timestamp(&body[at + 2..]))
+        .last();
+    match merged_at {
+        Some(at) => (body[..at].trim().to_string(), trailing(&body[at..])),
+        None => (body.trim().to_string(), None),
+    }
 }
 
 /// Model-visible header that opens the synthetic summary message. Purely
@@ -432,6 +504,10 @@ pub struct CompactionRequest<'a> {
     pub budget_tokens: usize,
     /// Calibration ratio (`reported / estimated`, at least 1.0).
     pub ratio: f64,
+    /// Also summarise the earlier tool iterations of the newest turn (the
+    /// one still in progress), keeping its user message and its latest
+    /// iteration verbatim. Used when that turn alone outgrows the budget.
+    pub split_current_turn: bool,
 }
 
 /// What a successful compaction did. Token counts are calibrated estimates
@@ -448,6 +524,12 @@ pub struct CompactionOutcome {
     pub summary: String,
     /// Whether a previous summary was folded into this one.
     pub folded_previous_summary: bool,
+    /// Earlier tool iterations of the in-progress turn that were summarised
+    /// (0 unless the turn was split).
+    pub iterations_summarised: usize,
+    /// When the in-progress turn was split: its user message's index before
+    /// and after compaction (it is kept verbatim but moves).
+    pub current_turn_moved: Option<(usize, usize)>,
 }
 
 /// Where a compaction cuts the history.
@@ -461,6 +543,10 @@ pub(crate) struct CompactionPlan {
     pub tail_start: usize,
     pub turns_summarised: usize,
     pub kept_turns: usize,
+    /// Split plan only: the in-progress turn's user message, kept verbatim
+    /// in front of `tail_start` (which is then its latest tool iteration).
+    pub current_turn_head: Option<usize>,
+    pub iterations_summarised: usize,
 }
 
 fn is_turn_boundary(message: &ChatMessage) -> bool {
@@ -487,12 +573,19 @@ fn calibrated_text_tokens(text: &str, ratio: f64) -> usize {
 /// summarised. Whole turns only, so an assistant tool call is never
 /// separated from its tool results. `None` only when the newest turn is the
 /// sole turn after the synthetic slot.
+///
+/// With `split_current_turn`, the newest turn (the one in progress) is also
+/// cut between tool iterations: its user message and its latest iteration
+/// (an assistant message plus the results after it) stay verbatim, every
+/// older turn and its earlier iterations are summarised. Falls back to the
+/// whole-turn plan when the turn has fewer than two iterations.
 pub(crate) fn plan_compaction(
     history: &[ChatMessage],
     crumb_present: bool,
     keep_recent_turns: usize,
     keep_recent_max_tokens: usize,
     ratio: f64,
+    split_current_turn: bool,
 ) -> Option<CompactionPlan> {
     let system_end = history.iter().take_while(|m| m.role == "system").count();
     let body_start =
@@ -501,6 +594,22 @@ pub(crate) fn plan_compaction(
         .filter(|&index| is_turn_boundary(&history[index]))
         .collect();
     let newest = *boundaries.last()?;
+    if split_current_turn {
+        let iterations: Vec<usize> = (newest + 1..history.len())
+            .filter(|&index| history[index].role == "assistant")
+            .collect();
+        if iterations.len() >= 2 {
+            return Some(CompactionPlan {
+                system_end,
+                body_start,
+                tail_start: *iterations.last()?,
+                turns_summarised: boundaries.len() - 1,
+                kept_turns: 1,
+                current_turn_head: Some(newest),
+                iterations_summarised: iterations.len() - 1,
+            });
+        }
+    }
     let mut tail_start = newest;
     let mut kept_turns = 1usize;
     for &candidate in boundaries.iter().rev().skip(1) {
@@ -534,7 +643,40 @@ pub(crate) fn plan_compaction(
         tail_start,
         turns_summarised,
         kept_turns,
+        current_turn_head: None,
+        iterations_summarised: 0,
     })
+}
+
+/// Whether the in-progress (newest) turn should be split between tool
+/// iterations: the whole-turn plan has nothing to summarise, or the newest
+/// turn plus the leading system messages alone exceeds `room_tokens` (the
+/// budget left after tool schemas and the summary's reserve), so no amount
+/// of summarising older turns can make the next request fit.
+pub(crate) fn current_turn_needs_split(
+    history: &[ChatMessage],
+    crumb_present: bool,
+    settings: &CompactionSettings,
+    ratio: f64,
+    room_tokens: usize,
+) -> bool {
+    let Some(plan) = plan_compaction(
+        history,
+        crumb_present,
+        settings.keep_recent_turns,
+        settings.keep_recent_max_tokens,
+        ratio,
+        false,
+    ) else {
+        return true;
+    };
+    let newest = (plan.body_start..history.len())
+        .rev()
+        .find(|&index| is_turn_boundary(&history[index]))
+        .unwrap_or(plan.tail_start);
+    let floor = calibrated(estimate_history_tokens(&history[..plan.system_end]), ratio)
+        + calibrated(estimate_history_tokens(&history[newest..]), ratio);
+    floor > room_tokens
 }
 
 /// Replace `[IMAGE:data:...]` inline payloads with a placeholder so base64
@@ -668,6 +810,7 @@ pub async fn compact_history(
         settings.keep_recent_turns,
         settings.keep_recent_max_tokens,
         ratio,
+        request.split_current_turn,
     )
     .ok_or(CompactionError::NothingToCompact)?;
     let tokens_before = calibrated(estimate_history_tokens(history), ratio);
@@ -707,10 +850,15 @@ pub async fn compact_history(
     // below the carried text, and is asked to consolidate only once the
     // combined summary passes `summary_max_tokens`. A breadcrumb (no summary)
     // is still folded in by the model as before.
-    let carried = if lead.summary_present {
-        previous_slot.as_deref().map(strip_summary_header)
+    // A user message that history loading merged onto the slot belongs to
+    // the oldest turn being summarised, not to the carried summary.
+    let (carried, merged_user) = if lead.summary_present {
+        match previous_slot.as_deref().map(split_carried_slot) {
+            Some((body, merged)) => (Some(body), merged),
+            None => (None, None),
+        }
     } else {
-        None
+        (None, None)
     };
     let (mut running, mut label) = if carried.is_some() {
         (None, previous_label)
@@ -718,10 +866,26 @@ pub async fn compact_history(
         (previous_slot, previous_label)
     };
 
-    let units: Vec<String> = history[plan.body_start..plan.tail_start]
+    let mut units: Vec<String> = Vec::new();
+    if let Some(merged) = &merged_user {
+        units.push(render_message(&ChatMessage::user(merged.clone())));
+    }
+    for (index, message) in history
         .iter()
-        .map(render_message)
-        .collect();
+        .enumerate()
+        .take(plan.tail_start)
+        .skip(plan.body_start)
+    {
+        if Some(index) == plan.current_turn_head {
+            units.push(format!(
+                "### user (the request I am still working on; it stays in my context verbatim, \
+                 so record what I have done for it so far)\n{}\n\n",
+                strip_inline_image_payloads(&message.content)
+            ));
+        } else {
+            units.push(render_message(message));
+        }
+    }
     let chunks = chunk_units(units, chunk_budget, ratio);
     let total = chunks.len();
     let mut calls = 0usize;
@@ -741,7 +905,7 @@ pub async fn compact_history(
             .await
             .map_err(CompactionError::Summarizer)?;
         calls += 1;
-        let summary = summary.trim().to_string();
+        let summary = strip_echoed_labels(&summary);
         if summary.is_empty() {
             return Err(CompactionError::EmptySummary);
         }
@@ -770,7 +934,7 @@ pub async fn compact_history(
                     .await
                     .map_err(CompactionError::Summarizer)?;
                 calls += 1;
-                let consolidated = consolidated.trim().to_string();
+                let consolidated = strip_echoed_labels(&consolidated);
                 // A consolidation that kept less than 40% of the text dropped
                 // facts, not just duplicates: keep the verbatim combination.
                 if consolidated.len() * 10 < combined.len() * 4 {
@@ -792,13 +956,21 @@ pub async fn compact_history(
             }
         }
     };
-    let message = ChatMessage::user(format!("{}\n\n{summary}", summary_header()));
+    let message = ChatMessage::user(format!(
+        "{}\n\n{summary}\n\n{SUMMARY_END_MARKER}",
+        summary_header()
+    ));
 
-    let messages_summarised = plan.tail_start - plan.body_start;
+    let messages_summarised =
+        plan.tail_start - plan.body_start - usize::from(plan.current_turn_head.is_some());
     let folded_previous_summary = lead.summary_present;
-    let mut compacted = Vec::with_capacity(plan.system_end + 1 + history.len() - plan.tail_start);
+    let mut compacted = Vec::with_capacity(plan.system_end + 2 + history.len() - plan.tail_start);
     compacted.extend_from_slice(&history[..plan.system_end]);
     compacted.push(message);
+    let current_turn_moved = plan.current_turn_head.map(|head| {
+        compacted.push(history[head].clone());
+        (head, compacted.len() - 1)
+    });
     compacted.extend_from_slice(&history[plan.tail_start..]);
     *history = compacted;
     *lead = LeadProvenance::new(true, true);
@@ -812,6 +984,8 @@ pub async fn compact_history(
         summary_calls: calls,
         summary,
         folded_previous_summary,
+        iterations_summarised: plan.iterations_summarised,
+        current_turn_moved,
     })
 }
 
@@ -863,6 +1037,7 @@ pub fn record_compaction_event(
                     "summary_calls": outcome.summary_calls,
                     "summary_chars": outcome.summary.chars().count(),
                     "folded_previous_summary": outcome.folded_previous_summary,
+                    "iterations_summarised": outcome.iterations_summarised,
                 })),
             format!(
                 "Context compacted ({trigger}): summarised {} turn(s), kept {}, {} -> {} tok",
@@ -931,6 +1106,7 @@ pub async fn run_compaction(
     focus: Option<&str>,
     budget_tokens: usize,
     ratio: f64,
+    split_current_turn: bool,
 ) -> Result<CompactionOutcome, CompactionError> {
     let tokens_before = calibrated(estimate_history_tokens(history), ratio);
     if plan_compaction(
@@ -939,6 +1115,7 @@ pub async fn run_compaction(
         settings.keep_recent_turns,
         settings.keep_recent_max_tokens,
         ratio,
+        split_current_turn,
     )
     .is_none()
     {
@@ -1004,6 +1181,7 @@ pub async fn run_compaction(
         focus,
         budget_tokens,
         ratio,
+        split_current_turn,
     };
     let result = compact_history(history, lead, summarizer, &request).await;
     record_compaction_event(
@@ -1089,6 +1267,7 @@ mod tests {
             focus: None,
             budget_tokens: 100_000,
             ratio: 1.0,
+            split_current_turn: false,
         }
     }
 
@@ -1130,7 +1309,11 @@ mod tests {
         // Ordering: system -> ONE summary -> the 4 newest turns verbatim.
         assert_eq!(rows(&history[..1]), rows(&original[..1]));
         assert_eq!(history[1].role, "user");
-        assert!(history[1].content.ends_with("summary-1"));
+        assert!(history[1].content.ends_with(&format!(
+            "summary-1
+
+{SUMMARY_END_MARKER}"
+        )));
         assert_eq!(rows(&history[2..]), rows(&original[9..]));
         assert_eq!(history[2].content, "request 2");
         // The summariser saw the two oldest turns, tool exchange included.
@@ -1184,18 +1367,18 @@ mod tests {
             history.push(ChatMessage::assistant("x".repeat(4_000)));
         }
         // Each turn is ~1,000+ tokens; a 2,500-token cap admits two turns.
-        let plan = plan_compaction(&history, false, 4, 2_500, 1.0).expect("plan");
+        let plan = plan_compaction(&history, false, 4, 2_500, 1.0, false).expect("plan");
         assert_eq!(plan.kept_turns, 2);
         assert_eq!(history[plan.tail_start].content, "turn 2");
         // A cap below one turn still keeps the newest whole turn.
-        let plan = plan_compaction(&history, false, 4, 10, 1.0).expect("plan");
+        let plan = plan_compaction(&history, false, 4, 10, 1.0, false).expect("plan");
         assert_eq!(plan.kept_turns, 1);
         assert_eq!(history[plan.tail_start].content, "turn 3");
         // The calibration ratio scales the cap check.
-        let plan = plan_compaction(&history, false, 4, 2_500, 2.0).expect("plan");
+        let plan = plan_compaction(&history, false, 4, 2_500, 2.0, false).expect("plan");
         assert_eq!(plan.kept_turns, 1);
         // Nothing older than the newest turn: nothing to compact.
-        assert!(plan_compaction(&history[..3], false, 4, 0, 1.0).is_none());
+        assert!(plan_compaction(&history[..3], false, 4, 0, 1.0, false).is_none());
     }
 
     #[test]
@@ -1208,7 +1391,7 @@ mod tests {
             history.push(ChatMessage::user(format!("turn {turn}")));
             history.push(ChatMessage::assistant(format!("reply {turn}")));
         }
-        let plan = plan_compaction(&history, true, 4, 0, 1.0).expect("plan");
+        let plan = plan_compaction(&history, true, 4, 0, 1.0, false).expect("plan");
         assert_eq!(plan.body_start, 2);
         assert_eq!(plan.kept_turns, 1);
         assert_eq!(plan.turns_summarised, 3);
@@ -1220,7 +1403,7 @@ mod tests {
             ChatMessage::user("turn 0"),
             ChatMessage::assistant("reply 0"),
         ];
-        assert!(plan_compaction(&only_newest, true, 4, 0, 1.0).is_none());
+        assert!(plan_compaction(&only_newest, true, 4, 0, 1.0, false).is_none());
     }
 
     #[tokio::test]
@@ -1271,7 +1454,12 @@ mod tests {
         let carried_at = slot.find("summary-1").expect("carried summary kept");
         let heading_at = slot.find(LATER_TURNS_HEADING).expect("later-turns heading");
         assert!(carried_at < heading_at);
-        assert!(slot.ends_with("summary-2"));
+        assert!(slot.ends_with(&format!(
+            "summary-2
+
+{SUMMARY_END_MARKER}"
+        )));
+        assert_eq!(slot.matches(SUMMARY_END_MARKER).count(), 1);
         assert_eq!(slot.matches(&summary_header()).count(), 1);
         assert_eq!(
             history
@@ -1368,6 +1556,7 @@ mod tests {
                 + calibrated_text_tokens(DEFAULT_COMPACTION_PROMPT, 1.0)
                 + 512,
             ratio: 1.0,
+            split_current_turn: false,
         };
         let outcome = compact_history(&mut history, &mut lead, &summarizer, &request)
             .await
@@ -1377,11 +1566,12 @@ mod tests {
         assert!(seen[0].contains("FOCUS REQUESTED BY THE USER"));
         assert!(seen[0].contains("the y payloads"));
         assert!(seen[1].contains("SUMMARY SO FAR"));
-        assert!(
-            history[1]
-                .content
-                .ends_with(&format!("summary-{}", seen.len()))
-        );
+        assert!(history[1].content.ends_with(&format!(
+            "summary-{}
+
+{SUMMARY_END_MARKER}",
+            seen.len()
+        )));
         assert_eq!(history.len(), 4);
     }
 
@@ -1392,5 +1582,148 @@ mod tests {
         ));
         assert!(rendered.contains("[inline image omitted]"));
         assert!(!rendered.contains("AAAABBBB"));
+    }
+
+    #[tokio::test]
+    async fn user_message_merged_onto_the_slot_is_summarised_not_carried() {
+        for slot_body in [
+            format!(
+                "old facts
+
+{SUMMARY_END_MARKER}
+
+[2026-11-07 08:09:33 -06:00] merged q"
+            ),
+            // Written before the end marker existed.
+            "old facts
+
+[2026-11-07 08:09:33 -06:00] merged q"
+                .to_string(),
+        ] {
+            let mut history = vec![
+                ChatMessage::system("s"),
+                ChatMessage::user(format!(
+                    "{}
+
+{slot_body}",
+                    summary_header()
+                )),
+                ChatMessage::assistant("merged answer"),
+            ];
+            native_tool_turn(&mut history, 1);
+            let mut lead = LeadProvenance::new(true, true);
+            let summarizer = ScriptedSummarizer::ok();
+            let settings = settings(1, 0);
+            compact_history(&mut history, &mut lead, &summarizer, &request(&settings))
+                .await
+                .expect("compaction succeeds");
+            let seen = summarizer.seen();
+            assert!(seen[0].contains("merged q") && seen[0].contains("merged answer"));
+            assert!(!seen[0].contains("old facts"));
+            let slot = &history[1].content;
+            let carried_at = slot.find("old facts").expect("carried");
+            let heading_at = slot.find(LATER_TURNS_HEADING).expect("heading");
+            assert!(carried_at < heading_at);
+            assert!(!slot.contains("merged q"), "{slot}");
+            assert_eq!(slot.matches(SUMMARY_END_MARKER).count(), 1);
+        }
+    }
+
+    #[test]
+    fn echoed_material_labels_are_stripped() {
+        assert_eq!(
+            strip_echoed_labels(
+                "SUMMARY SO FAR of the older parts (extend it; keep ALL of it):
+
+## LATER TURNS (x):
+1. real"
+            ),
+            "1. real"
+        );
+        assert_eq!(
+            strip_echoed_labels(
+                "  1. real
+SUMMARY SO FAR"
+            ),
+            "1. real
+SUMMARY SO FAR"
+        );
+    }
+
+    fn in_progress_turn() -> Vec<ChatMessage> {
+        let mut history = vec![
+            ChatMessage::system("s"),
+            ChatMessage::user("old"),
+            ChatMessage::assistant("old answer"),
+            ChatMessage::user("current request"),
+        ];
+        for index in 0..3 {
+            history.push(ChatMessage::assistant(format!(
+                r#"{{"content":null,"tool_calls":[{{"id":"c{index}","name":"shell","arguments":"{{}}"}}]}}"#
+            )));
+            history.push(ChatMessage::tool(format!(
+                r#"{{"tool_call_id":"c{index}","content":"r{index}"}}"#
+            )));
+        }
+        history
+    }
+
+    #[tokio::test]
+    async fn split_summarises_earlier_iterations_of_the_current_turn() {
+        let mut history = in_progress_turn();
+        let original = history.clone();
+        let mut lead = LeadProvenance::default();
+        let summarizer = ScriptedSummarizer::ok();
+        let settings = settings(4, 0);
+        let request = CompactionRequest {
+            split_current_turn: true,
+            ..request(&settings)
+        };
+        let outcome = compact_history(&mut history, &mut lead, &summarizer, &request)
+            .await
+            .expect("split compaction");
+        assert_eq!(outcome.iterations_summarised, 2);
+        assert_eq!(outcome.turns_summarised, 1);
+        assert_eq!(outcome.current_turn_moved, Some((3, 2)));
+        // system, summary, the request verbatim, then its latest iteration.
+        assert_eq!(history.len(), 5);
+        assert_eq!(history[2].content, "current request");
+        assert_eq!(rows(&history[3..]), rows(&original[8..]));
+        let seen = summarizer.seen();
+        assert!(seen[0].contains("old answer") && seen[0].contains("r0") && seen[0].contains("r1"));
+        assert!(seen[0].contains("still working on"));
+        assert!(!seen[0].contains("r2"));
+        for (index, message) in history.iter().enumerate() {
+            if message.role == "tool" {
+                assert_eq!(history[index - 1].role, "assistant");
+            }
+        }
+    }
+
+    #[test]
+    fn split_needs_two_iterations_and_is_needed_when_nothing_else_compacts() {
+        let history = in_progress_turn();
+        let settings = settings(4, 0);
+        // Only one iteration: the split plan falls back to the whole-turn plan.
+        let one_iteration = &history[..6];
+        let plan = plan_compaction(one_iteration, false, 4, 0, 1.0, true).expect("plan");
+        assert_eq!(plan.current_turn_head, None);
+        // Older turns exist and the newest fits: no split.
+        assert!(!current_turn_needs_split(
+            &history, false, &settings, 1.0, 100_000
+        ));
+        // The newest turn alone overflows the room: split.
+        assert!(current_turn_needs_split(
+            &history, false, &settings, 1.0, 10
+        ));
+        // Summary slot + only the in-progress turn: nothing else to compact.
+        let mut slot_only = vec![ChatMessage::system("s"), ChatMessage::user("[summary]")];
+        slot_only.extend_from_slice(&history[3..]);
+        assert!(current_turn_needs_split(
+            &slot_only, true, &settings, 1.0, 100_000
+        ));
+        let plan = plan_compaction(&slot_only, true, 4, 0, 1.0, true).expect("split plan");
+        assert_eq!(plan.current_turn_head, Some(2));
+        assert_eq!(plan.turns_summarised, 0);
     }
 }

@@ -4396,6 +4396,7 @@ async fn compact_sender_history_now(
         focus,
         budget,
         1.0,
+        false,
     )
     .await
     {
