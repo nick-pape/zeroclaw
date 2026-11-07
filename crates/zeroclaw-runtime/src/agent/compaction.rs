@@ -1175,6 +1175,9 @@ Rules:
 - One self-contained fact per entry, one or two sentences, naming its \
 subject explicitly (never \"it\", \"they\" or \"this\"), so it makes sense \
 on its own months later.
+- Name people by name (e.g. Nick, Katie, Dustin) when the summary identifies \
+them, including who stated a preference; use \"the household\" for shared \
+ones. Never write \"the user\".
 - Skip: one-off task details, the results of a single lookup, running totals, \
 transient state, message/transaction/order IDs, anything the assistant merely \
 guessed, and anything EXISTING MEMORIES already say.
