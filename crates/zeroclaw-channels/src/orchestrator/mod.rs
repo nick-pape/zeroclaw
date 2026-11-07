@@ -59272,7 +59272,8 @@ mod compaction_channel_tests {
             Some(true)
         );
 
-        // Nothing older than the protected tail any more.
+        // The protected tail now covers every turn after the summary, so a
+        // second /compact folds the older one in and keeps just the newest.
         let again = compact_sender_history_now(
             ctx.as_ref(),
             &sender,
@@ -59281,7 +59282,21 @@ mod compaction_channel_tests {
             Some("the grocery order"),
         )
         .await;
-        assert!(again.starts_with("Nothing to compact"), "{again}");
+        assert!(again.starts_with("Compacted: ~"), "{again}");
+        let stored = store.load(&sender);
+        assert_eq!(stored.len(), 3, "{stored:?}");
+        assert_eq!(rows(&stored[1..]), rows(&turns[10..]));
+
+        // Only the newest turn is left after the summary: nothing to compact.
+        let third = compact_sender_history_now(
+            ctx.as_ref(),
+            &sender,
+            &route,
+            &snapshot,
+            Some("the grocery order"),
+        )
+        .await;
+        assert!(third.starts_with("Nothing to compact"), "{third}");
     }
 
     #[tokio::test]

@@ -463,8 +463,11 @@ fn calibrated_text_tokens(text: &str, ratio: f64) -> usize {
 /// stopping before an older turn would push the tail above
 /// `keep_recent_max_tokens` (0 = no cap). The newest whole turn is always
 /// kept. Everything between the synthetic slot and the tail is summarised.
-/// Whole turns only, so an assistant tool call is never separated from its
-/// tool results. `None` when nothing older than the tail exists.
+/// When the protected tail would cover every turn (so nothing is left to
+/// summarise), the tail shrinks to the newest turn alone and the rest is
+/// summarised. Whole turns only, so an assistant tool call is never
+/// separated from its tool results. `None` only when the newest turn is the
+/// sole turn after the synthetic slot.
 pub(crate) fn plan_compaction(
     history: &[ChatMessage],
     crumb_present: bool,
@@ -493,6 +496,14 @@ pub(crate) fn plan_compaction(
         }
         tail_start = candidate;
         kept_turns += 1;
+    }
+    // The protected tail swallowed every turn, yet we are over budget (the
+    // only reason a plan is asked for). Fold the older protected turns into
+    // the summary and keep just the newest whole turn: summarising them
+    // beats the whole-turn trim fallback, which would drop them outright.
+    if tail_start <= body_start {
+        tail_start = newest;
+        kept_turns = 1;
     }
     if tail_start <= body_start {
         return None;
@@ -1104,6 +1115,31 @@ mod tests {
         assert_eq!(plan.kept_turns, 1);
         // Nothing older than the newest turn: nothing to compact.
         assert!(plan_compaction(&history[..3], false, 4, 0, 1.0).is_none());
+    }
+
+    #[test]
+    fn protected_tail_covering_every_turn_shrinks_to_newest_turn() {
+        // Summary slot + 4 turns, keep_recent_turns = 4: the tail would cover
+        // every turn. Over budget, the older three are summarised instead of
+        // being left for the whole-turn trim to drop.
+        let mut history = vec![ChatMessage::system("s"), ChatMessage::user("[summary]")];
+        for turn in 0..4 {
+            history.push(ChatMessage::user(format!("turn {turn}")));
+            history.push(ChatMessage::assistant(format!("reply {turn}")));
+        }
+        let plan = plan_compaction(&history, true, 4, 0, 1.0).expect("plan");
+        assert_eq!(plan.body_start, 2);
+        assert_eq!(plan.kept_turns, 1);
+        assert_eq!(plan.turns_summarised, 3);
+        assert_eq!(history[plan.tail_start].content, "turn 3");
+        // Slot + only the newest turn: still nothing to compact.
+        let only_newest = [
+            ChatMessage::system("s"),
+            ChatMessage::user("[summary]"),
+            ChatMessage::user("turn 0"),
+            ChatMessage::assistant("reply 0"),
+        ];
+        assert!(plan_compaction(&only_newest, true, 4, 0, 1.0).is_none());
     }
 
     #[tokio::test]
