@@ -224,6 +224,20 @@ pub fn resolve_inject_policy(
 
 /// The uniform skip set: entries no path wants in a preamble. Union of the
 /// legacy renderers' filters (the channel renderer's set was the widest).
+/// Reserved custom category for an agent's own bookkeeping (what it already
+/// alerted on, which senders it leaves alone, ...). Such rows are read back
+/// explicitly with `memory_recall`; they are never auto-injected into a turn
+/// (nor seen by compaction memory extraction, which reads `core` only).
+pub const STATE_MEMORY_CATEGORY: &str = "state";
+
+fn excluded_category(category: &MemoryCategory, exclude_conversation: bool) -> bool {
+    match category {
+        MemoryCategory::Conversation => exclude_conversation,
+        MemoryCategory::Custom(name) => name.eq_ignore_ascii_case(STATE_MEMORY_CATEGORY),
+        _ => false,
+    }
+}
+
 fn should_skip_entry(key: &str, content: &str) -> bool {
     if zeroclaw_memory::is_assistant_autosave_key(key) {
         return true;
@@ -341,7 +355,7 @@ pub async fn render_memory_context(
         // renderer's skip set so ineligible rows are dropped before the trim,
         // not after, letting over-fetched candidates fill the freed slots.
         entries = rerank::run(entries, &cfg.rerank, |entry| {
-            if exclude_conversation && matches!(entry.category, MemoryCategory::Conversation) {
+            if excluded_category(&entry.category, exclude_conversation) {
                 return false;
             }
             !should_skip_entry(&entry.key, &entry.content)
@@ -362,7 +376,7 @@ pub async fn render_memory_context(
         if included >= cfg.max_entries {
             break;
         }
-        if exclude_conversation && matches!(entry.category, MemoryCategory::Conversation) {
+        if excluded_category(&entry.category, exclude_conversation) {
             continue;
         }
         if should_skip_entry(&entry.key, &entry.content) {
@@ -434,6 +448,26 @@ pub(crate) fn strip_memory_context_preamble<'a>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn state_category_is_never_auto_injected() {
+        use super::excluded_category;
+        assert!(excluded_category(
+            &MemoryCategory::Custom("state".into()),
+            false
+        ));
+        assert!(excluded_category(
+            &MemoryCategory::Custom("State".into()),
+            true
+        ));
+        assert!(!excluded_category(
+            &MemoryCategory::Custom("notes".into()),
+            true
+        ));
+        assert!(!excluded_category(&MemoryCategory::Core, true));
+        assert!(excluded_category(&MemoryCategory::Conversation, true));
+        assert!(!excluded_category(&MemoryCategory::Conversation, false));
+    }
+
     use super::*;
     use async_trait::async_trait;
     use parking_lot::Mutex;

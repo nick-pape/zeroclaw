@@ -4305,6 +4305,139 @@ async fn with_compaction_scope<F: std::future::Future>(
     }
 }
 
+/// How often the idle-compaction sweeper looks for idle conversations.
+const IDLE_COMPACTION_SWEEP_SECS: u64 = 15 * 60;
+
+/// Whether `hour` falls in the overnight window `[start, end)` (wrapping
+/// past midnight when `start > end`; `start == end` = no window).
+fn in_night_window(hour: u8, start: u8, end: u8) -> bool {
+    match start.cmp(&end) {
+        std::cmp::Ordering::Equal => false,
+        std::cmp::Ordering::Less => (start..end).contains(&hour),
+        std::cmp::Ordering::Greater => hour >= start || hour < end,
+    }
+}
+
+/// Idle compaction for one agent: every sweep, compact each of this agent's
+/// channel conversations that has been idle for `idle_after_secs` and fills
+/// at least `idle_min_fill` of its context budget (`idle_night_min_fill`
+/// inside the overnight window), so the summary pause lands while nobody is
+/// waiting. Uses the same path as `/compact`, which refuses to publish when
+/// the conversation changed meanwhile. Each conversation is tried once per
+/// stretch of inactivity.
+fn spawn_idle_compaction(
+    ctx: Arc<ChannelRuntimeContext>,
+    cancel: tokio_util::sync::CancellationToken,
+) {
+    let Some(cfg) = ctx
+        .prompt_config
+        .runtime_profile_for_agent(ctx.agent_alias.as_str())
+        .map(|profile| profile.context_compression.clone())
+        .filter(|cfg| cfg.enabled && cfg.idle_after_secs > 0)
+    else {
+        return;
+    };
+    if ctx.session_store.is_none() {
+        return;
+    }
+    zeroclaw_spawn::spawn!(async move {
+        let mut tried: HashMap<String, chrono::DateTime<chrono::Utc>> = HashMap::new();
+        loop {
+            tokio::select! {
+                () = cancel.cancelled() => return,
+                () = tokio::time::sleep(Duration::from_secs(IDLE_COMPACTION_SWEEP_SECS)) => {}
+            }
+            idle_compaction_sweep(&ctx, &cfg, &mut tried).await;
+        }
+    });
+}
+
+async fn idle_compaction_sweep(
+    ctx: &ChannelRuntimeContext,
+    cfg: &zeroclaw_config::scattered_types::ContextCompressionConfig,
+    tried: &mut HashMap<String, chrono::DateTime<chrono::Utc>>,
+) {
+    use chrono::Timelike;
+    let Some(store) = ctx.session_store.as_ref() else {
+        return;
+    };
+    let now = chrono::Utc::now();
+    let idle_after =
+        chrono::Duration::seconds(i64::try_from(cfg.idle_after_secs).unwrap_or(i64::MAX));
+    let hour = u8::try_from(chrono::Local::now().hour()).unwrap_or(0);
+    let night = in_night_window(hour, cfg.idle_night_start_hour, cfg.idle_night_end_hour);
+    let min_fill = if night {
+        cfg.idle_night_min_fill
+    } else {
+        cfg.idle_min_fill
+    }
+    .clamp(0.0, 1.0);
+    let sessions = store.list_sessions_with_metadata();
+    for meta in sessions {
+        if meta.agent_alias.as_deref() != Some(ctx.agent_alias.as_str())
+            || meta.channel_id.is_none()
+            || now - meta.last_activity < idle_after
+            || tried.get(&meta.key) == Some(&meta.last_activity)
+        {
+            continue;
+        }
+        tried.insert(meta.key.clone(), meta.last_activity);
+        let defaults_snapshot = runtime_defaults_snapshot(ctx);
+        let current = ctx
+            .route_overrides
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&meta.key)
+            .cloned()
+            .unwrap_or_else(|| default_route_selection_from_snapshot(&defaults_snapshot));
+        let budget = compaction_budget_for(ctx, &current, &defaults_snapshot);
+        let history = store.load(&meta.key);
+        let tokens = zeroclaw_runtime::agent::history::estimate_history_tokens(&history);
+        let threshold = (budget as f64 * min_fill) as usize;
+        if budget == 0 || tokens < threshold {
+            continue;
+        }
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Start)
+                .with_category(::zeroclaw_log::EventCategory::Agent)
+                .with_attrs(::serde_json::json!({
+                    "event": "idle_compaction_candidate",
+                    "session_key": meta.key,
+                    "idle_secs": (now - meta.last_activity).num_seconds(),
+                    "estimated_tokens": tokens,
+                    "threshold_tokens": threshold,
+                    "night_window": night,
+                })),
+            format!(
+                "Idle compaction: {} idle {}s at ~{tokens} tok",
+                meta.key,
+                (now - meta.last_activity).num_seconds()
+            )
+        );
+        let reply = compact_sender_history_with_trigger(
+            ctx,
+            &meta.key,
+            &current,
+            &defaults_snapshot,
+            None,
+            "idle",
+        )
+        .await;
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete)
+                .with_category(::zeroclaw_log::EventCategory::Agent)
+                .with_attrs(::serde_json::json!({
+                    "event": "idle_compaction_result",
+                    "session_key": meta.key,
+                    "reply": reply,
+                })),
+            "Idle compaction finished"
+        );
+    }
+}
+
 /// Manual `/compact [focus]`: summarise the sender's older turns now,
 /// regardless of size, keeping the protected verbatim tail. No model turn
 /// runs. The summary call happens outside the per-sender persist lock; the
@@ -4317,6 +4450,46 @@ async fn compact_sender_history_now(
     current: &ChannelRouteSelection,
     defaults_snapshot: &ChannelRuntimeDefaultsSnapshot,
     focus: Option<&str>,
+) -> String {
+    compact_sender_history_with_trigger(
+        ctx,
+        sender_key,
+        current,
+        defaults_snapshot,
+        focus,
+        "manual",
+    )
+    .await
+}
+
+/// The context budget compaction works against for this sender's route.
+fn compaction_budget_for(
+    ctx: &ChannelRuntimeContext,
+    current: &ChannelRouteSelection,
+    defaults_snapshot: &ChannelRuntimeDefaultsSnapshot,
+) -> usize {
+    let limits = resolve_channel_context_limits(
+        defaults_snapshot.config.as_ref(),
+        ctx.agent_alias.as_str(),
+        current,
+        ctx.context_token_budget,
+    );
+    if limits.context_token_budget == 0 {
+        limits.model_context_window
+    } else {
+        limits.context_token_budget.min(limits.model_context_window)
+    }
+}
+
+/// [`compact_sender_history_now`] with an explicit trigger label (`manual`
+/// for `/compact`, `idle` for idle compaction).
+async fn compact_sender_history_with_trigger(
+    ctx: &ChannelRuntimeContext,
+    sender_key: &str,
+    current: &ChannelRouteSelection,
+    defaults_snapshot: &ChannelRuntimeDefaultsSnapshot,
+    focus: Option<&str>,
+    trigger: &str,
 ) -> String {
     use zeroclaw_runtime::agent::compaction::{
         CompactionError, CompactionSettings, LeadProvenance, run_compaction,
@@ -4354,17 +4527,7 @@ async fn compact_sender_history_now(
         (snapshot, crumb_present, summary_present)
     };
 
-    let limits = resolve_channel_context_limits(
-        defaults_snapshot.config.as_ref(),
-        ctx.agent_alias.as_str(),
-        current,
-        ctx.context_token_budget,
-    );
-    let budget = if limits.context_token_budget == 0 {
-        limits.model_context_window
-    } else {
-        limits.context_token_budget.min(limits.model_context_window)
-    };
+    let budget = compaction_budget_for(ctx, current, defaults_snapshot);
     // The agent's own route is the summary model only when no
     // `summary_provider` is configured.
     let fallback_provider = get_or_create_provider(
@@ -4384,21 +4547,30 @@ async fn compact_sender_history_now(
     });
     let mut compacted = snapshot.clone();
     let mut lead = LeadProvenance::new(crumb_present, summary_present);
-    let outcome = match run_compaction(
-        "manual",
-        Some(defaults_snapshot.config.as_ref()),
-        Some(ctx.agent_alias.as_str()),
-        fallback,
-        &settings,
-        Some(sender_key),
-        &mut compacted,
-        &mut lead,
-        focus,
-        budget,
-        1.0,
-        false,
-    )
-    .await
+    let scope = zeroclaw_runtime::agent::compaction::CompactionScope::with_memory(
+        summary_present,
+        Some(sender_key.to_string()),
+        Some(Arc::clone(&ctx.memory)),
+    );
+    let outcome = match zeroclaw_runtime::agent::compaction::COMPACTION_SCOPE
+        .scope(
+            scope,
+            run_compaction(
+                trigger,
+                Some(defaults_snapshot.config.as_ref()),
+                Some(ctx.agent_alias.as_str()),
+                fallback,
+                &settings,
+                Some(sender_key),
+                &mut compacted,
+                &mut lead,
+                focus,
+                budget,
+                1.0,
+                false,
+            ),
+        )
+        .await
     {
         Ok(outcome) => outcome,
         Err(CompactionError::NothingToCompact) => {
@@ -10251,9 +10423,10 @@ async fn process_channel_message_body(
     let summary_present_before_loop =
         resolve_summary_provenance(ctx.as_ref(), &history_key, history_has_trim_breadcrumb);
     let compaction_scope = compaction_enabled(ctx.as_ref()).then(|| {
-        zeroclaw_runtime::agent::compaction::CompactionScope::new(
+        zeroclaw_runtime::agent::compaction::CompactionScope::with_memory(
             summary_present_before_loop,
             Some(history_key.clone()),
+            Some(Arc::clone(&ctx.memory)),
         )
     });
     // Unused by this channel path: the pre-injection raw turn content is
@@ -18231,6 +18404,10 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
             (alias.clone(), Arc::new(owner))
         })
         .collect();
+
+    for ctx in agent_ctxs.values() {
+        spawn_idle_compaction(Arc::clone(ctx), cancel.clone());
+    }
 
     let router = AgentRouter::multi(
         agent_ctxs,
@@ -59316,5 +59493,24 @@ mod compaction_channel_tests {
         };
         let reply = compact_sender_history_now(ctx.as_ref(), "s", &route, &snapshot, None).await;
         assert!(reply.contains("not enabled"), "{reply}");
+    }
+}
+
+#[cfg(test)]
+mod idle_compaction_tests {
+    use super::in_night_window;
+
+    #[test]
+    fn night_window_handles_plain_wrapping_and_disabled_ranges() {
+        assert!(in_night_window(2, 2, 5));
+        assert!(in_night_window(4, 2, 5));
+        assert!(!in_night_window(5, 2, 5));
+        assert!(!in_night_window(1, 2, 5));
+        // 22:00-04:00 wraps past midnight.
+        assert!(in_night_window(23, 22, 4));
+        assert!(in_night_window(0, 22, 4));
+        assert!(!in_night_window(12, 22, 4));
+        // Equal hours = no window.
+        assert!(!in_night_window(3, 3, 3));
     }
 }

@@ -348,6 +348,18 @@ fn default_cc_keep_recent_turns() -> usize {
 fn default_cc_keep_recent_max_tokens() -> usize {
     40_000
 }
+fn default_cc_idle_min_fill() -> f64 {
+    0.5
+}
+fn default_cc_idle_night_min_fill() -> f64 {
+    0.25
+}
+fn default_cc_idle_night_start_hour() -> u8 {
+    2
+}
+fn default_cc_idle_night_end_hour() -> u8 {
+    5
+}
 fn default_identifier_policy() -> String {
     "strict".to_string()
 }
@@ -405,6 +417,41 @@ pub struct ContextCompressionConfig {
     /// system prompt of the summary call). Empty/unset = built-in prompt.
     #[serde(default)]
     pub prompt: Option<String>,
+    /// Hard ceiling (calibrated tokens) for the summary message. Once the
+    /// carried summary plus the newest part passes `summary_max_tokens`, the
+    /// older part is consolidated; a consolidation that looks lossy is kept
+    /// out only while the summary stays under this ceiling, and above it the
+    /// oldest text is cut. `0` = 3 x `summary_max_tokens`.
+    #[serde(default)]
+    pub summary_hard_max_tokens: usize,
+    /// Idle compaction: compact a conversation that has had no activity for
+    /// this many seconds and fills at least `idle_min_fill` of the context
+    /// budget, so the summary pause happens while nobody is waiting. `0`
+    /// (default) = off.
+    #[serde(default)]
+    pub idle_after_secs: u64,
+    /// Fraction of the context budget (0-1) an idle conversation must fill
+    /// before idle compaction runs. Default `0.5`.
+    #[serde(default = "default_cc_idle_min_fill")]
+    pub idle_min_fill: f64,
+    /// Local hour (0-23) the overnight window opens, during which idle
+    /// compaction uses `idle_night_min_fill` instead. Equal start and end
+    /// hours disable the window. Default `2`.
+    #[serde(default = "default_cc_idle_night_start_hour")]
+    pub idle_night_start_hour: u8,
+    /// Local hour (0-23, exclusive) the overnight window closes. Default `5`.
+    #[serde(default = "default_cc_idle_night_end_hour")]
+    pub idle_night_end_hour: u8,
+    /// Fill threshold inside the overnight window. Default `0.25`.
+    #[serde(default = "default_cc_idle_night_min_fill")]
+    pub idle_night_min_fill: f64,
+    /// After each compaction, extract durable facts (preferences, decisions,
+    /// rules, prohibitions, people, procedures) from the newly summarised
+    /// part into long-term memory, one self-contained fact per entry, adding
+    /// or updating by key. Runs in the background with the summary model.
+    /// Default `false`.
+    #[serde(default)]
+    pub extract_memories: bool,
     /// LEGACY (ignored).
     #[serde(default = "default_threshold_ratio")]
     pub threshold_ratio: f64,
@@ -448,6 +495,13 @@ impl Default for ContextCompressionConfig {
             keep_recent_max_tokens: default_cc_keep_recent_max_tokens(),
             timeout_secs: default_cc_timeout_secs(),
             prompt: None,
+            summary_hard_max_tokens: 0,
+            idle_after_secs: 0,
+            idle_min_fill: default_cc_idle_min_fill(),
+            idle_night_start_hour: default_cc_idle_night_start_hour(),
+            idle_night_end_hour: default_cc_idle_night_end_hour(),
+            idle_night_min_fill: default_cc_idle_night_min_fill(),
+            extract_memories: false,
             threshold_ratio: default_threshold_ratio(),
             protect_first_n: default_protect_first_n(),
             protect_last_n: default_protect_last_n(),

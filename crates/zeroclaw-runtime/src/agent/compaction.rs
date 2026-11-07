@@ -203,6 +203,11 @@ pub struct CompactionSettings {
     pub keep_recent_max_tokens: usize,
     pub timeout_secs: u64,
     pub prompt: Option<String>,
+    /// Ceiling for the summary message (see `summary_hard_max_tokens`),
+    /// already resolved (`0` in config = 3 x `summary_max_tokens`).
+    pub summary_hard_max_tokens: usize,
+    /// Extract durable facts into long-term memory after each compaction.
+    pub extract_memories: bool,
 }
 
 impl CompactionSettings {
@@ -220,6 +225,12 @@ impl CompactionSettings {
                 .map(str::trim)
                 .filter(|prompt| !prompt.is_empty())
                 .map(str::to_string),
+            summary_hard_max_tokens: if cfg.summary_hard_max_tokens == 0 {
+                cfg.summary_max_tokens.saturating_mul(3)
+            } else {
+                cfg.summary_hard_max_tokens.max(cfg.summary_max_tokens)
+            },
+            extract_memories: cfg.extract_memories,
         }
     }
 
@@ -234,6 +245,16 @@ impl CompactionSettings {
 
     fn system_prompt(&self) -> &str {
         self.prompt.as_deref().unwrap_or(DEFAULT_COMPACTION_PROMPT)
+    }
+
+    /// Effective summary ceiling: `summary_hard_max_tokens`, or 3 x
+    /// `summary_max_tokens` when unset.
+    fn hard_max_tokens(&self) -> usize {
+        if self.summary_hard_max_tokens == 0 {
+            self.summary_max_tokens.saturating_mul(3)
+        } else {
+            self.summary_hard_max_tokens.max(self.summary_max_tokens)
+        }
     }
 }
 
@@ -274,16 +295,44 @@ pub struct CompactionScope {
     summary_present: Mutex<bool>,
     compactions: AtomicUsize,
     session_key: Option<String>,
+    memory: Option<MemoryHandle>,
+}
+
+/// The history owner's agent-scoped long-term memory, for extraction.
+#[derive(Clone)]
+pub struct MemoryHandle(pub Arc<dyn zeroclaw_memory::Memory>);
+
+impl std::fmt::Debug for MemoryHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "MemoryHandle({})", self.0.name())
+    }
 }
 
 impl CompactionScope {
     #[must_use]
     pub fn new(summary_present: bool, session_key: Option<String>) -> Arc<Self> {
+        Self::with_memory(summary_present, session_key, None)
+    }
+
+    /// Like [`new`](Self::new), also carrying the agent's long-term memory so
+    /// a compaction under this scope can extract durable facts into it.
+    #[must_use]
+    pub fn with_memory(
+        summary_present: bool,
+        session_key: Option<String>,
+        memory: Option<Arc<dyn zeroclaw_memory::Memory>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             summary_present: Mutex::new(summary_present),
             compactions: AtomicUsize::new(0),
             session_key,
+            memory: memory.map(MemoryHandle),
         })
+    }
+
+    #[must_use]
+    pub fn memory(&self) -> Option<Arc<dyn zeroclaw_memory::Memory>> {
+        self.memory.as_ref().map(|handle| Arc::clone(&handle.0))
     }
 
     #[must_use]
@@ -530,6 +579,9 @@ pub struct CompactionOutcome {
     /// When the in-progress turn was split: its user message's index before
     /// and after compaction (it is kept verbatim but moves).
     pub current_turn_moved: Option<(usize, usize)>,
+    /// The summary of just the turns summarised by THIS compaction (without
+    /// the carried older summary): the material for memory extraction.
+    pub new_summary_part: String,
 }
 
 /// Where a compaction cuts the history.
@@ -914,48 +966,22 @@ pub async fn compact_history(
     }
     let new_part = running.ok_or(CompactionError::EmptySummary)?;
     let summary = match carried {
-        None => new_part,
+        None => new_part.clone(),
         Some(carried) => {
-            let combined = format!("{carried}\n\n{LATER_TURNS_HEADING}\n\n{new_part}");
-            let combined_tokens = calibrated_text_tokens(&combined, ratio);
-            if combined_tokens <= settings.summary_max_tokens || combined_tokens > per_call_budget {
-                // Under the cap: keep it all, verbatim. Too big for one
-                // consolidation call: also keep it verbatim (over the cap
-                // beats losing facts; the projection check decides fit).
-                combined
-            } else {
-                let material = format!(
-                    "PREVIOUS SUMMARY of even older turns (fold ALL of it into the new summary; \
-                     it is over the length limit, so merge duplicates and tighten wording, but \
-                     keep every fact, identifier, amount and date):\n{combined}"
-                );
-                let consolidated = summarizer
-                    .summarize(system_prompt, &material)
-                    .await
-                    .map_err(CompactionError::Summarizer)?;
-                calls += 1;
-                let consolidated = strip_echoed_labels(&consolidated);
-                // A consolidation that kept less than 40% of the text dropped
-                // facts, not just duplicates: keep the verbatim combination.
-                if consolidated.len() * 10 < combined.len() * 4 {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_category(::zeroclaw_log::EventCategory::Agent)
-                            .with_attrs(::serde_json::json!({
-                                "event": "compaction_consolidation_rejected",
-                                "combined_chars": combined.len(),
-                                "consolidated_chars": consolidated.len(),
-                            })),
-                        "Summary consolidation looked lossy; keeping the verbatim summary"
-                    );
-                    combined
-                } else {
-                    consolidated
-                }
-            }
+            merge_carried_summary(
+                summarizer,
+                system_prompt,
+                settings,
+                ratio,
+                per_call_budget,
+                &carried,
+                &new_part,
+                &mut calls,
+            )
+            .await
         }
     };
+
     let message = ChatMessage::user(format!(
         "{}\n\n{summary}\n\n{SUMMARY_END_MARKER}",
         summary_header()
@@ -986,15 +1012,368 @@ pub async fn compact_history(
         folded_previous_summary,
         iterations_summarised: plan.iterations_summarised,
         current_turn_moved,
+        new_summary_part: new_part,
     })
 }
 
-/// Memory-extraction seam: called once after every successful compaction
-/// with the new summary and the conversation's session key. Deliberately
-/// inert — the summary is NOT written to the memory backend.
-///
-/// TODO(memory extraction from compaction summaries): pull durable facts out
-/// of `summary` into the memory backend here (a separate, later task).
+/// Join the carried summary and the summary of the newer turns, keeping the
+/// result bounded. Under `summary_max_tokens` both parts are kept verbatim.
+/// Over it, only the OLDER (carried) part is consolidated, so the newest part
+/// is never rewritten; a consolidation that kept under 40% of the text is
+/// treated as lossy and refused while the verbatim join stays under the hard
+/// ceiling. Above the ceiling the consolidation is accepted anyway, and if
+/// the result is still over, the oldest text is cut with a visible marker.
+/// Never fails: a failed consolidation call falls back to the same rules.
+#[allow(clippy::too_many_arguments)]
+async fn merge_carried_summary(
+    summarizer: &dyn Summarizer,
+    system_prompt: &str,
+    settings: &CompactionSettings,
+    ratio: f64,
+    per_call_budget: usize,
+    carried: &str,
+    new_part: &str,
+    calls: &mut usize,
+) -> String {
+    let join = |older: &str| format!("{older}\n\n{LATER_TURNS_HEADING}\n\n{new_part}");
+    let combined = join(carried);
+    let combined_tokens = calibrated_text_tokens(&combined, ratio);
+    if combined_tokens <= settings.summary_max_tokens {
+        return combined;
+    }
+    let ceiling = settings.hard_max_tokens();
+    let new_tokens = calibrated_text_tokens(new_part, ratio);
+    let target = settings
+        .summary_max_tokens
+        .saturating_sub(new_tokens)
+        .max(settings.summary_max_tokens / 2);
+
+    let carried_tokens = calibrated_text_tokens(carried, ratio);
+    let consolidated = if carried_tokens + 1_024 <= per_call_budget {
+        let material = format!(
+            "PREVIOUS SUMMARY of even older turns, over the length limit. Rewrite it shorter, \
+             aiming for at most about {target} tokens: merge duplicates, drop superseded \
+             details and tighten wording, but keep every decision, preference, rule, \
+             prohibition, open item, identifier, amount and date. Keep the same section \
+             layout. Output only the rewritten summary.\n\n{carried}"
+        );
+        match summarizer.summarize(system_prompt, &material).await {
+            Ok(text) => {
+                *calls += 1;
+                Some(strip_echoed_labels(&text)).filter(|text| !text.is_empty())
+            }
+            Err(error) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_category(::zeroclaw_log::EventCategory::Agent)
+                        .with_attrs(::serde_json::json!({
+                            "event": "compaction_consolidation_failed",
+                            "error": error.to_string(),
+                        })),
+                    "Summary consolidation call failed; applying the size rules without it"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let over_ceiling = combined_tokens > ceiling;
+    let merged = match consolidated {
+        Some(text) if text.len() * 10 >= carried.len() * 4 => join(&text),
+        Some(text) if over_ceiling => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_category(::zeroclaw_log::EventCategory::Agent)
+                    .with_attrs(::serde_json::json!({
+                        "event": "compaction_consolidation_forced",
+                        "carried_chars": carried.len(),
+                        "consolidated_chars": text.len(),
+                        "combined_tokens": combined_tokens,
+                        "ceiling_tokens": ceiling,
+                    })),
+                "Summary is over its hard ceiling; accepting a short consolidation"
+            );
+            join(&text)
+        }
+        Some(text) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_category(::zeroclaw_log::EventCategory::Agent)
+                    .with_attrs(::serde_json::json!({
+                        "event": "compaction_consolidation_rejected",
+                        "combined_chars": combined.len(),
+                        "consolidated_chars": text.len(),
+                    })),
+                "Summary consolidation looked lossy; keeping the verbatim summary"
+            );
+            combined
+        }
+        None => combined,
+    };
+    cut_oldest_to_ceiling(&merged, new_part, ceiling, ratio)
+}
+
+/// Marks where the oldest summary text was cut to respect the ceiling.
+const SUMMARY_CUT_MARKER: &str =
+    "[The oldest part of this summary was cut to stay within the summary size limit.]";
+
+/// If `merged` is over `ceiling`, drop text from the front (whole paragraphs
+/// where possible) of the part before the newest `new_part`, keeping the
+/// newest part intact and marking the cut.
+fn cut_oldest_to_ceiling(merged: &str, new_part: &str, ceiling: usize, ratio: f64) -> String {
+    if calibrated_text_tokens(merged, ratio) <= ceiling {
+        return merged.to_string();
+    }
+    let tail = format!("\n\n{LATER_TURNS_HEADING}\n\n{new_part}");
+    let Some(older) = merged.strip_suffix(tail.as_str()) else {
+        return merged.to_string();
+    };
+    let room_tokens = ceiling.saturating_sub(calibrated_text_tokens(&tail, ratio) + 64);
+    let budget_chars = ((room_tokens as f64 / ratio.max(1.0)) as usize).saturating_mul(4);
+    if budget_chars == 0 {
+        return format!("{SUMMARY_CUT_MARKER}{tail}");
+    }
+    let mut start = older.len().saturating_sub(budget_chars);
+    while !older.is_char_boundary(start) {
+        start += 1;
+    }
+    if let Some(paragraph) = older[start..].find("\n\n") {
+        start += paragraph + 2;
+    }
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_category(::zeroclaw_log::EventCategory::Agent)
+            .with_attrs(::serde_json::json!({
+                "event": "compaction_summary_cut",
+                "cut_chars": start,
+                "ceiling_tokens": ceiling,
+            })),
+        "Summary over its hard ceiling; cut the oldest text"
+    );
+    format!(
+        "{SUMMARY_CUT_MARKER}\n\n{}{tail}",
+        older[start..].trim_start()
+    )
+}
+
+/// System prompt of the memory-extraction call.
+pub const MEMORY_EXTRACTION_PROMPT: &str = "\
+You maintain an AI assistant's long-term memory. You are given a summary of \
+part of a conversation and the memories the assistant already has. Extract \
+only DURABLE knowledge worth remembering in future, unrelated conversations: \
+the user's preferences, decisions and standing rules, prohibitions (\"don't \
+do X\"), facts about the people, places, pets, accounts and things in their \
+life, and reusable how-to lessons learned from mistakes.
+
+Rules:
+- One self-contained fact per entry, one or two sentences, naming its \
+subject explicitly (never \"it\", \"they\" or \"this\"), so it makes sense \
+on its own months later.
+- Skip: one-off task details, the results of a single lookup, running totals, \
+transient state, message/transaction/order IDs, anything the assistant merely \
+guessed, and anything EXISTING MEMORIES already say.
+- If a fact updates or contradicts an existing memory, output op \"update\" \
+with that memory's exact key and the full new content. Otherwise op \"add\" \
+with a new key.
+- Keys: lowercase snake_case, subject first then attribute, 3-60 \
+characters, e.g. people_dustin_food_dislikes, rule_category_taco_deli, \
+prohibition_no_email_to_others.
+- type: one of preference, decision, rule, prohibition, person, fact, \
+procedure.
+- Output ONLY a JSON array (use [] when nothing qualifies) of objects \
+{\"op\": ..., \"key\": ..., \"type\": ..., \"content\": ...}, at most 15.";
+
+/// Cap on memory operations applied from one extraction.
+const MAX_EXTRACTED_MEMORIES: usize = 15;
+/// Existing memories shown to the extractor (newest first).
+const MAX_EXISTING_MEMORIES_SHOWN: usize = 200;
+
+/// One validated memory write proposed by the extractor.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ExtractedMemory {
+    pub key: String,
+    pub content: String,
+    pub kind: String,
+    pub importance: f64,
+}
+
+fn normalize_memory_key(raw: &str) -> Option<String> {
+    let mut key = String::with_capacity(raw.len());
+    for c in raw.trim().chars() {
+        let c = c.to_ascii_lowercase();
+        if c.is_ascii_alphanumeric() {
+            key.push(c);
+        } else if !key.ends_with('_') {
+            key.push('_');
+        }
+    }
+    let key = key.trim_matches('_').to_string();
+    (3..=64).contains(&key.len()).then_some(key)
+}
+
+fn importance_for_kind(kind: &str) -> f64 {
+    match kind {
+        "prohibition" => 0.9,
+        "rule" | "decision" => 0.85,
+        "preference" | "person" => 0.8,
+        "procedure" => 0.75,
+        _ => 0.7,
+    }
+}
+
+/// Parse and validate the extractor's reply: the JSON array is located
+/// inside any surrounding prose; malformed or out-of-bounds entries are
+/// dropped, duplicates by key keep the first.
+pub(crate) fn parse_extracted_memories(reply: &str) -> Vec<ExtractedMemory> {
+    let (Some(start), Some(end)) = (reply.find('['), reply.rfind(']')) else {
+        return Vec::new();
+    };
+    if end <= start {
+        return Vec::new();
+    }
+    let Ok(items) = serde_json::from_str::<Vec<serde_json::Value>>(&reply[start..=end]) else {
+        return Vec::new();
+    };
+    let mut seen = std::collections::HashSet::new();
+    items
+        .iter()
+        .filter_map(|item| {
+            let op = item.get("op")?.as_str()?.trim().to_ascii_lowercase();
+            if op != "add" && op != "update" {
+                return None;
+            }
+            let key = normalize_memory_key(item.get("key")?.as_str()?)?;
+            let content = item.get("content")?.as_str()?.trim().to_string();
+            if !(12..=600).contains(&content.chars().count()) {
+                return None;
+            }
+            let kind = item
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("fact")
+                .trim()
+                .to_ascii_lowercase();
+            seen.insert(key.clone()).then(|| ExtractedMemory {
+                importance: importance_for_kind(&kind),
+                key,
+                content,
+                kind,
+            })
+        })
+        .take(MAX_EXTRACTED_MEMORIES)
+        .collect()
+}
+
+/// Counts from one extraction run.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ExtractionCounts {
+    pub added: usize,
+    pub updated: usize,
+    pub unchanged: usize,
+}
+
+/// Extract durable facts from `summary_part` into `memory` (the agent's
+/// scoped long-term memory): one summary-model call that sees the existing
+/// memories, then add/overwrite by key. Existing entries with identical
+/// content are left alone.
+pub async fn extract_memories(
+    summarizer: &dyn Summarizer,
+    memory: &dyn zeroclaw_memory::Memory,
+    summary_part: &str,
+) -> anyhow::Result<ExtractionCounts> {
+    let mut existing = memory
+        .list(Some(&zeroclaw_memory::MemoryCategory::Core), None)
+        .await?;
+    existing.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    let mut material = String::from("EXISTING MEMORIES (key: content):\n");
+    if existing.is_empty() {
+        material.push_str("(none)\n");
+    }
+    for entry in existing.iter().take(MAX_EXISTING_MEMORIES_SHOWN) {
+        let content: String = entry.content.chars().take(300).collect();
+        let _ = writeln!(material, "- {}: {}", entry.key, content.replace('\n', " "));
+    }
+    let _ = write!(material, "\nCONVERSATION SUMMARY:\n{summary_part}");
+    let reply = summarizer
+        .summarize(MEMORY_EXTRACTION_PROMPT, &material)
+        .await?;
+    let mut counts = ExtractionCounts::default();
+    for fact in parse_extracted_memories(&reply) {
+        match existing.iter().find(|entry| entry.key == fact.key) {
+            Some(entry) if entry.content.trim() == fact.content => {
+                counts.unchanged += 1;
+                continue;
+            }
+            Some(_) => counts.updated += 1,
+            None => counts.added += 1,
+        }
+        memory
+            .store_with_metadata(
+                &fact.key,
+                &fact.content,
+                zeroclaw_memory::MemoryCategory::Core,
+                None,
+                None,
+                Some(fact.importance),
+            )
+            .await?;
+    }
+    Ok(counts)
+}
+
+/// Run [`extract_memories`] in the background after a compaction, logging
+/// the result; never affects the compaction itself.
+fn spawn_memory_extraction(
+    summarizer: ProviderSummarizer<'static>,
+    memory: Arc<dyn zeroclaw_memory::Memory>,
+    session_key: Option<String>,
+    summary_part: String,
+) {
+    zeroclaw_spawn::spawn!(async move {
+        let result = extract_memories(&summarizer, memory.as_ref(), &summary_part).await;
+        match result {
+            Ok(counts) => ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete)
+                    .with_category(::zeroclaw_log::EventCategory::Agent)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                    .with_attrs(::serde_json::json!({
+                        "event": "compaction_memory_extraction",
+                        "session_key": session_key,
+                        "added": counts.added,
+                        "updated": counts.updated,
+                        "unchanged": counts.unchanged,
+                    })),
+                format!(
+                    "Memory extraction after compaction: {} added, {} updated",
+                    counts.added, counts.updated
+                )
+            ),
+            Err(error) => ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_category(::zeroclaw_log::EventCategory::Agent)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "event": "compaction_memory_extraction_failed",
+                        "session_key": session_key,
+                        "error": error.to_string(),
+                    })),
+                "Memory extraction after compaction failed"
+            ),
+        }
+    });
+}
+
+/// Debug seam called once after every successful compaction with the full
+/// summary. Memory extraction (`extract_memories` setting) runs separately,
+/// from `run_compaction`, on just the newly summarised part.
 pub fn on_compaction_summary(session_key: Option<&str>, summary: &str) {
     ::zeroclaw_log::record!(
         DEBUG,
@@ -1005,7 +1384,7 @@ pub fn on_compaction_summary(session_key: Option<&str>, summary: &str) {
                 "session_key": session_key,
                 "summary_chars": summary.chars().count(),
             })),
-        "compaction summary available for memory extraction (not implemented)"
+        "compaction summary available"
     );
 }
 
@@ -1194,8 +1573,36 @@ pub async fn run_compaction(
     );
     if let Ok(outcome) = &result {
         on_compaction_summary(session_key, &outcome.summary);
-        if let Some(scope) = current_scope() {
+        let scope = current_scope();
+        if let Some(scope) = &scope {
             scope.record_compaction();
+        }
+        if settings.extract_memories {
+            // A configured (owned) summary provider is required: the
+            // agent's own borrowed route cannot outlive this call.
+            match (scope.and_then(|scope| scope.memory()), configured) {
+                (Some(memory), Some(summarizer)) => spawn_memory_extraction(
+                    summarizer,
+                    memory,
+                    session_key.map(str::to_string),
+                    outcome.new_summary_part.clone(),
+                ),
+                (memory, _) => ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_category(::zeroclaw_log::EventCategory::Agent)
+                        .with_attrs(::serde_json::json!({
+                            "event": "compaction_memory_extraction_skipped",
+                            "session_key": session_key,
+                            "reason": if memory.is_none() {
+                                "no memory handle on the compaction scope"
+                            } else {
+                                "no summary_provider configured"
+                            },
+                        })),
+                    "Memory extraction skipped"
+                ),
+            }
         }
     }
     result
@@ -1258,6 +1665,8 @@ mod tests {
             keep_recent_max_tokens: keep_max_tokens,
             timeout_secs: 5,
             prompt: None,
+            summary_hard_max_tokens: 0,
+            extract_memories: false,
         }
     }
 
@@ -1491,6 +1900,13 @@ mod tests {
     }
 
     async fn compact_twice_with(consolidate_pct: usize) -> (Vec<ChatMessage>, usize, Vec<String>) {
+        compact_twice_with_ceiling(consolidate_pct, 0).await
+    }
+
+    async fn compact_twice_with_ceiling(
+        consolidate_pct: usize,
+        hard_max_tokens: usize,
+    ) -> (Vec<ChatMessage>, usize, Vec<String>) {
         let mut history = conversation(6);
         let mut lead = LeadProvenance::default();
         // ~1,500 tokens per summary; two together pass the 2,000-token cap.
@@ -1499,7 +1915,10 @@ mod tests {
             consolidate_pct,
             seen: std::sync::Mutex::new(Vec::new()),
         };
-        let settings = settings(2, 0);
+        let settings = CompactionSettings {
+            summary_hard_max_tokens: hard_max_tokens,
+            ..settings(2, 0)
+        };
         compact_history(&mut history, &mut lead, &summarizer, &request(&settings))
             .await
             .expect("first compaction");
@@ -1514,14 +1933,132 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn summary_over_the_cap_is_consolidated() {
+    async fn summary_over_the_cap_consolidates_only_the_older_part() {
         let (history, calls, seen) = compact_twice_with(60).await;
         assert_eq!(calls, 2, "new-turns call + consolidation call");
         assert_eq!(seen.len(), 3);
+        // Only the carried (older) summary goes to the consolidation call.
         assert!(seen[2].starts_with("PREVIOUS SUMMARY"));
-        assert!(seen[2].contains(LATER_TURNS_HEADING));
-        assert!(history[1].content.contains("ccc"));
-        assert!(!history[1].content.contains(LATER_TURNS_HEADING));
+        assert!(!seen[2].contains(LATER_TURNS_HEADING));
+        // The rewritten older part, then the newest part verbatim.
+        let slot = &history[1].content;
+        let older_at = slot.find("ccc").expect("consolidated older part");
+        let heading_at = slot.find(LATER_TURNS_HEADING).expect("heading");
+        assert!(older_at < heading_at);
+        assert_eq!(slot.matches(&"b".repeat(6_000)).count(), 1);
+    }
+
+    #[tokio::test]
+    async fn lossy_consolidation_is_forced_above_the_hard_ceiling() {
+        // ~3,000-token join over a 2,500-token ceiling: the short rewrite is
+        // accepted instead of letting the summary keep growing.
+        let (history, _calls, _seen) = compact_twice_with_ceiling(10, 2_500).await;
+        let slot = &history[1].content;
+        assert!(slot.contains("ccc"));
+        assert!(slot.contains(LATER_TURNS_HEADING));
+        assert_eq!(slot.matches(&"b".repeat(6_000)).count(), 1);
+    }
+
+    #[tokio::test]
+    async fn summary_still_over_the_ceiling_cuts_the_oldest_text() {
+        // The "consolidation" grows the text, so the join stays over the
+        // ceiling and the oldest text is cut, keeping the newest part whole.
+        let (history, _calls, _seen) = compact_twice_with_ceiling(150, 2_500).await;
+        let slot = &history[1].content;
+        assert!(slot.contains(SUMMARY_CUT_MARKER), "{}", &slot[..200]);
+        assert!(slot.contains(&"b".repeat(6_000)));
+        assert!(slot.ends_with(SUMMARY_END_MARKER));
+        assert!(calibrated_text_tokens(slot, 1.0) <= 2_500 + 200);
+    }
+
+    #[test]
+    fn extracted_memories_are_parsed_and_validated() {
+        let reply = r#"Here you go:
+[
+  {"op": "add", "key": "People Dustin / food dislikes", "type": "person", "content": "Dustin (age 4) dislikes vegetables and saucy foods."},
+  {"op": "update", "key": "rule_category_taco_deli", "type": "rule", "content": "Taco Deli charges are categorised as Dining."},
+  {"op": "add", "key": "x", "type": "fact", "content": "key too short so this is dropped"},
+  {"op": "delete", "key": "something_else", "type": "fact", "content": "unsupported op is dropped"},
+  {"op": "add", "key": "too_short_content", "type": "fact", "content": "tiny"},
+  {"op": "add", "key": "people_dustin_food_dislikes", "type": "person", "content": "duplicate key keeps the first entry"}
+]
+done"#;
+        let facts = parse_extracted_memories(reply);
+        assert_eq!(facts.len(), 2, "{facts:?}");
+        assert_eq!(facts[0].key, "people_dustin_food_dislikes");
+        assert!((facts[0].importance - 0.8).abs() < f64::EPSILON);
+        assert_eq!(facts[1].key, "rule_category_taco_deli");
+        assert!((facts[1].importance - 0.85).abs() < f64::EPSILON);
+        assert!(parse_extracted_memories("no json here").is_empty());
+        assert!(parse_extracted_memories("[not valid").is_empty());
+    }
+
+    struct ReplySummarizer(String, StdMutex<Vec<String>>);
+
+    #[async_trait::async_trait]
+    impl Summarizer for ReplySummarizer {
+        async fn summarize(&self, system: &str, material: &str) -> anyhow::Result<String> {
+            assert_eq!(system, MEMORY_EXTRACTION_PROMPT);
+            self.1.lock().unwrap().push(material.to_string());
+            Ok(self.0.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn extraction_adds_updates_and_skips_unchanged_by_key() {
+        use zeroclaw_memory::{Memory, MemoryCategory, SqliteMemory};
+        let tmp = tempfile::tempdir().unwrap();
+        let memory = SqliteMemory::new("test", tmp.path()).unwrap();
+        memory
+            .store(
+                "pizza_night",
+                "Friday is homemade pizza night.",
+                MemoryCategory::Core,
+                None,
+            )
+            .await
+            .unwrap();
+        memory
+            .store(
+                "people_dustin_age",
+                "Dustin is 3.",
+                MemoryCategory::Core,
+                None,
+            )
+            .await
+            .unwrap();
+        let summarizer = ReplySummarizer(
+            r#"[
+              {"op": "update", "key": "people_dustin_age", "type": "person", "content": "Dustin is 4 years old (as of Oct 2026)."},
+              {"op": "add", "key": "pizza_night", "type": "decision", "content": "Friday is homemade pizza night."},
+              {"op": "add", "key": "prohibition_no_bulk_pickle_juice", "type": "prohibition", "content": "Do not buy bulk pickle juice; buy a jar of pickles instead."}
+            ]"#
+            .to_string(),
+            StdMutex::new(Vec::new()),
+        );
+        let counts = extract_memories(&summarizer, &memory, "the user said things")
+            .await
+            .expect("extraction");
+        assert_eq!(
+            counts,
+            ExtractionCounts {
+                added: 1,
+                updated: 1,
+                unchanged: 1
+            }
+        );
+        let seen = summarizer.1.lock().unwrap().clone();
+        assert!(seen[0].contains("- pizza_night: Friday is homemade pizza night."));
+        assert!(seen[0].contains("CONVERSATION SUMMARY:\nthe user said things"));
+        let dustin = memory.get("people_dustin_age").await.unwrap().unwrap();
+        assert!(dustin.content.contains("4 years old"));
+        assert!(
+            memory
+                .get("prohibition_no_bulk_pickle_juice")
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[tokio::test]

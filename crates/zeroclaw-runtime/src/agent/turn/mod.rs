@@ -10807,6 +10807,8 @@ mod compaction_seam_tests {
                 keep_recent_max_tokens: 0,
                 timeout_secs: 5,
                 prompt: None,
+                summary_hard_max_tokens: 0,
+                extract_memories: false,
             },
             gave_up: false,
         }
