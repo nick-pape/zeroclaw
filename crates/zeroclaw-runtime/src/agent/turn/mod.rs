@@ -1432,6 +1432,197 @@ async fn enforce_reported_budget(
     }
 }
 
+/// LLM compaction state for one `run_tool_call_loop` invocation. Present only
+/// when the history owner installed a [`crate::agent::compaction::CompactionScope`]
+/// (it alone can persist the summary's owner flag) AND the executing agent's
+/// runtime profile enables `context_compression`.
+struct AutoCompaction {
+    scope: Arc<crate::agent::compaction::CompactionScope>,
+    settings: crate::agent::compaction::CompactionSettings,
+    /// Set after a compaction attempt that did not compact (summary failure,
+    /// timeout, nothing older than the protected tail). The remaining
+    /// iterations of this loop then go straight to the whole-turn trim
+    /// fallback instead of re-paying a failing summary call per iteration.
+    gave_up: bool,
+}
+
+impl AutoCompaction {
+    fn resolve(
+        config: Option<&zeroclaw_config::schema::Config>,
+        agent_alias: Option<&str>,
+    ) -> Option<Self> {
+        let scope = crate::agent::compaction::current_scope()?;
+        let settings = config
+            .zip(agent_alias)
+            .and_then(|(config, alias)| {
+                crate::agent::compaction::CompactionSettings::for_agent(config, alias)
+            })
+            .filter(|settings| settings.enabled)?;
+        Some(Self {
+            scope,
+            settings,
+            gave_up: false,
+        })
+    }
+}
+
+impl DispatchTokenCounter {
+    /// The calibration ratio a report would give `provider`/`model`, without
+    /// consuming the report (the dispatch counter takes it later). Mirrors
+    /// [`DispatchTokenCounter::for_route`]: another route's report, or a
+    /// ratio at or below 1.0, calibrates nothing.
+    fn peek_ratio(usage: Option<&ReportedRequestUsage>, provider: &str, model: &str) -> f64 {
+        usage
+            .filter(|usage| {
+                usage.provider_name == provider
+                    && usage.model == model
+                    && usage.estimated_tokens > 0
+            })
+            .map(|usage| usage.reported_tokens as f64 / usage.estimated_tokens as f64)
+            .filter(|ratio| *ratio > 1.0)
+            .unwrap_or(1.0)
+    }
+}
+
+/// LLM compaction seam. Projects the NEXT provider-facing request built from
+/// `history` (prepared messages + native tool schemas, calibrated exactly as
+/// the whole-turn trim projects it) and, when it exceeds `budget`, FIRST
+/// summarises the oldest whole turns into one summary message in the
+/// synthetic slot, keeping the newest whole turns verbatim. Runs before the
+/// request is prepared and before any `before_llm_call` hook, so the
+/// existing pre-dispatch trim then measures the compacted history and only
+/// drops whole turns when the summary failed or the result still does not
+/// fit. Returns whether the history was compacted.
+#[allow(clippy::too_many_arguments)]
+async fn auto_compact_if_over_budget(
+    compaction: &mut AutoCompaction,
+    trigger: &str,
+    config: Option<&zeroclaw_config::schema::Config>,
+    agent_alias: Option<&str>,
+    fallback_route: (&dyn ModelProvider, &str, Option<f64>),
+    history: &mut Vec<ChatMessage>,
+    crumb_present: &mut bool,
+    injected_memory_preamble: &mut Option<MemoryPreamble>,
+    multimodal_config: &zeroclaw_config::schema::MultimodalConfig,
+    degrade_strip_images: bool,
+    mut image_cache: Option<&mut zeroclaw_providers::multimodal::LocalImageCache>,
+    tool_schema_tokens: usize,
+    ratio: f64,
+    budget: usize,
+    on_delta: Option<&tokio::sync::mpsc::Sender<DraftEvent>>,
+) -> bool {
+    if budget == 0 || compaction.gave_up {
+        return false;
+    }
+    let projected_before = projected_provider_facing_tokens(
+        history,
+        multimodal_config,
+        degrade_strip_images,
+        image_cache.as_deref_mut(),
+        tool_schema_tokens,
+        ratio,
+    )
+    .await;
+    if projected_before <= budget {
+        return false;
+    }
+    events::send_progress(on_delta, ProgressEvent::CompactingContext).await;
+    let retention_before = retention_layout(history, *crumb_present);
+    let mut lead = crate::agent::compaction::LeadProvenance::new(
+        *crumb_present,
+        compaction.scope.summary_present(),
+    );
+    let result = crate::agent::compaction::run_compaction(
+        trigger,
+        config,
+        agent_alias,
+        Some(fallback_route),
+        &compaction.settings,
+        compaction.scope.session_key(),
+        history,
+        &mut lead,
+        None,
+        budget,
+        ratio,
+    )
+    .await;
+    match result {
+        Ok(outcome) => {
+            *crumb_present = lead.crumb_present;
+            compaction.scope.set_summary_present(lead.summary_present);
+            remap_memory_after_trim(
+                injected_memory_preamble,
+                retention_before,
+                history,
+                *crumb_present,
+            );
+            let projected_after = projected_provider_facing_tokens(
+                history,
+                multimodal_config,
+                degrade_strip_images,
+                image_cache,
+                tool_schema_tokens,
+                ratio,
+            )
+            .await;
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete)
+                    .with_category(::zeroclaw_log::EventCategory::Agent)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                    .with_attrs(::serde_json::json!({
+                        "event": "context_compaction_projection",
+                        "trigger": trigger,
+                        "tokens_before": projected_before,
+                        "tokens_after": projected_after,
+                        "tokens_source": "calibrated_provider_facing",
+                        "budget_tokens": budget,
+                        "turns_summarised": outcome.turns_summarised,
+                        "kept_turns": outcome.kept_turns,
+                        "fits": projected_after <= budget,
+                    })),
+                format!(
+                    "Compaction reduced the next request {projected_before} -> {projected_after} tok (budget {budget})"
+                )
+            );
+            if projected_after > budget {
+                // The summary is kept (it is strictly smaller than what it
+                // replaced); the whole-turn trim below drops further turns.
+                compaction.gave_up = true;
+            }
+            true
+        }
+        Err(_) => {
+            // Already logged by `run_compaction`; history is untouched and the
+            // whole-turn trim fallback applies.
+            compaction.gave_up = true;
+            false
+        }
+    }
+}
+
+/// Token-based safety guard for ONE tool result under LLM compaction, which
+/// otherwise keeps tool results whole (`max_tool_result_chars = 0` disables
+/// the character cap): a single result that alone would not fit the budget
+/// next to the system prompt and tool schemas can never be rescued by
+/// summarising older turns, so it is cut (head + tail, explicit marker) to
+/// half of the room that is left. Returns `None` when no cut is needed.
+fn guard_oversized_tool_result(output: &str, room_tokens: usize, ratio: f64) -> Option<String> {
+    let ratio = ratio.max(1.0);
+    let result_tokens = crate::agent::compaction::calibrated(output.len().div_ceil(4) + 4, ratio);
+    if room_tokens == 0 || result_tokens <= room_tokens {
+        return None;
+    }
+    let keep_tokens = room_tokens / 2;
+    let keep_chars = ((keep_tokens as f64 / ratio) as usize)
+        .saturating_mul(4)
+        .max(1024);
+    let cut = crate::agent::history::truncate_tool_result(output, keep_chars);
+    Some(format!(
+        "{cut}\n\n[tool result truncated: ~{result_tokens} tokens alone exceed the ~{room_tokens}-token context budget left for history]"
+    ))
+}
+
 /// Resolve the capacity/budget pair for the route that serves a single call.
 ///
 /// Preference order:
@@ -1705,6 +1896,17 @@ async fn run_tool_call_loop_impl<'a>(
     let mut turn_state = TurnState::new(raw_history, raw_canonical, *history_has_trim_breadcrumb);
 
     turn_state.sync_pending();
+
+    // LLM compaction (opt-in): only under an owner-installed compaction scope
+    // and an enabled `context_compression` profile. A loop that also feeds a
+    // canonical persistence delta (`new_messages_out`) never compacts: its
+    // owner replays that delta onto a durable history the summary would not
+    // reach.
+    let mut auto_compaction = if turn_state.canonical.is_none() {
+        AutoCompaction::resolve(config, agent_alias)
+    } else {
+        None
+    };
 
     let ingress_policy_cfg = IngressPolicy::default();
 
@@ -2109,6 +2311,60 @@ async fn run_tool_call_loop_impl<'a>(
             excluded_tools,
             activated_tools,
         )?;
+
+        // Compaction seam (both the start of a turn whose stored thread is
+        // already over budget, and every later iteration of the tool loop,
+        // where tool results grow the transcript): summarise the oldest whole
+        // turns BEFORE the request is prepared, so the whole-turn trim below
+        // only runs as the fallback.
+        if let Some(compaction) = auto_compaction.as_mut() {
+            let compaction_limits = resolve_context_limits_for_call(
+                context_limits_resolver.as_ref(),
+                config,
+                agent_alias,
+                active_model_provider_name,
+                active_model,
+                context_limits,
+            );
+            let compaction_ratio = DispatchTokenCounter::peek_ratio(
+                pending_reported_usage.as_ref(),
+                active_model_provider_name,
+                active_model,
+            );
+            let compaction_schema_tokens = if iteration_tool_specs.use_native_tools {
+                crate::agent::history::estimate_tool_schema_tokens(
+                    iteration_tool_specs.request_tool_specs(),
+                )
+            } else {
+                0
+            };
+            let trigger = if iteration == 0 {
+                "turn_start"
+            } else {
+                "tool_loop"
+            };
+            if Box::pin(auto_compact_if_over_budget(
+                compaction,
+                trigger,
+                config,
+                agent_alias,
+                (active_model_provider, active_dispatch_model, temperature),
+                turn_state.history,
+                &mut turn_state.crumb_present,
+                injected_memory_preamble,
+                multimodal_config,
+                degrade_strip_images,
+                image_cache.as_mut().map(|state| &mut *state.cache),
+                compaction_schema_tokens,
+                compaction_ratio,
+                dispatch_trim_budget(compaction_limits),
+                on_delta.as_ref(),
+            ))
+            .await
+            {
+                *history_has_trim_breadcrumb = turn_state.crumb_present;
+            }
+        }
 
         let (prepared_messages, mut prepared_source_rows) =
             vision_route::prepare_messages_with_source_rows(
@@ -3184,7 +3440,11 @@ async fn run_tool_call_loop_impl<'a>(
 
             let msg = ChatMessage::assistant(response_text.clone());
             turn_state.push_dual(msg);
-            if let Some(reported) = reported_input_tokens {
+            // Under LLM compaction the terminal whole-turn trim is deferred:
+            // the next turn's pre-dispatch compaction seam summarises the
+            // stored thread instead of this pass dropping (and the channel
+            // persisting the loss of) whole turns.
+            if let Some(reported) = reported_input_tokens.filter(|_| auto_compaction.is_none()) {
                 // Terminal response: no next request will be dispatched, so no
                 // hook reserve is carried — enforcement never executes a
                 // modifying `before_llm_call` hook merely to estimate a request
@@ -3459,6 +3719,18 @@ async fn run_tool_call_loop_impl<'a>(
             &mut loop_detector,
             &loop_ignore_tools,
             max_tool_result_chars,
+            // Under LLM compaction tool results stay whole; the only cut is a
+            // single result that alone cannot fit next to the system prompt
+            // and tool schemas.
+            auto_compaction.as_ref().map(|_| {
+                let ratio = token_counter.calibration_ratio.unwrap_or(1.0);
+                let fixed = crate::agent::compaction::calibrated(
+                    crate::agent::history::estimate_system_floor_tokens(turn_state.history)
+                        + tool_schema_tokens,
+                    ratio,
+                );
+                (trim_budget.saturating_sub(fixed), ratio)
+            }),
             collected_receipts,
             active_model,
             iteration,
@@ -10432,5 +10704,245 @@ mod tool_lifecycle_abandonment_tests {
             retained.lock().unwrap().is_empty(),
             "the cooperative dispatch releases exactly the retained entry"
         );
+    }
+}
+
+#[cfg(test)]
+mod compaction_seam_tests {
+    use super::*;
+    use crate::agent::compaction::{CompactionScope, CompactionSettings};
+
+    struct SummaryProvider {
+        fail: bool,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for SummaryProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "SummaryProvider"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for SummaryProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.fail {
+                anyhow::bail!("summary provider unavailable");
+            }
+            Ok("compact summary".to_string())
+        }
+    }
+
+    fn provider(fail: bool) -> SummaryProvider {
+        SummaryProvider {
+            fail,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn compaction(keep_recent_turns: usize) -> AutoCompaction {
+        AutoCompaction {
+            scope: CompactionScope::new(false, Some("session".into())),
+            settings: CompactionSettings {
+                enabled: true,
+                summary_max_tokens: 100,
+                keep_recent_turns,
+                keep_recent_max_tokens: 0,
+                timeout_secs: 5,
+                prompt: None,
+            },
+            gave_up: false,
+        }
+    }
+
+    /// System prompt + `turns` user/assistant turns of ~2,000 tokens each.
+    fn heavy_history(turns: usize) -> Vec<ChatMessage> {
+        let mut history = vec![ChatMessage::system("system prompt")];
+        for turn in 0..turns {
+            history.push(ChatMessage::user(format!("request {turn}")));
+            history.push(ChatMessage::assistant(format!(
+                "answer {turn} {}",
+                "z".repeat(8_000)
+            )));
+        }
+        history
+    }
+
+    async fn run_seam(
+        compaction: &mut AutoCompaction,
+        provider: &SummaryProvider,
+        history: &mut Vec<ChatMessage>,
+        crumb_present: &mut bool,
+        budget: usize,
+    ) -> bool {
+        let multimodal = zeroclaw_config::schema::MultimodalConfig::default();
+        let mut memory = None;
+        auto_compact_if_over_budget(
+            compaction,
+            "tool_loop",
+            None,
+            None,
+            (provider, "model", None),
+            history,
+            crumb_present,
+            &mut memory,
+            &multimodal,
+            false,
+            None,
+            0,
+            1.0,
+            budget,
+            None,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn seam_compacts_when_the_projection_exceeds_the_budget() {
+        let mut history = heavy_history(8);
+        let mut crumb_present = false;
+        let mut compaction = compaction(2);
+        let summarizer = provider(false);
+        let compacted = run_seam(
+            &mut compaction,
+            &summarizer,
+            &mut history,
+            &mut crumb_present,
+            15_000,
+        )
+        .await;
+        assert!(compacted);
+        assert!(crumb_present);
+        assert!(compaction.scope.summary_present());
+        // system -> summary -> the 2 newest turns verbatim.
+        assert_eq!(history.len(), 1 + 1 + 4);
+        assert!(history[1].content.ends_with("compact summary"));
+        assert_eq!(history[2].content, "request 6");
+        assert_eq!(
+            summarizer.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn seam_is_a_noop_while_the_request_fits() {
+        let mut history = heavy_history(3);
+        let before = history.len();
+        let mut crumb_present = false;
+        let mut compaction = compaction(2);
+        let summarizer = provider(false);
+        assert!(
+            !run_seam(
+                &mut compaction,
+                &summarizer,
+                &mut history,
+                &mut crumb_present,
+                100_000,
+            )
+            .await
+        );
+        assert_eq!(history.len(), before);
+        assert_eq!(
+            summarizer.calls.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+    }
+
+    // A failing summary call leaves the history untouched, and the existing
+    // whole-turn drop + breadcrumb then applies as the fallback.
+    #[tokio::test]
+    async fn summary_failure_falls_back_to_whole_turn_trim() {
+        let mut history = heavy_history(8);
+        let original_len = history.len();
+        let mut crumb_present = false;
+        let mut compaction = compaction(2);
+        let summarizer = provider(true);
+        let compacted = run_seam(
+            &mut compaction,
+            &summarizer,
+            &mut history,
+            &mut crumb_present,
+            15_000,
+        )
+        .await;
+        assert!(!compacted);
+        assert!(
+            compaction.gave_up,
+            "a failed summary is not retried this loop"
+        );
+        assert_eq!(history.len(), original_len);
+        assert!(!crumb_present);
+        assert!(!compaction.scope.summary_present());
+
+        // The pre-dispatch gate then drops the oldest whole turn and inserts
+        // the breadcrumb, exactly as without compaction.
+        let mut memory = None;
+        let trim = surface_oversized_dispatch_if_needed(
+            &mut memory,
+            &mut history,
+            &mut crumb_present,
+            20_000,
+            15_000,
+        );
+        assert_eq!(trim.outcome, PreDispatchOutcome::Trimmed);
+        assert!(crumb_present);
+        assert_eq!(history.len(), original_len - 2 + 1);
+
+        // Later iterations go straight to the fallback.
+        let compacted_again = run_seam(
+            &mut compaction,
+            &summarizer,
+            &mut history,
+            &mut crumb_present,
+            15_000,
+        )
+        .await;
+        assert!(!compacted_again);
+        assert_eq!(
+            summarizer.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+    }
+
+    #[test]
+    fn tool_result_guard_only_cuts_a_result_that_cannot_fit() {
+        let small = "x".repeat(4_000);
+        assert!(guard_oversized_tool_result(&small, 10_000, 1.0).is_none());
+        let huge = "y".repeat(400_000);
+        let cut = guard_oversized_tool_result(&huge, 10_000, 1.0).expect("cut");
+        assert!(cut.len() < 40_000, "{}", cut.len());
+        assert!(cut.contains("[tool result truncated:"));
+        assert!(cut.contains("characters truncated"));
+        // Calibration makes the same bytes cost more tokens.
+        let medium = "w".repeat(36_000);
+        assert!(guard_oversized_tool_result(&medium, 10_000, 1.0).is_none());
+        assert!(guard_oversized_tool_result(&medium, 10_000, 1.5).is_some());
+    }
+
+    #[test]
+    fn peek_ratio_matches_the_dispatch_counter_rules() {
+        let usage = ReportedRequestUsage {
+            provider_name: "p".into(),
+            model: "m".into(),
+            reported_tokens: 1_500,
+            estimated_tokens: 1_000,
+        };
+        assert!((DispatchTokenCounter::peek_ratio(Some(&usage), "p", "m") - 1.5).abs() < 1e-9);
+        assert!((DispatchTokenCounter::peek_ratio(Some(&usage), "p", "other") - 1.0).abs() < 1e-9);
+        assert!((DispatchTokenCounter::peek_ratio(None, "p", "m") - 1.0).abs() < 1e-9);
     }
 }

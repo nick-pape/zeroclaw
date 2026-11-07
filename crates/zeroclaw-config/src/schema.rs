@@ -6817,6 +6817,47 @@ fn default_keep_tool_context_turns() -> usize {
     2
 }
 
+/// `keep_tool_context_turns` accepts a non-negative integer or the string
+/// `"all"` (= `usize::MAX`, keep every turn's tool context); `usize::MAX`
+/// serializes back as `"all"`.
+mod keep_tool_context_turns_serde {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub const ALL: &str = "all";
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Raw {
+        Count(usize),
+        Word(String),
+    }
+
+    #[allow(clippy::ref_option)]
+    pub fn serialize<S: Serializer>(
+        value: &Option<usize>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        match value {
+            Some(usize::MAX) => serializer.serialize_some(ALL),
+            Some(count) => serializer.serialize_some(count),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<usize>, D::Error> {
+        match Option::<Raw>::deserialize(deserializer)? {
+            None => Ok(None),
+            Some(Raw::Count(count)) => Ok(Some(count)),
+            Some(Raw::Word(word)) if word.trim().eq_ignore_ascii_case(ALL) => Ok(Some(usize::MAX)),
+            Some(Raw::Word(word)) => Err(serde::de::Error::custom(format!(
+                "keep_tool_context_turns must be a non-negative integer or \"all\", got {word:?}"
+            ))),
+        }
+    }
+}
+
 fn default_agent_tool_dispatcher() -> String {
     "auto".into()
 }
@@ -14822,7 +14863,16 @@ pub struct RuntimeProfileConfig {
     pub max_system_prompt_chars: Option<usize>,
     /// Maximum characters for a single tool result. `None` inherits.
     pub max_tool_result_chars: Option<usize>,
-    /// Number of recent turns whose full tool context is preserved. `None` inherits.
+    /// Whether channel histories persist each turn's tool calls and tool
+    /// results. `0` persists none (only the user message and final reply are
+    /// stored); any positive value persists every turn's tool messages — the
+    /// channel runtime does not window them by turn count, they stay until
+    /// the history is trimmed or compacted. `"all"` is the explicit spelling
+    /// of "keep every turn's tool context" (stored as `usize::MAX`) and is
+    /// the intended setting with `context_compression`, which is what
+    /// shrinks history. `None` inherits the default (2).
+    #[serde(with = "keep_tool_context_turns_serde")]
+    #[cfg_attr(feature = "schema-export", schemars(with = "Option<usize>"))]
     pub keep_tool_context_turns: Option<usize>,
     /// Maximum memory entries injected per turn. `None` inherits global default (5).
     /// Set to `0` for unlimited.
@@ -23765,25 +23815,19 @@ impl Config {
         }
     }
 
-    /// Surface cross-provider ambiguity in a legacy config while reporting
-    /// the current contract: context compression has no runtime consumer, so
-    /// this knob is inert like every other `context_compression` field (see
-    /// `collect_context_compression_ignored_warnings`). This diagnostic adds
-    /// config-shape detail as a more specific companion for the same line. The
-    /// deprecated
+    /// Surface cross-provider ambiguity in a legacy config. The deprecated
     /// `runtime_profiles.<p>.context_compression.summary_model` is a bare
-    /// model id that names no provider of its own — it would need to be
-    /// resolved onto each consuming agent's OWN provider were the field ever
-    /// read again — so when a single profile is shared by agents resolving
-    /// to MORE THAN ONE distinct provider, that one bare id is ambiguous for
-    /// at least one of them. A `summary_provider` supplies provider identity
-    /// for this narrower diagnostic and excludes the corresponding value from
-    /// the ambiguity count; it does not make context compression functional.
+    /// model id that names no provider of its own and is ignored by LLM
+    /// compaction (see `collect_context_compression_ignored_warnings`); when
+    /// a single profile is shared by agents resolving to MORE THAN ONE
+    /// distinct provider, that one bare id is also ambiguous for at least one
+    /// of them. A `summary_provider` supplies provider identity and excludes
+    /// the profile from this diagnostic.
     ///
     /// The diagnostic is offline and deterministic: no schema bump, no
     /// network, and no model catalog. It names the profile, the affected
-    /// agents, and their differing providers, then recommends removing the
-    /// unsupported setting or waiting for an accepted compression design.
+    /// agents, and their differing providers, then recommends replacing the
+    /// legacy field with `summary_provider`.
     fn collect_cross_provider_summary_model_warnings(
         &self,
         warnings: &mut Vec<crate::validation_warnings::ValidationWarning>,
@@ -23846,29 +23890,30 @@ impl Config {
                 "cross_provider_summary_model",
                 format!(
                     "runtime_profiles.{profile_alias}.context_compression.summary_model \
-                     ({summary_model:?}) is set, but context compression is not currently \
-                     implemented in the runtime; this setting has no effect. It is also a \
-                     bare model id reused by agents resolving to different providers \
-                     ({detail}), which names no provider of its own and would be ambiguous \
-                     for at least one of them if compression were read again. Remove the \
-                     unsupported context_compression setting (every context_compression \
-                     field, including summary_provider, is currently inert), or wait for a \
-                     separately accepted compression design before configuring it."
+                     ({summary_model:?}) is set, but it is a legacy field that LLM compaction \
+                     ignores; this setting has no effect. It is also a bare model id reused \
+                     by agents resolving to different providers ({detail}), which names no \
+                     provider of its own and would be ambiguous for at least one of them. \
+                     Remove the legacy summary_model setting and name the summary model with \
+                     context_compression.summary_provider (a `<type>.<alias>` reference)."
                 ),
                 format!("runtime_profiles.{profile_alias}.context_compression.summary_model"),
             ));
         }
     }
 
-    /// Surface every non-default `context_compression` knob as inert: the
-    /// runtime context compressor was removed and nothing in the
-    /// workspace reads `context_compression` at runtime anymore, so the whole
-    /// struct — `enabled`, thresholds, protected counts, summarizer limits,
-    /// provider selection, tool-result retrimming — has no effect. Mirrors
-    /// `validate_memory_semantics`: one warning per non-default field, so a
-    /// user sees exactly which of their authored knobs are dead. A field
-    /// explicitly written at its default value is indistinguishable from an
-    /// omitted one post-deserialization and stays silent (same limitation as
+    /// Surface every non-default LEGACY `context_compression` knob as
+    /// ignored. LLM compaction is implemented again (see
+    /// `zeroclaw_runtime::agent::compaction`) and consumes `enabled`,
+    /// `summary_provider`, `summary_max_tokens`, `keep_recent_turns`,
+    /// `keep_recent_max_tokens`, `timeout_secs` and `prompt`; those draw no
+    /// warning. The fields kept only so configs written for the removed v0
+    /// compressor still parse (thresholds, protected counts, char limits,
+    /// the bare `summary_model`, identifier policy, tool-result retrimming)
+    /// have no consumer, so one `context_compression_legacy_field` warning is
+    /// emitted per non-default legacy field. A field explicitly written at
+    /// its default value is indistinguishable from an omitted one
+    /// post-deserialization and stays silent (same limitation as
     /// `validate_memory_semantics`).
     ///
     /// Only `[runtime_profiles.<alias>.context_compression]` is checked —
@@ -23887,83 +23932,74 @@ impl Config {
         for (alias, profile) in &self.runtime_profiles {
             let cc = &profile.context_compression;
 
-            // `enabled = true` gets its own message: it is the master switch
-            // users flip expecting compression to happen at all.
-            if cc.enabled {
-                warnings.push(crate::validation_warnings::ValidationWarning::new(
-                    "context_compression_unsupported",
-                    format!(
-                        "runtime_profiles.{alias}.context_compression.enabled is set but context \
-                         compression is not currently implemented in the runtime (the compressor \
-                         was removed in #8196); this setting has no effect."
-                    ),
-                    format!("runtime_profiles.{alias}.context_compression.enabled"),
+            let mut legacy: Vec<(&'static str, &'static str)> = Vec::new();
+            if (cc.threshold_ratio - defaults.threshold_ratio).abs() > f64::EPSILON {
+                legacy.push((
+                    "threshold_ratio",
+                    "compaction triggers at the profile's max_context_tokens",
                 ));
             }
-
-            // Every other knob: flag any value that differs from the default.
-            let mut inert: Vec<&'static str> = Vec::new();
-            if (cc.threshold_ratio - defaults.threshold_ratio).abs() > f64::EPSILON {
-                inert.push("threshold_ratio");
-            }
             if cc.protect_first_n != defaults.protect_first_n {
-                inert.push("protect_first_n");
+                legacy.push(("protect_first_n", "the system prompt is always kept"));
             }
             if cc.protect_last_n != defaults.protect_last_n {
-                inert.push("protect_last_n");
+                legacy.push(("protect_last_n", "use keep_recent_turns"));
             }
             if cc.max_passes != defaults.max_passes {
-                inert.push("max_passes");
+                legacy.push(("max_passes", "oversized material is summarised in chunks"));
             }
             if cc.summary_max_chars != defaults.summary_max_chars {
-                inert.push("summary_max_chars");
+                legacy.push(("summary_max_chars", "use summary_max_tokens"));
             }
             if cc.source_max_chars != defaults.source_max_chars {
-                inert.push("source_max_chars");
-            }
-            if cc.timeout_secs != defaults.timeout_secs {
-                inert.push("timeout_secs");
-            }
-            if cc.summary_provider != defaults.summary_provider {
-                inert.push("summary_provider");
+                legacy.push((
+                    "source_max_chars",
+                    "summary input is sized from the context budget",
+                ));
             }
             if cc.summary_model != defaults.summary_model {
                 // Ordering dependency: `collect_warnings()` runs
                 // `collect_cross_provider_summary_model_warnings` before this
                 // helper, so a cross-provider `summary_model` diagnostic for
                 // this same path is already in `warnings`. That diagnostic
-                // reports the same "has no effect" fact plus the specific
+                // reports the same "ignored" fact plus the specific
                 // cross-provider agents affected, so it wins and the generic
-                // inert warning is skipped to avoid printing two warnings
-                // for the same config line. All other `summary_model`
-                // shapes (single-provider, unshared) still get the inert
-                // warning; no other diagnostic covers them.
+                // legacy warning is skipped to avoid printing two warnings
+                // for the same config line.
                 let summary_model_path =
                     format!("runtime_profiles.{alias}.context_compression.summary_model");
                 if !warnings.iter().any(|w| {
                     w.code == "cross_provider_summary_model" && w.path == summary_model_path
                 }) {
-                    inert.push("summary_model");
+                    legacy.push(("summary_model", "use summary_provider"));
                 }
             }
             if cc.identifier_policy != defaults.identifier_policy {
-                inert.push("identifier_policy");
+                legacy.push((
+                    "identifier_policy",
+                    "the summary prompt always preserves identifiers verbatim",
+                ));
             }
             if cc.tool_result_retrim_chars != defaults.tool_result_retrim_chars {
-                inert.push("tool_result_retrim_chars");
+                legacy.push((
+                    "tool_result_retrim_chars",
+                    "tool results are kept whole until compaction",
+                ));
             }
             if cc.tool_result_trim_exempt != defaults.tool_result_trim_exempt {
-                inert.push("tool_result_trim_exempt");
+                legacy.push((
+                    "tool_result_trim_exempt",
+                    "tool results are kept whole until compaction",
+                ));
             }
 
-            for field in inert {
+            for (field, hint) in legacy {
                 warnings.push(crate::validation_warnings::ValidationWarning::new(
-                    "context_compression_unsupported",
+                    "context_compression_legacy_field",
                     format!(
                         "runtime_profiles.{alias}.context_compression.{field} is set to a \
-                         non-default value but context compression is not currently implemented \
-                         in the runtime (the compressor was removed in #8196); this setting has \
-                         no effect."
+                         non-default value but is a legacy field of the removed v0 context \
+                         compressor; LLM compaction ignores it ({hint})."
                     ),
                     format!("runtime_profiles.{alias}.context_compression.{field}"),
                 ));
@@ -49314,8 +49350,8 @@ allowed_users = []
             .find(|w| w.code == "cross_provider_summary_model")
             .expect("expected cross_provider_summary_model warning");
         assert!(
-            w.message.contains("not currently implemented") && w.message.contains("no effect"),
-            "message must truthfully report the setting as unsupported/inert: {}",
+            w.message.contains("legacy field") && w.message.contains("no effect"),
+            "message must truthfully report the setting as ignored: {}",
             w.message
         );
         assert!(
@@ -49335,37 +49371,30 @@ allowed_users = []
             "message must keep naming the affected agents and providers: {}",
             w.message
         );
-        // The remediation must NOT send the operator to another inert
-        // context_compression field: this PR's per-field pass classifies a
-        // non-default `summary_provider` as unsupported/inert too, so
-        // "migrate to context_compression.summary_provider" would just produce
-        // another no-effect setting and another warning.
+        // `summary_provider` is consumed by LLM compaction, so the
+        // remediation points the operator at it.
         assert!(
-            !w.message
-                .contains("Migrate to context_compression.summary_provider"),
-            "remediation must not recommend migrating to the inert summary_provider: {}",
-            w.message
-        );
-        assert!(
-            w.message
-                .contains("Remove the unsupported context_compression setting"),
-            "remediation should tell the operator to remove the inert setting: {}",
+            w.message.contains("context_compression.summary_provider"),
+            "remediation should point at summary_provider: {}",
             w.message
         );
     }
 
-    // The runtime context compressor was removed; nothing reads
-    // `context_compression` at runtime anymore, so an explicit
-    // `enabled = true` on a named runtime profile is inert and must be
-    // flagged.
+    // LLM compaction consumes `enabled`, so an explicit `enabled = true` on
+    // a named runtime profile is a supported setting and must not warn.
     #[tokio::test]
-    async fn collect_warnings_flags_context_compression_enabled_on_runtime_profile() {
+    async fn collect_warnings_silent_for_context_compression_enabled_on_runtime_profile() {
         let toml = r#"
             [risk_profiles.default]
             level = "supervised"
 
             [runtime_profiles.fast.context_compression]
             enabled = true
+            summary_max_tokens = 8000
+            keep_recent_turns = 2
+            keep_recent_max_tokens = 10000
+            timeout_secs = 120
+            prompt = "custom"
 
             [agents.alpha]
             enabled = true
@@ -49374,40 +49403,91 @@ allowed_users = []
         "#;
         let cfg: Config = toml::from_str(toml).unwrap();
         let warnings = cfg.collect_warnings();
-        let w = warnings
-            .iter()
-            .find(|w| w.code == "context_compression_unsupported")
-            .expect("expected context_compression_unsupported warning");
-        assert_eq!(w.path, "runtime_profiles.fast.context_compression.enabled");
         assert!(
-            w.message.contains("not currently implemented"),
-            "message explains the flag is inert: {}",
-            w.message
+            !warnings
+                .iter()
+                .any(|w| w.code == "context_compression_legacy_field"
+                    || w.code == "context_compression_unsupported"),
+            "supported compaction fields must not warn: {warnings:?}"
+        );
+        let resolved = cfg.resolved_agent_config("alpha").expect("agent resolves");
+        assert!(resolved.resolved.context_compression.enabled);
+        assert_eq!(resolved.resolved.context_compression.keep_recent_turns, 2);
+    }
+
+    // `keep_tool_context_turns` accepts "all" (every turn's tool context)
+    // next to plain counts, and round-trips it as "all".
+    #[::core::prelude::v1::test]
+    fn keep_tool_context_turns_accepts_all_and_counts() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [runtime_profiles.keep_all]
+            keep_tool_context_turns = "all"
+            [runtime_profiles.keep_none]
+            keep_tool_context_turns = 0
+            [runtime_profiles.inherit]
+            agentic = true
+            [agents.a]
+            runtime_profile = "keep_all"
+            [agents.b]
+            runtime_profile = "keep_none"
+            [agents.c]
+            runtime_profile = "inherit"
+            "#,
+        )
+        .expect("config parses");
+        assert_eq!(
+            cfg.runtime_profiles["keep_all"].keep_tool_context_turns,
+            Some(usize::MAX)
+        );
+        assert_eq!(cfg.effective_keep_tool_context_turns("a"), usize::MAX);
+        assert_eq!(cfg.effective_keep_tool_context_turns("b"), 0);
+        assert_eq!(cfg.effective_keep_tool_context_turns("c"), 2);
+        let rendered = toml::to_string(&cfg.runtime_profiles["keep_all"]).unwrap();
+        assert!(
+            rendered.contains("keep_tool_context_turns = \"all\""),
+            "{rendered}"
+        );
+        let reparsed: RuntimeProfileConfig = toml::from_str(&rendered).unwrap();
+        assert_eq!(reparsed.keep_tool_context_turns, Some(usize::MAX));
+        assert!(
+            toml::from_str::<RuntimeProfileConfig>("keep_tool_context_turns = \"some\"").is_err()
         );
     }
 
     // The legacy pre-V3 `[agent.context_compression]` top-level table is
     // folded into `[runtime_profiles.default]` by the V1/V2→V3 migration
-    // (see `schema/v2.rs`), so it must surface the same diagnostic once
-    // migrated — this is the historical form of the surface commonly
-    // called "agent-level" configuration.
+    // (see `schema/v2.rs`); its `enabled` flag survives the migration and is
+    // a supported setting, while a legacy tuning field still warns.
     #[::core::prelude::v1::test]
-    fn collect_warnings_flags_context_compression_enabled_via_legacy_agent_table() {
+    fn context_compression_legacy_agent_table_migrates_enabled_and_flags_legacy_fields() {
         let raw = r#"
             default_temperature = 0.7
 
             [agent.context_compression]
             enabled = true
+            threshold_ratio = 0.9
         "#;
         let parsed = crate::migration::migrate_to_current(raw).expect("migration succeeds");
+        assert!(
+            parsed.runtime_profiles["default"]
+                .context_compression
+                .enabled
+        );
         let warnings = parsed.collect_warnings();
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| w.path == "runtime_profiles.default.context_compression.enabled"),
+            "enabled must not warn after migration: {warnings:?}"
+        );
         let w = warnings
             .iter()
-            .find(|w| w.code == "context_compression_unsupported")
-            .expect("expected context_compression_unsupported warning after migration");
+            .find(|w| w.code == "context_compression_legacy_field")
+            .expect("expected context_compression_legacy_field warning after migration");
         assert_eq!(
             w.path,
-            "runtime_profiles.default.context_compression.enabled"
+            "runtime_profiles.default.context_compression.threshold_ratio"
         );
     }
 
@@ -49429,8 +49509,8 @@ allowed_users = []
         assert!(
             !warnings
                 .iter()
-                .any(|w| w.code == "context_compression_unsupported"),
-            "default config must not flag context_compression_unsupported: {warnings:?}"
+                .any(|w| w.code == "context_compression_legacy_field"),
+            "default config must not flag context_compression_legacy_field: {warnings:?}"
         );
     }
 
@@ -49457,7 +49537,7 @@ allowed_users = []
         let warnings = cfg.collect_warnings();
         let paths: Vec<&str> = warnings
             .iter()
-            .filter(|w| w.code == "context_compression_unsupported")
+            .filter(|w| w.code == "context_compression_legacy_field")
             .map(|w| w.path.as_str())
             .collect();
         assert!(
@@ -49509,15 +49589,15 @@ allowed_users = []
         assert!(
             !warnings
                 .iter()
-                .any(|w| w.code == "context_compression_unsupported"),
-            "explicit default values must not flag context_compression_unsupported: {warnings:?}"
+                .any(|w| w.code == "context_compression_legacy_field"),
+            "explicit default values must not flag context_compression_legacy_field: {warnings:?}"
         );
     }
 
     // Specific-warning-wins dedup: a bare cross-provider `summary_model`
     // already draws the more specific `cross_provider_summary_model`
     // diagnostic, which itself reports the setting as inert (same fact as
-    // `context_compression_unsupported`) plus the cross-provider detail, so
+    // `context_compression_legacy_field`) plus the cross-provider detail, so
     // the generic inert warning must NOT also fire for the identical path —
     // doctor/gateway print both with no dedup, and it would just be the same
     // statement twice.
@@ -49607,8 +49687,8 @@ allowed_users = []
             .find(|w| w.path == "runtime_profiles.shared.context_compression.summary_model")
             .expect("expected a warning for the summary_model path");
         assert_eq!(
-            w.code, "context_compression_unsupported",
-            "single-provider summary_model gets the inert warning"
+            w.code, "context_compression_legacy_field",
+            "single-provider summary_model gets the legacy-field warning"
         );
     }
 

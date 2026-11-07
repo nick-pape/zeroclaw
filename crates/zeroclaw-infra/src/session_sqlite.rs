@@ -172,6 +172,10 @@ impl SqliteSessionBackend {
                 "principal_id",
                 "ALTER TABLE session_metadata ADD COLUMN principal_id TEXT",
             ),
+            (
+                "compaction_summary",
+                "ALTER TABLE session_metadata ADD COLUMN compaction_summary INTEGER",
+            ),
         ] {
             Self::ensure_metadata_column(&tx, column, ddl)?;
         }
@@ -306,7 +310,29 @@ impl SqliteSessionBackend {
         conn.execute(
             "INSERT INTO session_metadata (session_key, created_at, last_activity, message_count, trim_breadcrumb)
              VALUES (?1, ?2, ?3, 0, ?4)
-             ON CONFLICT(session_key) DO UPDATE SET trim_breadcrumb = excluded.trim_breadcrumb",
+             ON CONFLICT(session_key) DO UPDATE SET
+                trim_breadcrumb = excluded.trim_breadcrumb,
+                compaction_summary = CASE WHEN excluded.trim_breadcrumb = 0 THEN 0
+                                          ELSE compaction_summary END",
+            params![session_key, now, now, i64::from(present)],
+        )?;
+        Ok(())
+    }
+
+    /// Record whether the breadcrumb slot holds a compaction summary. A
+    /// summary can only live in the synthetic slot, so `true` is stored only
+    /// beside a recorded `trim_breadcrumb = 1`; clearing the breadcrumb flag
+    /// (see `set_session_trim_breadcrumb_on`) clears this one too.
+    fn set_session_compaction_summary_on(
+        conn: &Connection,
+        session_key: &str,
+        present: bool,
+    ) -> rusqlite::Result<()> {
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO session_metadata (session_key, created_at, last_activity, message_count, compaction_summary)
+             VALUES (?1, ?2, ?3, 0, ?4)
+             ON CONFLICT(session_key) DO UPDATE SET compaction_summary = excluded.compaction_summary",
             params![session_key, now, now, i64::from(present)],
         )?;
         Ok(())
@@ -974,6 +1000,32 @@ impl SessionBackend for SqliteSessionBackend {
         Ok(())
     }
 
+    /// Replace the transcript and both synthetic-slot provenance flags in
+    /// one transaction (see `replace_conversation_state`): a compaction's
+    /// summary, the breadcrumb slot flag and the summary flag commit or roll
+    /// back together.
+    fn replace_compacted_conversation_state(
+        &self,
+        session_key: &str,
+        messages: &[ChatMessage],
+        breadcrumb_present: bool,
+        summary_present: bool,
+    ) -> std::io::Result<()> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction().map_err(std::io::Error::other)?;
+        Self::rewrite_messages_on(&tx, session_key, messages).map_err(std::io::Error::other)?;
+        Self::set_session_trim_breadcrumb_on(&tx, session_key, breadcrumb_present)
+            .map_err(std::io::Error::other)?;
+        Self::set_session_compaction_summary_on(
+            &tx,
+            session_key,
+            summary_present && breadcrumb_present,
+        )
+        .map_err(std::io::Error::other)?;
+        tx.commit().map_err(std::io::Error::other)?;
+        Ok(())
+    }
+
     /// Existence-guarded replacement in one transaction: when the metadata
     /// row is gone (a concurrent delete won), return `Ok(false)` without
     /// writing anything, so a completed turn can never recreate a session
@@ -1187,7 +1239,7 @@ impl SessionBackend for SqliteSessionBackend {
         // and a stale recorded `true` on an already-empty session must not
         // survive to misclassify the next first message.
         conn.execute(
-            "UPDATE session_metadata SET message_count = 0, last_activity = ?1, trim_breadcrumb = NULL WHERE session_key = ?2",
+            "UPDATE session_metadata SET message_count = 0, last_activity = ?1, trim_breadcrumb = NULL, compaction_summary = NULL WHERE session_key = ?2",
             params![Utc::now().to_rfc3339(), session_key],
         )
         .map_err(std::io::Error::other)?;
@@ -1656,6 +1708,30 @@ impl SessionBackend for SqliteSessionBackend {
         .map(|v| v.map(|n| n != 0))
     }
 
+    fn set_session_compaction_summary(
+        &self,
+        session_key: &str,
+        present: bool,
+    ) -> std::io::Result<()> {
+        let conn = self.conn.lock();
+        Self::set_session_compaction_summary_on(&conn, session_key, present)
+            .map_err(std::io::Error::other)
+    }
+
+    fn get_session_compaction_summary(&self, session_key: &str) -> std::io::Result<Option<bool>> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT compaction_summary FROM session_metadata WHERE session_key = ?1",
+            params![session_key],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Ok(None),
+            other => Err(std::io::Error::other(other)),
+        })
+        .map(|v| v.map(|n| n != 0))
+    }
+
     fn set_session_context(
         &self,
         session_key: &str,
@@ -1908,6 +1984,48 @@ mod tests {
         // Metadata count should reflect the new message
         let meta = backend.list_sessions_with_metadata();
         assert_eq!(meta[0].message_count, 1);
+    }
+
+    #[test]
+    fn replace_compacted_conversation_state_round_trips_summary_flag() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        let messages = vec![
+            ChatMessage::user("[compaction summary]"),
+            ChatMessage::user("newest"),
+        ];
+        backend
+            .replace_compacted_conversation_state("s1", &messages, true, true)
+            .unwrap();
+        assert_eq!(backend.load("s1").len(), 2);
+        assert_eq!(
+            backend.get_session_trim_breadcrumb("s1").unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            backend.get_session_compaction_summary("s1").unwrap(),
+            Some(true)
+        );
+
+        // A plain trim that publishes "no synthetic slot" clears the summary
+        // flag with it: a summary can only live in that slot.
+        backend
+            .replace_conversation_state("s1", &messages[1..], false)
+            .unwrap();
+        assert_eq!(
+            backend.get_session_compaction_summary("s1").unwrap(),
+            Some(false)
+        );
+
+        backend
+            .replace_compacted_conversation_state("s1", &messages, true, true)
+            .unwrap();
+        backend.clear_messages("s1").unwrap();
+        assert_eq!(backend.get_session_compaction_summary("s1").unwrap(), None);
+        assert_eq!(
+            backend.get_session_compaction_summary("missing").unwrap(),
+            None
+        );
     }
 
     #[test]

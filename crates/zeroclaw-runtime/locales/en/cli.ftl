@@ -1299,6 +1299,10 @@ history-trim-breadcrumb = [earlier turns omitted to fit the context window]
 history-trim-reason-budget = context token budget exceeded
 history-trim-reason-message-cap = history turn limit exceeded
 history-trim-reason-recovery = context window overflow recovery
+# Header of the synthetic message that replaces compacted turns (LLM context
+# compaction). Model-visible; the slot is classified by an owner flag, never
+# by this text.
+history-compaction-summary-header = [Conversation summary: my earlier turns in this conversation were compacted into the summary below, written by me for myself. Treat it as my own memory of those turns. The most recent turns follow verbatim.]
 # Remediation surfaced when the system prompt + inlined tool definitions alone
 # meet or exceed the context budget, so no amount of conversation trimming can
 # fit the request (#5808).
@@ -1327,6 +1331,12 @@ channel-runtime-progress-compacting-context = Compacting context
 channel-runtime-progress-finalizing-response = Finalizing response
 channel-runtime-matrix-progress-item-too-large = ⚠️ This line is too large to fit in a single Matrix message. ⚠️
 channel-runtime-new-session = Conversation history cleared. Starting fresh.
+channel-runtime-compact-done = Compacted: ~{ $before } tokens → ~{ $after } tokens.
+channel-runtime-compact-nothing = Nothing to compact yet: everything still fits in the most recent turns, which are always kept verbatim.
+channel-runtime-compact-disabled = Context compaction is not enabled for this agent (set `context_compression.enabled = true` on its runtime profile).
+channel-runtime-compact-failed = Compaction failed ({ $error }); the conversation history is unchanged.
+channel-runtime-compact-conflict = The conversation changed while it was being compacted, so nothing was applied. Try /compact again.
+channel-runtime-compact-unavailable = The conversation history could not be loaded, so nothing was compacted.
 channel-runtime-stop-sent = Stop signal sent.
 channel-runtime-stop-no-task = No in-flight task for this sender scope.
 channel-runtime-stop-folded-followup = Nothing to stop here: this reply was merged into the earlier message it answers, which is still being processed. Send /stop in that conversation to cancel it.

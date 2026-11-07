@@ -337,7 +337,16 @@ fn default_source_max_chars() -> usize {
     50_000
 }
 fn default_cc_timeout_secs() -> u64 {
-    60
+    600
+}
+fn default_cc_summary_max_tokens() -> usize {
+    16_384
+}
+fn default_cc_keep_recent_turns() -> usize {
+    4
+}
+fn default_cc_keep_recent_max_tokens() -> usize {
+    40_000
 }
 fn default_identifier_policy() -> String {
     "strict".to_string()
@@ -346,41 +355,85 @@ fn default_tool_result_retrim_chars() -> usize {
     2_000
 }
 
+/// LLM context compaction (`[runtime_profiles.<name>.context_compression]`).
+///
+/// When enabled, a provider-facing request that would exceed the profile's
+/// context budget (`max_context_tokens`) first has its oldest whole turns
+/// summarised by `summary_provider` into ONE synthetic summary message; the
+/// newest whole turns are replayed verbatim (bounded by both
+/// `keep_recent_turns` and `keep_recent_max_tokens`). The whole-turn drop +
+/// breadcrumb trim remains the fallback when the summary call fails, times
+/// out, or the result still does not fit. Channels persist the compacted
+/// history and expose a manual `/compact [focus]` command.
+///
+/// Fields marked LEGACY are accepted for backward compatibility with the
+/// removed v0 compressor and are ignored (each non-default value draws a
+/// `context_compression_legacy_field` warning).
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "agent.context_compression"]
 pub struct ContextCompressionConfig {
-    /// The runtime context compressor was removed; no runtime execution path
-    /// consumes this flag, so setting it to `true` currently has no effect.
-    /// Defaults to `false` to match actual runtime behavior;
-    /// `Config::collect_warnings` reads an explicit `true` only to report
-    /// `context_compression_unsupported`.
+    /// Master switch for LLM compaction. Default `false`: the runtime keeps
+    /// the upstream whole-turn trim behaviour and `/compact` replies that
+    /// compaction is disabled.
     #[serde(default = "default_cc_enabled")]
     pub enabled: bool,
-    #[serde(default = "default_threshold_ratio")]
-    pub threshold_ratio: f64,
-    #[serde(default = "default_protect_first_n")]
-    pub protect_first_n: usize,
-    #[serde(default = "default_protect_last_n")]
-    pub protect_last_n: usize,
-    #[serde(default = "default_cc_max_passes")]
-    pub max_passes: u32,
-    #[serde(default = "default_summary_max_chars")]
-    pub summary_max_chars: usize,
-    #[serde(default = "default_source_max_chars")]
-    pub source_max_chars: usize,
-    #[serde(default = "default_cc_timeout_secs")]
-    pub timeout_secs: u64,
-    /// Summarizer provider as a `<type>.<alias>` reference into `providers.models`.
+    /// Summary model as a `<type>.<alias>` reference into `providers.models`.
+    /// Point it at an alias with thinking/reasoning disabled; its `model`,
+    /// `temperature`, credentials and endpoint are used for the summary call
+    /// (`max_tokens` and `timeout_secs` are overridden from this section).
+    /// Empty = reuse the agent's own provider and model.
     #[serde(default)]
     pub summary_provider: crate::providers::ModelProviderRef,
-    /// DEPRECATED bare model id retained as a compatibility fallback.
+    /// Maximum output tokens for one summary call. Also reserved out of the
+    /// context budget when sizing the material sent to the summariser.
+    #[serde(default = "default_cc_summary_max_tokens")]
+    pub summary_max_tokens: usize,
+    /// Number of newest whole turns replayed verbatim after the summary.
+    /// The newest whole turn is always kept, even when this is `0`.
+    #[serde(default = "default_cc_keep_recent_turns")]
+    pub keep_recent_turns: usize,
+    /// Token cap (calibrated estimate) for the verbatim tail: older turns
+    /// stop being added once the tail would exceed it. The newest whole turn
+    /// is always kept even when it alone exceeds the cap. `0` = no cap.
+    #[serde(default = "default_cc_keep_recent_max_tokens")]
+    pub keep_recent_max_tokens: usize,
+    /// Timeout (seconds) for one summary call.
+    #[serde(default = "default_cc_timeout_secs")]
+    pub timeout_secs: u64,
+    /// Optional replacement for the built-in summary instructions (the
+    /// system prompt of the summary call). Empty/unset = built-in prompt.
+    #[serde(default)]
+    pub prompt: Option<String>,
+    /// LEGACY (ignored).
+    #[serde(default = "default_threshold_ratio")]
+    pub threshold_ratio: f64,
+    /// LEGACY (ignored).
+    #[serde(default = "default_protect_first_n")]
+    pub protect_first_n: usize,
+    /// LEGACY (ignored); use `keep_recent_turns`.
+    #[serde(default = "default_protect_last_n")]
+    pub protect_last_n: usize,
+    /// LEGACY (ignored).
+    #[serde(default = "default_cc_max_passes")]
+    pub max_passes: u32,
+    /// LEGACY (ignored); use `summary_max_tokens`.
+    #[serde(default = "default_summary_max_chars")]
+    pub summary_max_chars: usize,
+    /// LEGACY (ignored).
+    #[serde(default = "default_source_max_chars")]
+    pub source_max_chars: usize,
+    /// DEPRECATED bare model id; LEGACY and ignored by LLM compaction — use
+    /// `summary_provider`.
     #[serde(default)]
     pub summary_model: Option<String>,
+    /// LEGACY (ignored).
     #[serde(default = "default_identifier_policy")]
     pub identifier_policy: String,
+    /// LEGACY (ignored).
     #[serde(default = "default_tool_result_retrim_chars")]
     pub tool_result_retrim_chars: usize,
+    /// LEGACY (ignored).
     #[serde(default)]
     pub tool_result_trim_exempt: Vec<String>,
 }
@@ -389,14 +442,18 @@ impl Default for ContextCompressionConfig {
     fn default() -> Self {
         Self {
             enabled: default_cc_enabled(),
+            summary_provider: crate::providers::ModelProviderRef::default(),
+            summary_max_tokens: default_cc_summary_max_tokens(),
+            keep_recent_turns: default_cc_keep_recent_turns(),
+            keep_recent_max_tokens: default_cc_keep_recent_max_tokens(),
+            timeout_secs: default_cc_timeout_secs(),
+            prompt: None,
             threshold_ratio: default_threshold_ratio(),
             protect_first_n: default_protect_first_n(),
             protect_last_n: default_protect_last_n(),
             max_passes: default_cc_max_passes(),
             summary_max_chars: default_summary_max_chars(),
             source_max_chars: default_source_max_chars(),
-            timeout_secs: default_cc_timeout_secs(),
-            summary_provider: crate::providers::ModelProviderRef::default(),
             summary_model: None,
             identifier_policy: default_identifier_policy(),
             tool_result_retrim_chars: default_tool_result_retrim_chars(),
@@ -987,14 +1044,74 @@ mod tests {
         assert_eq!(ThinkingLevel::Max.default_budget_tokens(), Some(50_000));
     }
 
-    // The runtime context compressor was removed; nothing reads
-    // `context_compression` at runtime anymore, so the default must be
-    // `false` (a `true` default would mislead users into thinking the
-    // knob does something). See `context_compression_unsupported` in
-    // `schema.rs` for the companion validation warning.
+    // LLM compaction is opt-in: the default must stay `false` so upstream
+    // whole-turn trimming is unchanged unless an operator enables it.
     #[test]
     fn context_compression_config_defaults_to_disabled() {
         assert!(!ContextCompressionConfig::default().enabled);
+    }
+
+    #[test]
+    fn context_compression_config_new_field_defaults() {
+        let cfg = ContextCompressionConfig::default();
+        assert_eq!(cfg.summary_max_tokens, 16_384);
+        assert_eq!(cfg.keep_recent_turns, 4);
+        assert_eq!(cfg.keep_recent_max_tokens, 40_000);
+        assert_eq!(cfg.timeout_secs, 600);
+        assert!(cfg.prompt.is_none());
+        assert!(cfg.summary_provider.trim().is_empty());
+    }
+
+    #[test]
+    fn context_compression_config_parses_new_fields() {
+        let cfg: ContextCompressionConfig = toml::from_str(
+            r#"
+            enabled = true
+            summary_provider = "llamacpp.summary"
+            summary_max_tokens = 8000
+            keep_recent_turns = 2
+            keep_recent_max_tokens = 12000
+            timeout_secs = 120
+            prompt = "Summarise tersely."
+            "#,
+        )
+        .expect("new-shape context_compression parses");
+        assert!(cfg.enabled);
+        assert_eq!(cfg.summary_provider.as_str(), "llamacpp.summary");
+        assert_eq!(cfg.summary_max_tokens, 8000);
+        assert_eq!(cfg.keep_recent_turns, 2);
+        assert_eq!(cfg.keep_recent_max_tokens, 12_000);
+        assert_eq!(cfg.timeout_secs, 120);
+        assert_eq!(cfg.prompt.as_deref(), Some("Summarise tersely."));
+    }
+
+    // Configs written for the removed v0 compressor (and unknown keys) must
+    // still parse: the legacy fields are accepted and ignored.
+    #[test]
+    fn context_compression_config_parses_legacy_and_unknown_fields() {
+        let cfg: ContextCompressionConfig = toml::from_str(
+            r#"
+            enabled = true
+            threshold_ratio = 0.8
+            protect_first_n = 2
+            protect_last_n = 6
+            max_passes = 5
+            summary_max_chars = 9000
+            source_max_chars = 1000
+            summary_model = "haiku"
+            identifier_policy = "loose"
+            tool_result_retrim_chars = 100
+            tool_result_trim_exempt = ["shell"]
+            some_future_or_removed_key = "x"
+            "#,
+        )
+        .expect("legacy-shape context_compression parses");
+        assert!(cfg.enabled);
+        assert_eq!(cfg.protect_last_n, 6);
+        assert_eq!(cfg.summary_model.as_deref(), Some("haiku"));
+        // New fields fall back to their defaults.
+        assert_eq!(cfg.keep_recent_turns, 4);
+        assert_eq!(cfg.summary_max_tokens, 16_384);
     }
 
     #[test]

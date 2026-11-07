@@ -53,6 +53,10 @@ pub(crate) fn collect_tool_results(
     loop_detector: &mut LoopDetector,
     loop_ignore_tools: &HashSet<&str>,
     max_tool_result_chars: usize,
+    // `(room_tokens, calibration_ratio)` when the token guard is active (LLM
+    // compaction): a single result whose calibrated size exceeds the room
+    // left for history is cut with an explicit marker. `None` = no guard.
+    tool_result_token_guard: Option<(usize, f64)>,
     collected_receipts: Option<&Mutex<Vec<String>>>,
     model: &str,
     iteration: usize,
@@ -160,6 +164,25 @@ pub(crate) fn collect_tool_results(
             );
         }
         let mut result_output = truncation.output;
+        if let Some((room_tokens, ratio)) = tool_result_token_guard
+            && let Some(guarded) =
+                super::guard_oversized_tool_result(&result_output, room_tokens, ratio)
+        {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_category(::zeroclaw_log::EventCategory::Tool)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "tool_call_id": tool_call_id,
+                        "original_bytes": result_output.len(),
+                        "retained_bytes": guarded.len(),
+                        "room_tokens": room_tokens,
+                    })),
+                "tool_result_truncated_token_guard"
+            );
+            result_output = guarded;
+        }
         // Append HMAC receipt to tool result when receipts are enabled
         if let Some(ref receipt) = outcome.receipt {
             ::zeroclaw_log::record!(
@@ -315,6 +338,7 @@ mod tests {
             &ignore,
             max_tool_result_chars,
             None,
+            None,
             "test-model",
             0,
             "turn-test",
@@ -438,6 +462,7 @@ mod tests {
                 &ignore,
                 10_000,
                 None,
+                None,
                 "test-model",
                 iteration,
                 "turn-test",
@@ -489,6 +514,7 @@ mod tests {
             &ignore,
             10_000,
             None,
+            None,
             "test-model",
             0,
             "turn-test",
@@ -534,6 +560,7 @@ mod tests {
             &mut detector,
             &ignore,
             10_000,
+            None,
             None,
             "test-model",
             0,

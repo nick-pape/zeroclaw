@@ -2243,6 +2243,7 @@ mod tests {
             &ignore,
             0,
             None,
+            None,
             "test-model",
             0,
             "turn-test",

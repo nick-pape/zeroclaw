@@ -313,6 +313,48 @@ pub trait SessionBackend: Send + Sync {
         Ok(true)
     }
 
+    /// Record whether the synthetic leading message of this session's
+    /// persisted transcript (the slot `trim_breadcrumb` marks) is an LLM
+    /// compaction summary rather than the plain trim breadcrumb. Like the
+    /// breadcrumb flag this is an owner record, never inferred from message
+    /// text: a later compaction folds a recorded summary into the next one
+    /// (summary-of-summary). Only meaningful together with
+    /// `trim_breadcrumb = true`. No-op for backends that don't track it
+    /// (the caller then treats the leading message as a breadcrumb, whose
+    /// text a later compaction still folds in, so nothing is lost).
+    fn set_session_compaction_summary(
+        &self,
+        _session_key: &str,
+        _present: bool,
+    ) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    /// Get the recorded compaction-summary provenance. `None` means the
+    /// backend doesn't track it or nothing was recorded (treat as `false`).
+    fn get_session_compaction_summary(&self, _session_key: &str) -> std::io::Result<Option<bool>> {
+        Ok(None)
+    }
+
+    /// Replace the durable transcript together with BOTH provenance flags of
+    /// its synthetic leading message: the breadcrumb slot flag and whether
+    /// that slot holds a compaction summary. Channel resyncs use this after
+    /// a trim or a compaction so the transcript and its provenance commit as
+    /// one fact. The default performs `replace_conversation_state` then
+    /// `set_session_compaction_summary` under the caller's lock (not
+    /// crash-atomic); `SqliteSessionBackend` overrides it with one
+    /// transaction.
+    fn replace_compacted_conversation_state(
+        &self,
+        session_key: &str,
+        messages: &[ChatMessage],
+        breadcrumb_present: bool,
+        summary_present: bool,
+    ) -> std::io::Result<()> {
+        self.replace_conversation_state(session_key, messages, breadcrumb_present)?;
+        self.set_session_compaction_summary(session_key, summary_present && breadcrumb_present)
+    }
+
     fn set_session_context(
         &self,
         _session_key: &str,

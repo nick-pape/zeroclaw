@@ -2,6 +2,7 @@
 pub mod agent;
 pub(crate) mod approval_bridge;
 pub mod classifier;
+pub mod compaction;
 pub mod context_analyzer;
 pub mod cost;
 pub mod dispatcher;

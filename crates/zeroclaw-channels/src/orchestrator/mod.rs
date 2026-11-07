@@ -244,6 +244,13 @@ type ConversationHistoryMap = Arc<Mutex<lru::LruCache<String, Vec<ChatMessage>>>
 /// text on every restore. `true` means the stored history's first non-system
 /// message is the synthetic trim marker.
 type HistoryCrumbMap = Arc<Mutex<lru::LruCache<String, bool>>>;
+/// A fresh, empty per-sender provenance map.
+fn new_history_flag_map() -> HistoryCrumbMap {
+    Arc::new(Mutex::new(lru::LruCache::new(
+        std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
+            .expect("MAX_CONVERSATION_SENDERS must be positive"),
+    )))
+}
 /// Senders that requested `/new` or `/clear` and must force a fresh prompt on their next message.
 type PendingNewSessionSet = Arc<Mutex<HashSet<String>>>;
 /// Maximum conversation senders kept in memory (LRU eviction beyond this).
@@ -514,6 +521,9 @@ enum ChannelRuntimeCommand {
     SetModelScoped(OverrideScope, String),
     ShowConfig,
     NewSession,
+    /// `/compact [focus]` — summarise the sender's older turns now (LLM
+    /// compaction), optionally steering the summary with focus text.
+    Compact(Option<String>),
     SetThinking(Option<ThinkingLevel>),
     InvalidThinking(String),
 }
@@ -705,6 +715,11 @@ struct ChannelRuntimeContext {
     min_relevance_score: f64,
     conversation_histories: ConversationHistoryMap,
     history_crumb_flags: HistoryCrumbMap,
+    /// Per-sender compaction-summary provenance: `true` means the synthetic
+    /// slot `history_crumb_flags` marks holds an LLM compaction summary
+    /// rather than the plain trim breadcrumb (owner record, never inferred
+    /// from text). Only meaningful beside a `true` crumb flag.
+    history_summary_flags: HistoryCrumbMap,
     pending_new_sessions: PendingNewSessionSet,
     provider_cache: ProviderCacheMap,
     route_overrides: RouteSelectionMap,
@@ -2804,6 +2819,14 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
                 None
             }
         }
+        // `/compact [focus text]` is available on every channel, like `/new`.
+        // The focus is the verbatim remainder after the command token.
+        "/compact" => {
+            let focus = trimmed[command_token.len()..].trim();
+            Some(ChannelRuntimeCommand::Compact(
+                (!focus.is_empty()).then(|| focus.to_string()),
+            ))
+        }
         "/thinking" => {
             let arg = parts.next();
             if parts.next().is_some() {
@@ -3545,6 +3568,10 @@ fn clear_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .pop(sender_key);
+    ctx.history_summary_flags
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .pop(sender_key);
 }
 
 fn mark_sender_for_new_session(ctx: &ChannelRuntimeContext, sender_key: &str) {
@@ -3964,7 +3991,11 @@ fn hydrate_sender_history_if_missing(ctx: &ChannelRuntimeContext, sender_key: &s
         // the cache missing so the next turn retries hydration.
         let mut hydration_unavailable = false;
         if missing && let Some(ref store) = ctx.session_store {
-            match hydrate_session_transcript(store.as_ref(), sender_key) {
+            match hydrate_session_transcript_with_cap(
+                store.as_ref(),
+                sender_key,
+                hydration_row_cap(ctx),
+            ) {
                 Ok(Some(hydrated)) => {
                     ctx.history_crumb_flags
                         .lock()
@@ -4117,15 +4148,14 @@ fn append_sender_turn(
     }
 
     let max_history = channel_history_cap(ctx);
+    let keep_lead = lead_is_recorded_summary(ctx, sender_key);
     let mut histories = ctx
         .conversation_histories
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let turns = histories.get_or_insert_mut(sender_key.to_string(), Vec::new);
     turns.push(turn);
-    while turns.len() > max_history {
-        turns.remove(0);
-    }
+    cap_history_rows(turns, max_history, keep_lead);
     Some(turns.clone())
 }
 
@@ -4138,6 +4168,303 @@ fn channel_history_cap(ctx: &ChannelRuntimeContext) -> usize {
     } else {
         MAX_CHANNEL_HISTORY
     }
+}
+
+/// Whether LLM context compaction is enabled for this context's agent, read
+/// from the same config snapshot the tool-call loop resolves it from.
+fn compaction_enabled(ctx: &ChannelRuntimeContext) -> bool {
+    zeroclaw_runtime::agent::compaction::CompactionSettings::for_agent(
+        ctx.prompt_config.as_ref(),
+        ctx.agent_alias.as_str(),
+    )
+    .is_some_and(|settings| settings.enabled)
+}
+
+/// Row cap applied when a durable transcript is rehydrated. Upstream
+/// hydration always caps at `MAX_CHANNEL_HISTORY`; with LLM compaction the
+/// operator's `max_history_messages` applies instead (compaction, not a row
+/// cap, is what shrinks a compacting thread), so a restart does not cut a
+/// thread the live process kept.
+fn hydration_row_cap(ctx: &ChannelRuntimeContext) -> usize {
+    if compaction_enabled(ctx) {
+        channel_history_cap(ctx)
+    } else {
+        MAX_CHANNEL_HISTORY
+    }
+}
+
+/// The owner's compaction-summary provenance for `sender_key`'s synthetic
+/// slot: the in-memory record first, then the durable one. Never inferred
+/// from message text; `false` whenever the slot is not occupied.
+fn resolve_summary_provenance(
+    ctx: &ChannelRuntimeContext,
+    sender_key: &str,
+    crumb_present: bool,
+) -> bool {
+    if !crumb_present {
+        return false;
+    }
+    if let Some(flag) = ctx
+        .history_summary_flags
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .peek(sender_key)
+        .copied()
+    {
+        return flag;
+    }
+    ctx.session_store
+        .as_deref()
+        .and_then(|store| {
+            store
+                .get_session_compaction_summary(sender_key)
+                .ok()
+                .flatten()
+        })
+        .unwrap_or(false)
+}
+
+/// Whether the cached transcript for `sender_key` currently leads with a
+/// recorded compaction summary (both owner flags set in memory).
+fn lead_is_recorded_summary(ctx: &ChannelRuntimeContext, sender_key: &str) -> bool {
+    let crumb = ctx
+        .history_crumb_flags
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .peek(sender_key)
+        .copied()
+        .unwrap_or(false);
+    crumb
+        && ctx
+            .history_summary_flags
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .peek(sender_key)
+            .copied()
+            .unwrap_or(false)
+}
+
+/// Enforce the per-sender row cap. A transcript that leads with a recorded
+/// compaction summary keeps it and evicts the oldest rows AFTER it instead,
+/// so the cap never removes the summary while its owner flags still claim
+/// the slot.
+fn cap_history_rows(turns: &mut Vec<ChatMessage>, cap: usize, keep_lead: bool) {
+    if turns.len() <= cap {
+        return;
+    }
+    let excess = turns.len() - cap;
+    if keep_lead && cap >= 2 {
+        turns.drain(1..1 + excess);
+    } else {
+        turns.drain(..excess);
+    }
+}
+
+/// Run `fut` inside `scope` when one is given (LLM compaction enabled).
+async fn with_compaction_scope<F: std::future::Future>(
+    scope: Option<Arc<zeroclaw_runtime::agent::compaction::CompactionScope>>,
+    fut: F,
+) -> F::Output {
+    match scope {
+        Some(scope) => {
+            zeroclaw_runtime::agent::compaction::COMPACTION_SCOPE
+                .scope(scope, fut)
+                .await
+        }
+        None => fut.await,
+    }
+}
+
+/// Manual `/compact [focus]`: summarise the sender's older turns now,
+/// regardless of size, keeping the protected verbatim tail. No model turn
+/// runs. The summary call happens outside the per-sender persist lock; the
+/// result is published (cache + durable store + both owner flags) only when
+/// the cached transcript still starts with the snapshot that was summarised,
+/// and any messages appended meanwhile are kept after it.
+async fn compact_sender_history_now(
+    ctx: &ChannelRuntimeContext,
+    sender_key: &str,
+    current: &ChannelRouteSelection,
+    defaults_snapshot: &ChannelRuntimeDefaultsSnapshot,
+    focus: Option<&str>,
+) -> String {
+    use zeroclaw_runtime::agent::compaction::{
+        CompactionError, CompactionSettings, LeadProvenance, run_compaction,
+    };
+    let Some(settings) =
+        CompactionSettings::for_agent(ctx.prompt_config.as_ref(), ctx.agent_alias.as_str())
+            .filter(|settings| settings.enabled)
+    else {
+        return channel_runtime_cli_string("channel-runtime-compact-disabled");
+    };
+
+    let (snapshot, crumb_present, summary_present) = {
+        let persist_lock = acquire_persist_lock(ctx, sender_key);
+        let _lock = persist_lock.lock().unwrap_or_else(|e| e.into_inner());
+        if !hydrate_sender_history_if_missing(ctx, sender_key) {
+            return channel_runtime_cli_string("channel-runtime-compact-unavailable");
+        }
+        let snapshot = ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .peek(sender_key)
+            .cloned()
+            .unwrap_or_default();
+        let recorded = ctx
+            .history_crumb_flags
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .peek(sender_key)
+            .copied();
+        let crumb_present = recorded.unwrap_or_else(|| {
+            resolve_cold_crumb_provenance(ctx.session_store.as_deref(), sender_key, &snapshot)
+        });
+        let summary_present = resolve_summary_provenance(ctx, sender_key, crumb_present);
+        (snapshot, crumb_present, summary_present)
+    };
+
+    let limits = resolve_channel_context_limits(
+        defaults_snapshot.config.as_ref(),
+        ctx.agent_alias.as_str(),
+        current,
+        ctx.context_token_budget,
+    );
+    let budget = if limits.context_token_budget == 0 {
+        limits.model_context_window
+    } else {
+        limits.context_token_budget.min(limits.model_context_window)
+    };
+    // The agent's own route is the summary model only when no
+    // `summary_provider` is configured.
+    let fallback_provider = get_or_create_provider(
+        ctx,
+        &current.model_provider,
+        current.api_key.as_deref(),
+        defaults_snapshot,
+    )
+    .await
+    .ok();
+    let fallback = fallback_provider.as_ref().map(|provider| {
+        (
+            provider.as_ref() as &dyn ModelProvider,
+            current.model.as_str(),
+            ctx.temperature,
+        )
+    });
+    let mut compacted = snapshot.clone();
+    let mut lead = LeadProvenance::new(crumb_present, summary_present);
+    let outcome = match run_compaction(
+        "manual",
+        Some(defaults_snapshot.config.as_ref()),
+        Some(ctx.agent_alias.as_str()),
+        fallback,
+        &settings,
+        Some(sender_key),
+        &mut compacted,
+        &mut lead,
+        focus,
+        budget,
+        1.0,
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(CompactionError::NothingToCompact) => {
+            return channel_runtime_cli_string("channel-runtime-compact-nothing");
+        }
+        Err(error) => {
+            let error = zeroclaw_providers::sanitize_api_error(&error.to_string());
+            return channel_runtime_cli_string_with_args(
+                "channel-runtime-compact-failed",
+                &[("error", error.as_str())],
+            );
+        }
+    };
+
+    let persist_lock = acquire_persist_lock(ctx, sender_key);
+    let _lock = persist_lock.lock().unwrap_or_else(|e| e.into_inner());
+    let live = ctx
+        .conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .peek(sender_key)
+        .cloned();
+    let live_crumb = ctx
+        .history_crumb_flags
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .peek(sender_key)
+        .copied()
+        .unwrap_or(crumb_present);
+    let Some(live) = live.filter(|live| {
+        live_crumb == crumb_present
+            && live.len() >= snapshot.len()
+            && live
+                .iter()
+                .zip(&snapshot)
+                .all(|(a, b)| a.role == b.role && a.content == b.content)
+    }) else {
+        return channel_runtime_cli_string("channel-runtime-compact-conflict");
+    };
+    let mut published = compacted;
+    published.extend_from_slice(&live[snapshot.len()..]);
+    if let Some(ref store) = ctx.session_store
+        && let Err(e) = store.replace_compacted_conversation_state(
+            sender_key,
+            &published,
+            lead.crumb_present,
+            lead.summary_present,
+        )
+    {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(
+                    ::serde_json::json!({"error": format!("{}", e), "sender_key": sender_key})
+                ),
+            "Failed to persist manually compacted session history"
+        );
+        // The durable write may have partially applied; evict the cache so
+        // the next turn reloads whatever is durable rather than building on
+        // a state this command cannot vouch for.
+        ctx.conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pop(sender_key);
+        ctx.history_crumb_flags
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pop(sender_key);
+        ctx.history_summary_flags
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pop(sender_key);
+        return channel_runtime_cli_string_with_args(
+            "channel-runtime-compact-failed",
+            &[("error", "the compacted history could not be saved")],
+        );
+    }
+    ctx.conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .put(sender_key.to_string(), published);
+    ctx.history_crumb_flags
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .put(sender_key.to_string(), lead.crumb_present);
+    ctx.history_summary_flags
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .put(sender_key.to_string(), lead.summary_present);
+    channel_runtime_cli_string_with_args(
+        "channel-runtime-compact-done",
+        &[
+            ("before", outcome.tokens_before.to_string().as_str()),
+            ("after", outcome.tokens_after.to_string().as_str()),
+        ],
+    )
 }
 
 /// Append an internally initiated exchange to a sender's history as one
@@ -4184,15 +4511,14 @@ fn append_bound_exchange(
 
     if kept > 0 {
         let max_history = channel_history_cap(ctx);
+        let keep_lead = lead_is_recorded_summary(ctx, sender_key);
         let mut histories = ctx
             .conversation_histories
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let turns = histories.get_or_insert_mut(sender_key.to_string(), Vec::new);
         turns.extend(messages[..kept].iter().cloned());
-        while turns.len() > max_history {
-            turns.remove(0);
-        }
+        cap_history_rows(turns, max_history, keep_lead);
     }
 
     match failure {
@@ -4403,13 +4729,16 @@ fn turns_appended_after<'a>(
 /// provenance is not the same as a confirmed absence, and publishing a
 /// guess in its place could make a later trim treat a synthetic marker as
 /// a real turn or vice versa.
+#[allow(clippy::too_many_arguments)]
 fn resync_sender_history_after_trim(
     ctx: &ChannelRuntimeContext,
     sender_key: &str,
     trimmed_turns: &[ChatMessage],
     breadcrumb_present: bool,
+    summary_present: bool,
     known_prefix: &[ChatMessage],
     crumb_present_before_loop: bool,
+    summary_present_before_loop: bool,
 ) -> bool {
     let persist_lock = acquire_persist_lock(ctx, sender_key);
     let _lock = persist_lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -4436,9 +4765,15 @@ fn resync_sender_history_after_trim(
         // mean the transcript half landed and the breadcrumb half did not
         // (or vice versa), so on error we reload the backend's actual
         // current state below instead of assuming nothing changed.
-        if let Err(e) =
-            store.replace_conversation_state(sender_key, &published_turns, breadcrumb_present)
-        {
+        // The compaction-summary flag commits with the transcript and the
+        // breadcrumb flag (one transaction on SQLite): a compaction's summary
+        // and its provenance must never land apart.
+        if let Err(e) = store.replace_compacted_conversation_state(
+            sender_key,
+            &published_turns,
+            breadcrumb_present,
+            summary_present,
+        ) {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -4462,6 +4797,17 @@ fn resync_sender_history_after_trim(
                         .lock()
                         .unwrap_or_else(|e| e.into_inner());
                     flags.put(sender_key.to_string(), reloaded_breadcrumb);
+                    drop(flags);
+                    let reloaded_summary = reloaded_breadcrumb
+                        && store
+                            .get_session_compaction_summary(sender_key)
+                            .ok()
+                            .flatten()
+                            .unwrap_or(summary_present_before_loop);
+                    ctx.history_summary_flags
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .put(sender_key.to_string(), reloaded_summary);
                 }
                 Err(e) => {
                     // The provenance read failed outright: `Err(_)` is not
@@ -4498,7 +4844,24 @@ fn resync_sender_history_after_trim(
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     flags.put(sender_key.to_string(), breadcrumb_present);
+    drop(flags);
+    ctx.history_summary_flags
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .put(
+            sender_key.to_string(),
+            breadcrumb_present && summary_present,
+        );
     true
+}
+
+/// Compaction facts the post-loop resync needs (see
+/// `resync_history_after_trim_or_evict_cache`). `Default` = no compaction.
+#[derive(Debug, Clone, Copy, Default)]
+struct CompactionResync {
+    summary_present: bool,
+    summary_present_before_loop: bool,
+    compacted: bool,
 }
 
 /// Resync the cache and durable transcript to the tool-call loop's trimmed
@@ -4529,6 +4892,11 @@ fn resync_history_after_trim_or_evict_cache(
     prior_turns_len_before_loop: usize,
     known_prefix: &[ChatMessage],
     outgoing_user_turn_raw_content: Option<&str>,
+    // LLM compaction: the slot's summary provenance after/before the loop and
+    // whether the loop compacted at all. A compaction always republishes the
+    // loop's history, even when it happens to leave the row count and the
+    // breadcrumb flag unchanged.
+    compaction: CompactionResync,
 ) -> bool {
     let last_user_idx = history.iter().rposition(|m| m.role == "user").unwrap_or(0);
     let retained_prior_turns = if last_user_idx >= 1 {
@@ -4539,6 +4907,8 @@ fn resync_history_after_trim_or_evict_cache(
 
     if history_has_trim_breadcrumb == crumb_present_before_loop
         && retained_prior_turns.len() == prior_turns_len_before_loop
+        && !compaction.compacted
+        && compaction.summary_present == compaction.summary_present_before_loop
     {
         // Serialize with the trim publication path (`resync_sender_history_after_trim`
         // holds this same lock while publishing the cache plus `history_crumb_flags`
@@ -4588,8 +4958,10 @@ fn resync_history_after_trim_or_evict_cache(
         sender_key,
         &clean_retained_turns,
         history_has_trim_breadcrumb,
+        compaction.summary_present,
         known_prefix,
         crumb_present_before_loop,
+        compaction.summary_present_before_loop,
     );
     if !reconciled {
         // The resync could not confirm that the cache matches whatever
@@ -5578,6 +5950,16 @@ async fn handle_runtime_command_for_delivery(
             }
             mark_sender_for_new_session(ctx, &sender_key);
             channel_runtime_cli_string("channel-runtime-new-session")
+        }
+        ChannelRuntimeCommand::Compact(focus) => {
+            compact_sender_history_now(
+                ctx,
+                &sender_key,
+                &current,
+                &defaults_snapshot,
+                focus.as_deref(),
+            )
+            .await
         }
         ChannelRuntimeCommand::SetThinking(level) => match level {
             Some(level) => {
@@ -9831,6 +10213,18 @@ async fn process_channel_message_body(
         None => resolve_cold_crumb_provenance(ctx.session_store.as_deref(), &history_key, &history),
     };
     let crumb_present_before_loop = history_has_trim_breadcrumb;
+    // LLM compaction (opt-in): the slot's compaction-summary provenance is
+    // carried into the loop through a task-scoped `CompactionScope` (the
+    // breadcrumb flag keeps travelling through `history_has_trim_breadcrumb`)
+    // and read back after it for the post-loop resync.
+    let summary_present_before_loop =
+        resolve_summary_provenance(ctx.as_ref(), &history_key, history_has_trim_breadcrumb);
+    let compaction_scope = compaction_enabled(ctx.as_ref()).then(|| {
+        zeroclaw_runtime::agent::compaction::CompactionScope::new(
+            summary_present_before_loop,
+            Some(history_key.clone()),
+        )
+    });
     // Unused by this channel path: the pre-injection raw turn content is
     // already captured and restored wholesale below (`outgoing_user_turn_raw_content`
     // / `strip_volatile_preamble_before_persist`), which covers the recalled-memory
@@ -10363,6 +10757,19 @@ async fn process_channel_message_body(
         ctx.message_timeout_secs,
         ctx.max_tool_iterations,
         scale_cap,
+    )
+    // A compaction summary call runs inside the turn; give it its own time
+    // so a slow summary does not starve the turn it makes room for.
+    .saturating_add(
+        compaction_scope
+            .as_ref()
+            .and_then(|_| {
+                zeroclaw_runtime::agent::compaction::CompactionSettings::for_agent(
+                    ctx.prompt_config.as_ref(),
+                    ctx.agent_alias.as_str(),
+                )
+            })
+            .map_or(0, |settings| settings.timeout_secs),
     );
     let cost_tracking_context = ctx.cost_tracking.clone().map(|state| {
         zeroclaw_runtime::agent::loop_::ToolLoopCostTrackingContext::new(
@@ -10544,6 +10951,7 @@ async fn process_channel_message_body(
                 tool_loop,
             );
             let tool_loop = scope_thread_id(thread_scope_id, tool_loop);
+            let tool_loop = with_compaction_scope(compaction_scope.clone(), tool_loop);
             let tool_loop = zeroclaw_providers::reliable::scope_provider_attempt_allowlist(
                 attempt_allowlist.clone(),
                 tool_loop,
@@ -10707,6 +11115,16 @@ async fn process_channel_message_body(
         prior_turns_len_before_loop,
         &known_prefix,
         outgoing_user_turn_raw_content.as_deref(),
+        CompactionResync {
+            summary_present: compaction_scope
+                .as_ref()
+                .map_or(summary_present_before_loop, |scope| scope.summary_present())
+                && history_has_trim_breadcrumb,
+            summary_present_before_loop,
+            compacted: compaction_scope
+                .as_ref()
+                .is_some_and(|scope| scope.compactions() > 0),
+        },
     );
 
     let turn_tokens_used = cost_tracking_context.as_ref().and_then(|ctx| {
@@ -16734,9 +17152,22 @@ struct HydrationFailed;
 /// part of that reconciliation: publishing a closure that storage never
 /// accepted would leave the live cache ahead of durable storage until the
 /// next authoritative replacement.
+#[cfg(test)]
 fn hydrate_session_transcript(
     store: &dyn zeroclaw_infra::session_backend::SessionBackend,
     session_key: &str,
+) -> Result<Option<HydratedSession>, HydrationFailed> {
+    hydrate_session_transcript_with_cap(store, session_key, MAX_CHANNEL_HISTORY)
+}
+
+/// [`hydrate_session_transcript`] with an explicit row cap (see
+/// [`hydration_row_cap`]). A transcript whose synthetic slot holds a
+/// recorded compaction summary keeps the summary when the cap applies and
+/// evicts the oldest rows after it, so its provenance stays valid.
+fn hydrate_session_transcript_with_cap(
+    store: &dyn zeroclaw_infra::session_backend::SessionBackend,
+    session_key: &str,
+    row_cap: usize,
 ) -> Result<Option<HydratedSession>, HydrationFailed> {
     let mut msgs = match store.try_load(session_key) {
         Ok(v) => v,
@@ -16789,9 +17220,18 @@ fn hydrate_session_transcript(
         first.role == "user"
             && zeroclaw_runtime::agent::history::is_history_trim_breadcrumb_text(&first.content)
     });
-    let truncated = msgs.len() > MAX_CHANNEL_HISTORY;
+    let row_cap = row_cap.max(1);
+    let truncated = msgs.len() > row_cap;
+    // A recorded compaction summary is owner provenance, not text: when the
+    // cap applies it survives in the slot and the rows after it are evicted.
+    let durable_summary_lead = durable_crumb == Some(true)
+        && store
+            .get_session_compaction_summary(session_key)
+            .ok()
+            .flatten()
+            .unwrap_or(false);
     if truncated {
-        msgs.drain(..msgs.len() - MAX_CHANNEL_HISTORY);
+        cap_history_rows(&mut msgs, row_cap, durable_summary_lead);
     }
 
     let mut orphan_closed = false;
@@ -16830,6 +17270,7 @@ fn hydrate_session_transcript(
     };
 
     let crumb_present = match durable_crumb {
+        Some(true) if durable_summary_lead => true,
         Some(true) => !(truncated && marker_present_pre_drain),
         Some(false) => false,
         None => marker_present_post_cap,
@@ -17578,6 +18019,7 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
             ))),
+            history_summary_flags: new_history_flag_map(),
             history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
@@ -17696,8 +18138,11 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
             // reconciliation (`Err`) skip startup installation: the next
             // inbound turn retries hydration (or installs a verified
             // durable fallback) instead of building on unconfirmed state.
-            let Ok(Some(hydrated_session)) = hydrate_session_transcript(store.as_ref(), &m.key)
-            else {
+            let Ok(Some(hydrated_session)) = hydrate_session_transcript_with_cap(
+                store.as_ref(),
+                &m.key,
+                hydration_row_cap(target_ctx),
+            ) else {
                 continue;
             };
             let mut msgs = hydrated_session.messages;
@@ -18269,6 +18714,7 @@ fn concurrent_persist_lock_serialization() {
             std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
         ))),
         pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+        history_summary_flags: new_history_flag_map(),
         history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
             std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                 .expect("MAX_CONVERSATION_SENDERS must be positive"),
@@ -18452,6 +18898,7 @@ fn test_channel_ctx_with_backend(
             std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
         ))),
         pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+        history_summary_flags: new_history_flag_map(),
         history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
             std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                 .expect("MAX_CONVERSATION_SENDERS must be positive"),
@@ -18576,6 +19023,7 @@ fn test_channel_ctx_with_backend_channel_and_provider(
             std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
         ))),
         pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+        history_summary_flags: new_history_flag_map(),
         history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
             std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                 .expect("MAX_CONVERSATION_SENDERS must be positive"),
@@ -18746,8 +19194,10 @@ fn channel_trim_resync_survives_restart() {
             &sender,
             &trimmed_turns,
             true,
+            false,
             &known_prefix,
-            false
+            false,
+            false,
         ),
         "resync must report success when the durable write succeeds"
     );
@@ -18898,8 +19348,10 @@ fn channel_trim_resync_does_not_record_breadcrumb_when_transcript_write_fails() 
             &sender,
             &trimmed_turns,
             true,
+            false,
             &known_prefix,
-            false
+            false,
+            false,
         ),
         "resync must report failure when the durable transcript write fails"
     );
@@ -19028,8 +19480,10 @@ fn channel_trim_resync_does_not_guess_breadcrumb_when_provenance_read_fails() {
             &sender,
             &trimmed_turns,
             true,
+            false,
             &known_prefix,
-            false
+            false,
+            false,
         ),
         "resync must report failure when the durable transcript write fails"
     );
@@ -19151,6 +19605,7 @@ fn caller_evicts_cache_and_does_not_guess_flag_when_trim_resync_fails() {
         1,     // prior_turns_len_before_loop
         &known_prefix,
         None,
+        CompactionResync::default(),
     );
 
     assert!(
@@ -19323,7 +19778,9 @@ fn stale_no_trim_completion_does_not_overwrite_a_newer_trims_flag() {
             &sender,
             &trimmed_turns,
             true,
+            false,
             &known_prefix_b,
+            false,
             false,
         ),
         "worker B's trim resync must succeed"
@@ -19347,6 +19804,7 @@ fn stale_no_trim_completion_does_not_overwrite_a_newer_trims_flag() {
         prior_len_a,
         &known_prefix_a,
         None,
+        CompactionResync::default(),
     );
     assert!(
         !resync_failed,
@@ -19522,7 +19980,9 @@ fn channel_trim_resync_preserves_a_concurrent_workers_later_turn() {
             &sender,
             &trimmed_turns,
             true,
+            false,
             &known_prefix,
+            false,
             false,
         ),
         "resync must report success when the durable write succeeds"
@@ -19634,7 +20094,9 @@ fn bound_exchange_survives_a_concurrent_channel_turns_trim_resync() {
         &sender,
         &trimmed_turns,
         true,
+        false,
         &known_prefix,
+        false,
         false,
     ));
 
@@ -20208,7 +20670,9 @@ fn channel_trim_resync_preserves_a_concurrent_workers_later_turn_across_eviction
             &sender,
             &trimmed_turns,
             false,
+            false,
             &known_prefix,
+            false,
             false,
         ),
         "resync must report success when the durable write succeeds"
@@ -22806,6 +23270,7 @@ temperature = 0.3
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_summary_flags: new_history_flag_map(),
             history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
@@ -23783,6 +24248,7 @@ temperature = 0.3
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_summary_flags: new_history_flag_map(),
             history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
@@ -24269,6 +24735,7 @@ api_key = "anthropic-key"
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(histories)),
+            history_summary_flags: new_history_flag_map(),
             history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
@@ -24379,6 +24846,7 @@ api_key = "anthropic-key"
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_summary_flags: new_history_flag_map(),
             history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
@@ -24505,6 +24973,7 @@ api_key = "anthropic-key"
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(histories)),
+            history_summary_flags: new_history_flag_map(),
             history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
@@ -24636,6 +25105,7 @@ api_key = "anthropic-key"
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(histories)),
+            history_summary_flags: new_history_flag_map(),
             history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
@@ -26675,6 +27145,7 @@ api_key = "anthropic-key"
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_summary_flags: new_history_flag_map(),
             history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
@@ -26782,6 +27253,7 @@ api_key = "anthropic-key"
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_summary_flags: new_history_flag_map(),
             history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
@@ -29766,6 +30238,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_summary_flags: new_history_flag_map(),
             history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
@@ -29948,6 +30421,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_summary_flags: new_history_flag_map(),
             history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
@@ -30128,6 +30602,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_summary_flags: new_history_flag_map(),
             history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
@@ -30337,6 +30812,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_summary_flags: new_history_flag_map(),
             history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
@@ -30526,6 +31002,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_summary_flags: new_history_flag_map(),
             history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
@@ -30727,6 +31204,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_summary_flags: new_history_flag_map(),
             history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
@@ -31302,6 +31780,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_summary_flags: new_history_flag_map(),
             history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
@@ -31454,6 +31933,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_summary_flags: new_history_flag_map(),
             history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
@@ -31582,6 +32062,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_summary_flags: new_history_flag_map(),
             history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
@@ -31890,6 +32371,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_summary_flags: new_history_flag_map(),
             history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
@@ -32027,6 +32509,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_summary_flags: new_history_flag_map(),
             history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
@@ -32186,6 +32669,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_summary_flags: new_history_flag_map(),
             history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
@@ -32328,6 +32812,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_summary_flags: new_history_flag_map(),
             history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
@@ -32455,6 +32940,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_summary_flags: new_history_flag_map(),
             history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
@@ -32600,6 +33086,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_summary_flags: new_history_flag_map(),
             history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
@@ -32767,6 +33254,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_summary_flags: new_history_flag_map(),
             history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
@@ -32974,6 +33462,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_summary_flags: new_history_flag_map(),
             history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
@@ -33495,6 +33984,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_summary_flags: new_history_flag_map(),
             history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
@@ -33617,6 +34107,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_summary_flags: new_history_flag_map(),
             history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
@@ -33749,6 +34240,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_summary_flags: new_history_flag_map(),
             history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
@@ -35239,6 +35731,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_summary_flags: new_history_flag_map(),
             history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
@@ -35449,6 +35942,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_summary_flags: new_history_flag_map(),
             history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
@@ -35620,6 +36114,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_summary_flags: new_history_flag_map(),
             history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
@@ -35784,6 +36279,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_summary_flags: new_history_flag_map(),
             history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
@@ -35955,6 +36451,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_summary_flags: new_history_flag_map(),
             history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
@@ -36174,6 +36671,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_summary_flags: new_history_flag_map(),
             history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
@@ -36407,6 +36905,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_summary_flags: new_history_flag_map(),
             history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
@@ -36553,6 +37052,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_summary_flags: new_history_flag_map(),
             history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
@@ -37236,6 +37736,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_summary_flags: new_history_flag_map(),
             history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
@@ -37376,6 +37877,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_summary_flags: new_history_flag_map(),
             history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
@@ -37519,6 +38021,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_summary_flags: new_history_flag_map(),
             history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
@@ -37654,6 +38157,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_summary_flags: new_history_flag_map(),
             history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
@@ -37789,6 +38293,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_summary_flags: new_history_flag_map(),
             history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
@@ -38211,6 +38716,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_summary_flags: new_history_flag_map(),
             history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
@@ -39744,6 +40250,7 @@ BTC is currently around $65,000 based on latest tool output."#
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
+            history_summary_flags: new_history_flag_map(),
             history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
@@ -46446,6 +46953,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_summary_flags: new_history_flag_map(),
             history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
@@ -46637,6 +47145,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_summary_flags: new_history_flag_map(),
             history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
@@ -47164,6 +47673,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_summary_flags: new_history_flag_map(),
             history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
@@ -47662,6 +48172,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_summary_flags: new_history_flag_map(),
             history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
@@ -47839,6 +48350,7 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(histories)),
+            history_summary_flags: new_history_flag_map(),
             history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
@@ -51857,6 +52369,7 @@ This is an example JSON object for profile settings."#;
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_summary_flags: new_history_flag_map(),
             history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
@@ -51994,6 +52507,7 @@ This is an example JSON object for profile settings."#;
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_summary_flags: new_history_flag_map(),
             history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
@@ -52171,6 +52685,7 @@ This is an example JSON object for profile settings."#;
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_summary_flags: new_history_flag_map(),
             history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
@@ -52490,6 +53005,7 @@ This is an example JSON object for profile settings."#;
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_summary_flags: new_history_flag_map(),
             history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
@@ -52655,6 +53171,7 @@ This is an example JSON object for profile settings."#;
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_summary_flags: new_history_flag_map(),
             history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
@@ -52812,6 +53329,7 @@ This is an example JSON object for profile settings."#;
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_summary_flags: new_history_flag_map(),
             history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
@@ -52989,6 +53507,7 @@ This is an example JSON object for profile settings."#;
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_summary_flags: new_history_flag_map(),
             history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
@@ -54167,6 +54686,7 @@ This is an example JSON object for profile settings."#;
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_summary_flags: new_history_flag_map(),
             history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
@@ -58406,5 +58926,322 @@ mod channel_purpose_tests {
     #[test]
     fn prompt_without_a_section_reports_none() {
         assert_eq!(rendered_channel_purpose("BASE PROMPT"), None);
+    }
+}
+
+// ── LLM compaction (channel side) ───────────────────────────────────────
+#[cfg(test)]
+mod compaction_channel_tests {
+    use super::*;
+    use zeroclaw_infra::session_backend::SessionBackend;
+
+    fn rows(history: &[ChatMessage]) -> Vec<(String, String)> {
+        history
+            .iter()
+            .map(|m| (m.role.clone(), m.content.clone()))
+            .collect()
+    }
+
+    /// Replies to every summary call with a fixed summary.
+    struct SummaryProvider;
+
+    impl ::zeroclaw_api::attribution::Attributable for SummaryProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "SummaryProvider"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for SummaryProvider {
+        async fn chat_with_system(
+            &self,
+            system_prompt: Option<&str>,
+            message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            assert!(system_prompt.is_some_and(|p| p.contains("VERY DETAILED")));
+            assert!(message.contains("FOCUS REQUESTED BY THE USER"));
+            assert!(message.contains("the grocery order"));
+            Ok("SUMMARY: the user asked about turns 0 and 1.".to_string())
+        }
+    }
+
+    fn compaction_ctx(backend: Arc<dyn SessionBackend>) -> Arc<ChannelRuntimeContext> {
+        let base = Arc::into_inner(test_channel_ctx_with_backend(backend))
+            .expect("fresh test context has one owner");
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.runtime_profiles.insert(
+            "compacting".to_string(),
+            zeroclaw_config::schema::RuntimeProfileConfig {
+                max_context_tokens: Some(100_000),
+                context_compression: zeroclaw_config::scattered_types::ContextCompressionConfig {
+                    enabled: true,
+                    keep_recent_turns: 2,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "test".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                runtime_profile: zeroclaw_config::providers::RuntimeProfileRef::from("compacting"),
+                ..Default::default()
+            },
+        );
+        Arc::new(ChannelRuntimeContext {
+            model_provider: Arc::new(SummaryProvider),
+            agent_alias: Arc::new("test".into()),
+            prompt_config: Arc::new(config.clone()),
+            live_config: zeroclaw_config::live::LiveConfig::new(config).handle(),
+            context_token_budget: 100_000,
+            ..base
+        })
+    }
+
+    fn six_turns() -> Vec<ChatMessage> {
+        (0..6)
+            .flat_map(|turn| {
+                [
+                    ChatMessage::user(format!("question {turn}")),
+                    ChatMessage::assistant(format!("answer {turn}")),
+                ]
+            })
+            .collect()
+    }
+
+    #[test]
+    fn parse_runtime_command_compact_with_and_without_focus() {
+        assert_eq!(
+            parse_runtime_command("matrix", "/compact"),
+            Some(ChannelRuntimeCommand::Compact(None))
+        );
+        assert_eq!(
+            parse_runtime_command("matrix", "  /compact   "),
+            Some(ChannelRuntimeCommand::Compact(None))
+        );
+        assert_eq!(
+            parse_runtime_command("telegram", "/compact@zeroclaw_bot keep the  HEB order ids"),
+            Some(ChannelRuntimeCommand::Compact(Some(
+                "keep the  HEB order ids".to_string()
+            )))
+        );
+        assert_eq!(
+            parse_runtime_command("discord", "/COMPACT focus"),
+            Some(ChannelRuntimeCommand::Compact(Some("focus".to_string())))
+        );
+        // Not a command when it is not the leading token.
+        assert_eq!(parse_runtime_command("matrix", "please /compact"), None);
+    }
+
+    #[test]
+    fn cap_history_rows_keeps_a_recorded_summary_lead() {
+        let mut turns = vec![ChatMessage::user("SUMMARY")];
+        turns.extend(six_turns());
+        let mut plain = turns.clone();
+        cap_history_rows(&mut turns, 5, true);
+        assert_eq!(turns.len(), 5);
+        assert_eq!(turns[0].content, "SUMMARY");
+        assert_eq!(turns[1].content, "question 4");
+        cap_history_rows(&mut plain, 5, false);
+        assert_eq!(plain[0].content, "answer 3");
+    }
+
+    // The loop compacted the thread mid-turn: the post-loop resync must
+    // publish the summary + kept turns to the cache AND the SQLite store,
+    // with both owner flags, so the next turn neither re-summarises nor
+    // reloads the dropped turns — and a restart's hydration keeps it.
+    #[test]
+    fn compaction_resync_persists_summary_and_flags_to_session_store() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store: Arc<dyn SessionBackend> = Arc::new(
+            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+        );
+        let sender = "compaction_resync_sender".to_string();
+        let mut prior = six_turns();
+        prior.push(ChatMessage::user("current request"));
+        for message in &prior {
+            store.append(&sender, message).unwrap();
+        }
+        let ctx = compaction_ctx(Arc::clone(&store));
+        ctx.conversation_histories
+            .lock()
+            .unwrap()
+            .push(sender.clone(), prior.clone());
+        ctx.history_crumb_flags
+            .lock()
+            .unwrap()
+            .push(sender.clone(), false);
+
+        let summary = ChatMessage::user("[summary of turns 0-3]");
+        let mut loop_history = vec![ChatMessage::system("system prompt"), summary.clone()];
+        loop_history.extend_from_slice(&prior[8..]);
+        loop_history.push(ChatMessage::assistant("final answer"));
+
+        let failed = resync_history_after_trim_or_evict_cache(
+            ctx.as_ref(),
+            &sender,
+            &loop_history,
+            true,
+            false,
+            prior.len(),
+            &prior,
+            None,
+            CompactionResync {
+                summary_present: true,
+                summary_present_before_loop: false,
+                compacted: true,
+            },
+        );
+        assert!(!failed);
+
+        let mut expected = vec![summary];
+        expected.extend_from_slice(&prior[8..]);
+        assert_eq!(rows(&store.load(&sender)), rows(&expected));
+        assert_eq!(
+            store.get_session_trim_breadcrumb(&sender).unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            store.get_session_compaction_summary(&sender).unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            rows(
+                ctx.conversation_histories
+                    .lock()
+                    .unwrap()
+                    .peek(&sender)
+                    .unwrap()
+            ),
+            rows(&expected)
+        );
+        assert_eq!(
+            ctx.history_summary_flags
+                .lock()
+                .unwrap()
+                .peek(&sender)
+                .copied(),
+            Some(true)
+        );
+        assert!(lead_is_recorded_summary(ctx.as_ref(), &sender));
+
+        // Restart: hydration under a small cap keeps the summary in its slot
+        // and stays classified as synthetic.
+        store
+            .append(&sender, &ChatMessage::assistant("final answer"))
+            .unwrap();
+        let hydrated = hydrate_session_transcript_with_cap(store.as_ref(), &sender, 3)
+            .expect("hydration")
+            .expect("transcript");
+        assert!(hydrated.crumb_present);
+        assert_eq!(hydrated.messages.len(), 3);
+        assert_eq!(hydrated.messages[0].content, "[summary of turns 0-3]");
+        assert_eq!(
+            store.get_session_compaction_summary(&sender).unwrap(),
+            Some(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_compact_summarises_older_turns_and_persists_them() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store: Arc<dyn SessionBackend> = Arc::new(
+            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+        );
+        let sender = "manual_compact_sender".to_string();
+        let turns = six_turns();
+        for message in &turns {
+            store.append(&sender, message).unwrap();
+        }
+        let ctx = compaction_ctx(Arc::clone(&store));
+        ctx.conversation_histories
+            .lock()
+            .unwrap()
+            .push(sender.clone(), turns.clone());
+        ctx.history_crumb_flags
+            .lock()
+            .unwrap()
+            .push(sender.clone(), false);
+        let snapshot = runtime_defaults_snapshot(ctx.as_ref());
+        let route = ChannelRouteSelection {
+            model_provider: "test".into(),
+            model: "test".into(),
+            automatic: false,
+            api_key: None,
+        };
+        ctx.provider_cache.lock().unwrap().insert(
+            provider_cache_key("test", None, snapshot.generation),
+            Arc::new(SummaryProvider) as Arc<dyn ModelProvider>,
+        );
+
+        let reply = compact_sender_history_now(
+            ctx.as_ref(),
+            &sender,
+            &route,
+            &snapshot,
+            Some("the grocery order"),
+        )
+        .await;
+        assert!(reply.starts_with("Compacted: ~"), "{reply}");
+        assert!(reply.contains("tokens →"), "{reply}");
+
+        let stored = store.load(&sender);
+        assert_eq!(stored.len(), 5, "{stored:?}");
+        assert!(stored[0].content.contains("SUMMARY: the user asked"));
+        assert_eq!(rows(&stored[1..]), rows(&turns[8..]));
+        assert_eq!(
+            store.get_session_trim_breadcrumb(&sender).unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            store.get_session_compaction_summary(&sender).unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            ctx.history_crumb_flags
+                .lock()
+                .unwrap()
+                .peek(&sender)
+                .copied(),
+            Some(true)
+        );
+
+        // Nothing older than the protected tail any more.
+        let again = compact_sender_history_now(
+            ctx.as_ref(),
+            &sender,
+            &route,
+            &snapshot,
+            Some("the grocery order"),
+        )
+        .await;
+        assert!(again.starts_with("Nothing to compact"), "{again}");
+    }
+
+    #[tokio::test]
+    async fn manual_compact_reports_disabled_without_touching_history() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store: Arc<dyn SessionBackend> = Arc::new(
+            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+        );
+        let ctx = test_channel_ctx_with_backend(Arc::clone(&store));
+        let snapshot = runtime_defaults_snapshot(ctx.as_ref());
+        let route = ChannelRouteSelection {
+            model_provider: "test".into(),
+            model: "test".into(),
+            automatic: false,
+            api_key: None,
+        };
+        let reply = compact_sender_history_now(ctx.as_ref(), "s", &route, &snapshot, None).await;
+        assert!(reply.contains("not enabled"), "{reply}");
     }
 }
