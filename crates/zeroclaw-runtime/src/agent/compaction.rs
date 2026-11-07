@@ -95,6 +95,25 @@ material; never drop facts from the previous summary just because they are \
 old. If a section has nothing to report, write \"None.\" for it. Output only \
 the summary itself, with no preamble and no closing remarks.";
 
+/// Prepended to the summariser material when a previous summary is carried
+/// forward verbatim by code.
+const CARRIED_SUMMARY_NOTE: &str = "NOTE: a summary of even older turns already exists and is \
+kept word for word separately. Summarise ONLY the conversation turns below; do not restate or \
+reconstruct the older summary.\n\n";
+
+/// Separates the carried summary from the summary of the turns after it.
+const LATER_TURNS_HEADING: &str = "LATER TURNS (summarised after everything above):";
+
+/// The carried summary's body: the slot text without the model-visible
+/// summary header (a fresh header is added when the slot is rebuilt).
+fn strip_summary_header(slot: &str) -> String {
+    let header = summary_header();
+    slot.strip_prefix(header.as_str())
+        .unwrap_or(slot)
+        .trim()
+        .to_string()
+}
+
 /// Model-visible header that opens the synthetic summary message. Purely
 /// informational: classification of the slot is carried by the owner flag,
 /// never by matching this text.
@@ -681,23 +700,42 @@ pub async fn compact_history(
         return Err(CompactionError::BudgetTooSmall);
     }
 
+    // A previous SUMMARY is carried forward verbatim by code, never by asking
+    // the model to copy it: a local summariser told to "fold ALL of it in"
+    // was seen replacing a ~10k-token summary with a 500-token one about the
+    // newest turn only. The model summarises just the new turns, appended
+    // below the carried text, and is asked to consolidate only once the
+    // combined summary passes `summary_max_tokens`. A breadcrumb (no summary)
+    // is still folded in by the model as before.
+    let carried = if lead.summary_present {
+        previous_slot.as_deref().map(strip_summary_header)
+    } else {
+        None
+    };
+    let (mut running, mut label) = if carried.is_some() {
+        (None, previous_label)
+    } else {
+        (previous_slot, previous_label)
+    };
+
     let units: Vec<String> = history[plan.body_start..plan.tail_start]
         .iter()
         .map(render_message)
         .collect();
     let chunks = chunk_units(units, chunk_budget, ratio);
     let total = chunks.len();
-    let mut running: Option<String> = previous_slot;
-    let mut label = previous_label;
     let mut calls = 0usize;
     for (index, chunk) in chunks.iter().enumerate() {
-        let material = build_material(
+        let mut material = build_material(
             running.as_deref(),
             label,
             chunk,
             (index + 1, total),
             request.focus,
         );
+        if carried.is_some() && running.is_none() {
+            material.insert_str(0, CARRIED_SUMMARY_NOTE);
+        }
         let summary = summarizer
             .summarize(system_prompt, &material)
             .await
@@ -710,7 +748,50 @@ pub async fn compact_history(
         running = Some(summary);
         label = "SUMMARY SO FAR of the older parts (extend it; keep ALL of it):";
     }
-    let summary = running.ok_or(CompactionError::EmptySummary)?;
+    let new_part = running.ok_or(CompactionError::EmptySummary)?;
+    let summary = match carried {
+        None => new_part,
+        Some(carried) => {
+            let combined = format!("{carried}\n\n{LATER_TURNS_HEADING}\n\n{new_part}");
+            let combined_tokens = calibrated_text_tokens(&combined, ratio);
+            if combined_tokens <= settings.summary_max_tokens || combined_tokens > per_call_budget {
+                // Under the cap: keep it all, verbatim. Too big for one
+                // consolidation call: also keep it verbatim (over the cap
+                // beats losing facts; the projection check decides fit).
+                combined
+            } else {
+                let material = format!(
+                    "PREVIOUS SUMMARY of even older turns (fold ALL of it into the new summary; \
+                     it is over the length limit, so merge duplicates and tighten wording, but \
+                     keep every fact, identifier, amount and date):\n{combined}"
+                );
+                let consolidated = summarizer
+                    .summarize(system_prompt, &material)
+                    .await
+                    .map_err(CompactionError::Summarizer)?;
+                calls += 1;
+                let consolidated = consolidated.trim().to_string();
+                // A consolidation that kept less than 40% of the text dropped
+                // facts, not just duplicates: keep the verbatim combination.
+                if consolidated.len() * 10 < combined.len() * 4 {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_category(::zeroclaw_log::EventCategory::Agent)
+                            .with_attrs(::serde_json::json!({
+                                "event": "compaction_consolidation_rejected",
+                                "combined_chars": combined.len(),
+                                "consolidated_chars": consolidated.len(),
+                            })),
+                        "Summary consolidation looked lossy; keeping the verbatim summary"
+                    );
+                    combined
+                } else {
+                    consolidated
+                }
+            }
+        }
+    };
     let message = ChatMessage::user(format!("{}\n\n{summary}", summary_header()));
 
     let messages_summarised = plan.tail_start - plan.body_start;
@@ -1161,7 +1242,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn second_compaction_folds_the_previous_summary() {
+    async fn second_compaction_carries_the_previous_summary_verbatim() {
         let mut history = conversation(6);
         let mut lead = LeadProvenance::default();
         let summarizer = ScriptedSummarizer::ok();
@@ -1178,12 +1259,20 @@ mod tests {
         assert!(outcome.folded_previous_summary);
         let seen = summarizer.seen();
         assert_eq!(seen.len(), 2);
-        assert!(seen[1].contains("PREVIOUS SUMMARY"));
-        assert!(seen[1].contains("summary-1"));
+        // The model summarises only the new turns; it is never handed the
+        // previous summary to copy forward.
+        assert!(seen[1].starts_with(CARRIED_SUMMARY_NOTE));
+        assert!(!seen[1].contains("summary-1"));
         assert!(seen[1].contains("request 4"));
-        // Exactly one summary message remains, holding the folded summary.
+        // One summary message: the carried text verbatim, then the new part.
         assert_eq!(history[1].role, "user");
-        assert!(history[1].content.ends_with("summary-2"));
+        let slot = &history[1].content;
+        assert!(slot.starts_with(&summary_header()));
+        let carried_at = slot.find("summary-1").expect("carried summary kept");
+        let heading_at = slot.find(LATER_TURNS_HEADING).expect("later-turns heading");
+        assert!(carried_at < heading_at);
+        assert!(slot.ends_with("summary-2"));
+        assert_eq!(slot.matches(&summary_header()).count(), 1);
         assert_eq!(
             history
                 .iter()
@@ -1192,6 +1281,69 @@ mod tests {
             1
         );
         assert_eq!(history[2].content, "request 7");
+    }
+
+    /// Returns `body_chars` of text for turn material and `consolidate_pct`
+    /// percent of the input length for a consolidation call.
+    struct SizedSummarizer {
+        body_chars: usize,
+        consolidate_pct: usize,
+        seen: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Summarizer for SizedSummarizer {
+        async fn summarize(&self, _system: &str, material: &str) -> anyhow::Result<String> {
+            self.seen.lock().unwrap().push(material.to_string());
+            if material.starts_with("PREVIOUS SUMMARY") {
+                return Ok("c".repeat(material.len() * self.consolidate_pct / 100));
+            }
+            Ok("b".repeat(self.body_chars))
+        }
+    }
+
+    async fn compact_twice_with(consolidate_pct: usize) -> (Vec<ChatMessage>, usize, Vec<String>) {
+        let mut history = conversation(6);
+        let mut lead = LeadProvenance::default();
+        // ~1,500 tokens per summary; two together pass the 2,000-token cap.
+        let summarizer = SizedSummarizer {
+            body_chars: 6_000,
+            consolidate_pct,
+            seen: std::sync::Mutex::new(Vec::new()),
+        };
+        let settings = settings(2, 0);
+        compact_history(&mut history, &mut lead, &summarizer, &request(&settings))
+            .await
+            .expect("first compaction");
+        for turn in 6..9 {
+            native_tool_turn(&mut history, turn);
+        }
+        let outcome = compact_history(&mut history, &mut lead, &summarizer, &request(&settings))
+            .await
+            .expect("second compaction");
+        let seen = summarizer.seen.lock().unwrap().clone();
+        (history, outcome.summary_calls, seen)
+    }
+
+    #[tokio::test]
+    async fn summary_over_the_cap_is_consolidated() {
+        let (history, calls, seen) = compact_twice_with(60).await;
+        assert_eq!(calls, 2, "new-turns call + consolidation call");
+        assert_eq!(seen.len(), 3);
+        assert!(seen[2].starts_with("PREVIOUS SUMMARY"));
+        assert!(seen[2].contains(LATER_TURNS_HEADING));
+        assert!(history[1].content.contains("ccc"));
+        assert!(!history[1].content.contains(LATER_TURNS_HEADING));
+    }
+
+    #[tokio::test]
+    async fn lossy_consolidation_is_rejected_and_the_verbatim_summary_kept() {
+        let (history, _calls, seen) = compact_twice_with(10).await;
+        assert_eq!(seen.len(), 3);
+        let slot = &history[1].content;
+        assert!(slot.contains(LATER_TURNS_HEADING));
+        assert!(!slot.contains("ccc"));
+        assert_eq!(slot.matches(&"b".repeat(6_000)).count(), 2);
     }
 
     #[tokio::test]
