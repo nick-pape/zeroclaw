@@ -60,6 +60,19 @@ pub fn is_no_reply_sentinel(output: &str) -> bool {
         // sentinel — deliver it rather than guess.
         return false;
     }
+    // Models often narrate before the sentinel ("Nothing new to report.\n\n
+    // NO_REPLY"). A bare `NO_REPLY` alone on the last line is still the
+    // model's decision to stay quiet; the lines above it are working notes.
+    // Only the bare form counts here, so a report that ends in a kinded or
+    // reasoned sentinel is still delivered.
+    if let Some(last) = trimmed.lines().rev().find(|l| !l.trim().is_empty()) {
+        // Tolerate markdown wrapping (`**NO_REPLY**`, `` `NO_REPLY` ``) and a
+        // trailing full stop.
+        let bare = last
+            .trim()
+            .trim_matches(|c| matches!(c, '*' | '`' | '_' | '.'));
+        return bare.eq_ignore_ascii_case("NO_REPLY");
+    }
     false
 }
 
@@ -1721,6 +1734,27 @@ mod tests {
             "The job returned NO_REPLY which means nothing happened"
         ));
         assert!(!is_no_reply_sentinel("NO_REPLYING is the status"));
+    }
+
+    #[test]
+    fn narration_followed_by_a_bare_sentinel_line_is_quiet() {
+        assert!(is_no_reply_sentinel(
+            "No new senders to process. Nothing new needs Nick's attention.\n\nNO_REPLY"
+        ));
+        assert!(is_no_reply_sentinel("All accounted for.\n**NO_REPLY**\n"));
+        assert!(is_no_reply_sentinel("Nothing new.\n`NO_REPLY`"));
+        // Real content after the sentinel line: deliver.
+        assert!(!is_no_reply_sentinel(
+            "NO_REPLY\nActually: Dr. Lee's office needs a reply by Friday."
+        ));
+        // A report that ends in a failure kind: deliver.
+        assert!(!is_no_reply_sentinel(
+            "Checked the inbox.\nNO_REPLY[FAIL]: search timed out"
+        ));
+        // Sentinel only mentioned mid-sentence on the last line: deliver.
+        assert!(!is_no_reply_sentinel(
+            "Bill due Friday.\nOtherwise I'd say NO_REPLY"
+        ));
     }
 
     async fn test_config(tmp: &TempDir) -> Config {
