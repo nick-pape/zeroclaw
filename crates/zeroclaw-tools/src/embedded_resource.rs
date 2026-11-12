@@ -466,6 +466,25 @@ fn materializable_base64(item: &serde_json::Value) -> Option<&str> {
 /// every top-level field is part of the known envelope. If `structuredContent`
 /// is present, the joined text must parse as semantically equal JSON. Anything
 /// else takes the preserving full-result path.
+/// True when `structuredContent` carries nothing the text doesn't: either the
+/// text's own JSON, or FastMCP's wrapper for a non-object return value,
+/// `{"result": <value>}`, where the value is the text itself (a tool that
+/// returned a string, e.g. through a proxying gateway) or the text's JSON.
+fn structured_duplicates_text(structured: &serde_json::Value, text: &str) -> bool {
+    let parsed: Option<serde_json::Value> = serde_json::from_str(text).ok();
+    if parsed.as_ref() == Some(structured) {
+        return true;
+    }
+    let Some(wrapped) = structured
+        .as_object()
+        .filter(|o| o.len() == 1)
+        .and_then(|o| o.get("result"))
+    else {
+        return false;
+    };
+    wrapped.as_str() == Some(text) || parsed.as_ref() == Some(wrapped)
+}
+
 fn all_text_content(result: &serde_json::Value) -> Option<String> {
     let envelope = result.as_object()?;
     if envelope
@@ -495,8 +514,7 @@ fn all_text_content(result: &serde_json::Value) -> Option<String> {
     }
 
     if let Some(structured) = envelope.get("structuredContent") {
-        let parsed: serde_json::Value = serde_json::from_str(&text).ok()?;
-        if &parsed != structured {
+        if !structured_duplicates_text(structured, &text) {
             return None;
         }
     }
@@ -1341,6 +1359,52 @@ mod tests {
         assert_eq!(out, payload);
         assert!(!out.contains("structuredContent"), "envelope kept: {out}");
         assert!(!dir.path().join("uploads").exists());
+    }
+
+    #[test]
+    fn mcp_intake_result_wrapped_duplicate_sends_the_text_alone() {
+        // FastMCP wraps a non-object return as {"result": ...}. A gateway that
+        // proxies a text tool returns the text again under "result".
+        let dir = tempdir().unwrap();
+        let text = "<untrusted>\n{\n  \"uid\": 7\n}\n</untrusted>\n\n[note]";
+        let result = json!({
+            "content": [{ "type": "text", "text": text }],
+            "structuredContent": { "result": text },
+            "isError": false,
+        });
+        let (out, _) = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
+        assert_eq!(out, text);
+
+        // ... or the text's JSON under "result" (a list return value).
+        let list = r#"[1, 2, 3]"#;
+        let result = json!({
+            "content": [{ "type": "text", "text": list }],
+            "structuredContent": { "result": [1, 2, 3] },
+        });
+        let (out, _) = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
+        assert_eq!(out, list);
+    }
+
+    #[test]
+    fn mcp_intake_result_wrapper_with_other_data_keeps_the_envelope() {
+        let dir = tempdir().unwrap();
+        let result = json!({
+            "content": [{ "type": "text", "text": "Found one record" }],
+            "structuredContent": { "result": "something else" },
+        });
+        let (out, _) = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
+        assert!(
+            out.contains("structuredContent"),
+            "structured output dropped: {out}"
+        );
+        assert!(out.contains("something else"));
+
+        let result = json!({
+            "content": [{ "type": "text", "text": "x" }],
+            "structuredContent": { "result": "x", "extra": 1 },
+        });
+        let (out, _) = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
+        assert!(out.contains("\"extra\": 1"), "extra field dropped: {out}");
     }
 
     #[test]
