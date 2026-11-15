@@ -9735,7 +9735,14 @@ fn stamp_session_routing_context(
         room_id,
         sender_id: Some(msg.sender.as_str()).filter(|s| !s.is_empty()),
     };
-    if let Err(e) = store.set_session_context(history_key, context) {
+    // Channel sessions must carry their owning agent too: the idle-compaction
+    // sweeper (and per-agent session listings) select by agent_alias, and only
+    // the gateway handshake used to set it, so channel conversations were
+    // never idle-compacted.
+    let result = store
+        .set_session_context(history_key, context)
+        .and_then(|()| store.set_session_agent_alias(history_key, ctx.agent_alias.as_str()));
+    if let Err(e) = result {
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
