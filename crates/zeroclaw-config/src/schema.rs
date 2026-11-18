@@ -17892,6 +17892,16 @@ pub struct MatrixConfig {
     #[tab(Behavior)]
     #[serde(default = "default_true")]
     pub per_user_session: bool,
+    /// `stream_mode = "single_message"` only. When true, the progress message
+    /// is re-derived from the turn's state on every update instead of being
+    /// appended to: a tool's completion replaces its own start line, a 0s
+    /// duration is omitted, "Thinking..." (no round number) is only ever the
+    /// last line while the model is thinking, and the finished turn ends with
+    /// "Done (<secs>s)". A turn that called no tools leaves no progress
+    /// message. Default false (the append-only transcript).
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub progress_in_place: bool,
     /// Override for the top-level `[channels].ack_reactions`. When
     /// `None`, falls back to the channels-wide default. When set
     /// explicitly (`true`/`false`), takes precedence for this Matrix

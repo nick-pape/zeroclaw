@@ -474,6 +474,9 @@ mod streaming {
         pub last_text: String,
         /// Last edit attempt timestamp, used only for Matrix edit throttling.
         pub last_edit: Instant,
+        /// When the draft was opened: the turn's elapsed time for the
+        /// `progress_in_place` "Done" line.
+        pub started: Instant,
     }
 
     /// MultiMessage streaming state. The runtime calls `update_draft` repeatedly
@@ -671,7 +674,17 @@ mod streaming {
     /// oldest entries once the configured window is full. A zero limit
     /// intentionally means "unlimited".
     pub(super) fn push_single_progress_line(draft: &mut SingleDraft, text: &str, max_lines: usize) {
-        push_single_progress(draft, legacy_single_progress(text), max_lines);
+        push_single_progress_line_in_mode(draft, text, max_lines, false);
+    }
+
+    /// [`push_single_progress_line`] honouring `progress_in_place`.
+    pub(super) fn push_single_progress_line_in_mode(
+        draft: &mut SingleDraft,
+        text: &str,
+        max_lines: usize,
+        in_place: bool,
+    ) {
+        push_single_progress_in_mode(draft, legacy_single_progress(text), max_lines, in_place);
     }
 
     /// Classify callers of the legacy text-only API using the historical
@@ -695,8 +708,23 @@ mod streaming {
         progress: DraftProgress,
         max_lines: usize,
     ) {
+        push_single_progress_in_mode(draft, progress, max_lines, false);
+    }
+
+    /// [`push_single_progress`] honouring `progress_in_place`.
+    pub(super) fn push_single_progress_in_mode(
+        draft: &mut SingleDraft,
+        progress: DraftProgress,
+        max_lines: usize,
+        in_place: bool,
+    ) {
         let progress = normalize_matrix_progress(progress);
         if progress.text.is_empty() {
+            return;
+        }
+        if in_place {
+            place_single_progress(draft, progress);
+            trim_single_visible_lines(draft, max_lines);
             return;
         }
         if merge_single_progress_line(draft, &progress) {
@@ -705,6 +733,89 @@ mod streaming {
         }
         draft.lines.push_back(progress);
         trim_single_visible_lines(draft, max_lines);
+    }
+
+    /// The thinking line `progress_in_place` shows: no round number. Inserted
+    /// as-is (not through `normalize_matrix_progress`).
+    const IN_PLACE_THINKING_TEXT: &str = "\u{1f914} Thinking...";
+
+    /// The tool a normalized `⏳`/`✅`/`❌` status line is about: the first
+    /// word after the marker, minus a trailing escaped colon. Start and
+    /// completion lines escape the name identically, so they compare equal.
+    fn in_place_tool_token(text: &str) -> Option<(&str, &str)> {
+        let (marker, rest) = text.split_once(' ')?;
+        if !matches!(marker, "\u{23f3}" | "\u{2705}" | "\u{274c}") {
+            return None;
+        }
+        let word = rest.split([' ', '\n']).next()?;
+        let word = word.strip_suffix("\\:").unwrap_or(word);
+        (!word.is_empty()).then_some((marker, word))
+    }
+
+    fn is_in_place_thinking(progress: &DraftProgress) -> bool {
+        matches!(progress.kind, DraftProgressKind::Status)
+            && progress.text == IN_PLACE_THINKING_TEXT
+    }
+
+    /// `progress_in_place`: fold one update into the state-derived view.
+    /// Thinking ticks only ever occupy the last line (and lose their round
+    /// number); anything else first removes a trailing thinking line; a tool
+    /// completion replaces its own start line, dropping a 0s duration.
+    fn place_single_progress(draft: &mut SingleDraft, mut progress: DraftProgress) {
+        let thinking_at_back = draft.lines.back().is_some_and(is_in_place_thinking);
+        if is_single_thinking_status(&progress) {
+            if !thinking_at_back {
+                draft
+                    .lines
+                    .push_back(DraftProgress::status(IN_PLACE_THINKING_TEXT));
+            }
+            return;
+        }
+        if thinking_at_back {
+            draft.lines.pop_back();
+        }
+        let completion = matches!(progress.kind, DraftProgressKind::Status)
+            .then(|| in_place_tool_token(&progress.text))
+            .flatten()
+            .filter(|(marker, _)| *marker != "\u{23f3}")
+            .map(|(marker, tool)| (marker == "\u{2705}", tool.to_string()));
+        if let Some((succeeded, tool)) = completion {
+            if succeeded {
+                progress.text = progress.text.replace(" \\(0s\\)", "");
+            }
+            if let Some(start) = draft.lines.iter_mut().rev().find(|line| {
+                matches!(line.kind, DraftProgressKind::Status)
+                    && in_place_tool_token(&line.text) == Some(("\u{23f3}", tool.as_str()))
+            }) {
+                *start = progress;
+                return;
+            }
+        }
+        if merge_single_progress_line(draft, &progress) {
+            return;
+        }
+        draft.lines.push_back(progress);
+    }
+
+    /// `progress_in_place` at the end of a turn: the trailing thinking line
+    /// becomes "Done (<secs>s)". A turn that ran no tool keeps no progress at
+    /// all, so plain replies don't leave an empty-looking status message.
+    pub(super) fn finish_single_in_place(draft: &mut SingleDraft, elapsed: Duration) {
+        while draft.lines.back().is_some_and(is_in_place_thinking) {
+            draft.lines.pop_back();
+        }
+        let ran_tools = draft
+            .lines
+            .iter()
+            .any(|line| in_place_tool_token(&line.text).is_some());
+        if !ran_tools {
+            draft.lines.clear();
+            return;
+        }
+        draft.lines.push_back(DraftProgress::status(format!(
+            "Done ({}s)",
+            elapsed.as_secs()
+        )));
     }
 
     /// Reasoning arrives as provider stream fragments. Keep it as one Matrix
@@ -4628,7 +4739,12 @@ impl MatrixChannel {
             let Some(draft) = streaming::single_for_update(&mut state, &key) else {
                 return Ok(());
             };
-            streaming::push_single_progress_line(draft, text, self.config.stream_draft_lines);
+            streaming::push_single_progress_line_in_mode(
+                draft,
+                text,
+                self.config.stream_draft_lines,
+                self.config.progress_in_place,
+            );
 
             let now = Instant::now();
             let interval = Duration::from_millis(self.config.draft_update_interval_ms.max(50));
@@ -4697,10 +4813,11 @@ impl MatrixChannel {
                 return Ok(());
             };
             for entry in progress {
-                streaming::push_single_progress(
+                streaming::push_single_progress_in_mode(
                     draft,
                     entry.clone(),
                     self.config.stream_draft_lines,
+                    self.config.progress_in_place,
                 );
             }
 
@@ -5001,6 +5118,7 @@ impl Channel for MatrixChannel {
                         lines: Default::default(),
                         last_text: message.content.clone(),
                         last_edit: first_edit_ready,
+                        started: first_edit_ready,
                     },
                 )?;
                 Ok(Some(event_id.to_string()))
@@ -5231,10 +5349,16 @@ impl Channel for MatrixChannel {
                 Ok(())
             }
             MatrixStreamMode::SingleMessage => {
-                let draft = {
+                let mut draft = {
                     let mut state = self.streaming_state.write().await;
                     streaming::take_single(&mut state, &key)
                 };
+                if self.config.progress_in_place
+                    && let Some(draft) = draft.as_mut()
+                {
+                    let elapsed = draft.started.elapsed();
+                    streaming::finish_single_in_place(draft, elapsed);
+                }
                 let plan = streaming::single_finalize_plan(
                     draft.is_some(),
                     self.config.stream_draft_delete,
@@ -8639,7 +8763,8 @@ mod tests {
             SingleRetainedDraftAction, State, decide_partial_finalize_action, insert_multi,
             insert_partial, insert_single, mark_single_edit_delivered, multi_contains,
             normalize_matrix_progress_line, partial_contains, partial_len, partial_should_edit,
-            partial_visible_text, push_single_progress, push_single_progress_line,
+            finish_single_in_place, partial_visible_text, push_single_progress,
+            push_single_progress_line, push_single_progress_line_in_mode,
             single_cancel_deletes_draft, single_contains, single_edit_interval_elapsed,
             single_finalize_plan, single_render_changed, single_retained_draft_action,
             single_visible_text_with_budget, single_visible_text_with_edit_budget,
@@ -8732,7 +8857,63 @@ mod tests {
                 lines: VecDeque::new(),
                 last_text: DRAFT_PLACEHOLDER.to_string(),
                 last_edit: Instant::now(),
+                started: Instant::now(),
             }
+        }
+
+        /// `progress_in_place`: the message is re-derived from state, not
+        /// appended to: a completion replaces its own start line, a 0s
+        /// duration is dropped, "Thinking..." only ever trails, and the turn
+        /// ends "Done (<secs>s)".
+        #[test]
+        fn progress_in_place_rederives_the_message() {
+            use zeroclaw_runtime::agent::loop_::thinking_status_text;
+            let mut draft = single_draft(owned_event_id!("$single:server"));
+            let push =
+                |d: &mut SingleDraft, s: &str| push_single_progress_line_in_mode(d, s, 0, true);
+            let view = |d: &SingleDraft| single_visible_text_with_budget(d, 10_000);
+
+            push(&mut draft, &thinking_status_text(0));
+            assert_eq!(view(&draft), "\u{1f914} Thinking...");
+
+            push(&mut draft, "\u{23f3} list_events: query\n");
+            push(&mut draft, "\u{23f3} get_freebusy\n");
+            assert_eq!(
+                view(&draft),
+                "\u{23f3} list\\_events\\: query\n\u{23f3} get\\_freebusy"
+            );
+
+            push(&mut draft, "\u{2705} list_events (0s)\n");
+            push(&mut draft, "\u{2705} get_freebusy (3s)\n");
+            assert_eq!(
+                view(&draft),
+                "\u{2705} list\\_events\n\u{2705} get\\_freebusy \\(3s\\)"
+            );
+
+            push(&mut draft, &thinking_status_text(1));
+            assert_eq!(
+                view(&draft),
+                "\u{2705} list\\_events\n\u{2705} get\\_freebusy \\(3s\\)\n\u{1f914} Thinking..."
+            );
+
+            push(&mut draft, "\u{23f3} create_event\n");
+            push(&mut draft, "\u{2705} create_event (0s)\n");
+            push(&mut draft, &thinking_status_text(2));
+            finish_single_in_place(&mut draft, Duration::from_secs(30));
+            assert_eq!(
+                view(&draft),
+                "\u{2705} list\\_events\n\u{2705} get\\_freebusy \\(3s\\)\n\u{2705} create\\_event\nDone (30s)"
+            );
+        }
+
+        /// A turn that ran no tool leaves no progress message.
+        #[test]
+        fn progress_in_place_without_tools_leaves_nothing() {
+            use zeroclaw_runtime::agent::loop_::thinking_status_text;
+            let mut draft = single_draft(owned_event_id!("$single:server"));
+            push_single_progress_line_in_mode(&mut draft, &thinking_status_text(0), 0, true);
+            finish_single_in_place(&mut draft, Duration::from_secs(2));
+            assert!(draft.lines.is_empty());
         }
 
         #[test]
@@ -10507,6 +10688,7 @@ mod tests {
                 approval_timeout_secs: 300,
                 reply_in_thread: true,
                 per_user_session: true,
+                progress_in_place: false,
                 ack_reactions: Some(true),
                 excluded_tools: vec![],
                 reply_min_interval_secs: 0,

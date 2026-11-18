@@ -346,6 +346,7 @@ mod tests {
                 approval_timeout_secs: 300,
                 reply_in_thread: true,
                 per_user_session: true,
+                progress_in_place: false,
                 ack_reactions: Some(true),
                 excluded_tools: vec![],
                 reply_min_interval_secs: 0,
