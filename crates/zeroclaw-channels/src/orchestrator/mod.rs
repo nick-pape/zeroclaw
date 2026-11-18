@@ -18499,6 +18499,80 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
     Ok(())
 }
 
+/// The user turn filed before an announcement recorded in a room's history,
+/// so the model reads the announcement as something it said on its own, not
+/// as the answer to whoever spoke last.
+const OUTBOUND_ANNOUNCEMENT_MARKER: &str = "[Not a message from a person. The next message is one you posted to this room yourself, outside a reply (a scheduled run, or a message you sent with send_message_to_peer). Later messages in this room may be answers to it.]";
+
+/// After an announcement (a scheduled job's delivery, or
+/// `send_message_to_peer` to a room) reaches a room whose channel keeps one
+/// shared history per room, append it to that history as
+/// `[marker, assistant(text)]`, so a reply in the room sees what the agent
+/// itself said there. Goes through the owning agent's published
+/// [`ConversationBindingOwner`], i.e. the same persist lock, cache and store
+/// as the room's own turns. Best effort: delivery already succeeded, so a
+/// failure here is logged, never returned.
+async fn record_outbound_in_room_conversation(
+    config: &zeroclaw_config::schema::Config,
+    channel: &str,
+    target: &str,
+    ch: &dyn Channel,
+    sent_text: &str,
+) {
+    if !ch.shares_room_conversation() {
+        return;
+    }
+    let route = channel.to_ascii_lowercase();
+    let Some(agent_alias) = config.agents.iter().find_map(|(alias, agent)| {
+        agent
+            .channels
+            .iter()
+            .any(|c| {
+                let c: &str = c.as_ref();
+                c.eq_ignore_ascii_case(&route)
+            })
+            .then(|| alias.clone())
+    }) else {
+        return;
+    };
+    let Some(owner) = zeroclaw_infra::conversation_owners::conversation_owner(
+        zeroclaw_api::conversation_binding::ConversationSurface::Channel,
+        &agent_alias,
+    ) else {
+        return;
+    };
+    let Some(room) = ch.canonical_reply_target(target).await else {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"channel": route, "target": target})),
+            "announcement delivered but its room could not be resolved; not recorded in the room's history"
+        );
+        return;
+    };
+    // Same key the room's inbound turns use under `ReplyTarget` scope
+    // (`conversation_history_key_in_scope`): `<type>.<alias>_<room>`.
+    let binding = zeroclaw_api::conversation_binding::ConversationBinding {
+        surface: zeroclaw_api::conversation_binding::ConversationSurface::Channel,
+        route: route.clone(),
+        key: sanitize_session_key(&format!("{route}_{room}")),
+    };
+    let exchange = [
+        ChatMessage::user(OUTBOUND_ANNOUNCEMENT_MARKER),
+        ChatMessage::assistant(sent_text),
+    ];
+    if let Err(e) = owner.append(&binding, &exchange) {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"channel": route, "key": binding.key, "error": e.to_string()})),
+            "announcement delivered but recording it in the room's history failed"
+        );
+    }
+}
+
 pub async fn deliver_announcement(
     config: &zeroclaw_config::schema::Config,
     channel: &str,
@@ -18528,7 +18602,10 @@ pub async fn deliver_announcement(
     if let Some(registry) = registry_snapshot
         && let Some(ch) = registry.get(channel.to_ascii_lowercase().as_str())
     {
-        return ch.send(&make_msg(&safe_output)).await;
+        ch.send(&make_msg(&safe_output)).await?;
+        record_outbound_in_room_conversation(config, channel, target, ch.as_ref(), &safe_output)
+            .await;
+        return Ok(());
     }
 
     let (raw_type, alias) = channel.split_once('.').ok_or_else(|| {
@@ -20332,6 +20409,140 @@ fn bound_exchange_survives_a_concurrent_channel_turns_trim_resync() {
         reloaded.len() == expected.len() && reloaded.iter().zip(&expected).all(|(a, b)| same(a, b)),
         "the durable transcript must agree with the cache: got {reloaded:?}"
     );
+}
+
+/// A channel that shares one history per room and spells a room two ways
+/// (alias and id), like Matrix with `per_user_session = false`.
+#[cfg(test)]
+struct SharedRoomTestChannel {
+    shares: bool,
+}
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl Channel for SharedRoomTestChannel {
+    fn name(&self) -> &str {
+        "matrix"
+    }
+
+    async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn listen(
+        &self,
+        _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn canonical_reply_target(&self, target: &str) -> Option<String> {
+        Some(if target == "#calendar:example.org" {
+            "!room:example.org".to_string()
+        } else {
+            target.to_string()
+        })
+    }
+
+    fn shares_room_conversation(&self) -> bool {
+        self.shares
+    }
+}
+
+#[cfg(test)]
+impl ::zeroclaw_api::attribution::Attributable for SharedRoomTestChannel {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Channel(::zeroclaw_api::attribution::ChannelKind::Webhook)
+    }
+    fn alias(&self) -> &str {
+        "test"
+    }
+}
+
+#[cfg(test)]
+fn outbound_record_fixture(
+    agent: &str,
+    route: &str,
+) -> (
+    tempfile::TempDir,
+    Arc<dyn zeroclaw_infra::session_backend::SessionBackend>,
+    zeroclaw_config::schema::Config,
+    zeroclaw_infra::conversation_owners::ConversationOwnerLease,
+) {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let backend: Arc<dyn zeroclaw_infra::session_backend::SessionBackend> = Arc::new(
+        zeroclaw_infra::session_store::SessionStore::new(tmp.path()).expect("session store"),
+    );
+    let ctx = test_channel_ctx_with_backend(backend.clone());
+    let owner = ChannelConversationOwner {
+        ctx: Arc::clone(&ctx),
+        owner_by_channel_key: Arc::new(HashMap::from([(
+            route.to_string(),
+            ctx.agent_alias.to_string(),
+        )])),
+    };
+    let lease = zeroclaw_infra::conversation_owners::publish_conversation_owner(
+        zeroclaw_api::conversation_binding::ConversationSurface::Channel,
+        agent,
+        Arc::new(owner),
+    );
+    let mut config = zeroclaw_config::schema::Config::default();
+    let mut agent_cfg = zeroclaw_config::schema::AliasedAgentConfig::default();
+    agent_cfg.channels = vec![zeroclaw_config::providers::ChannelRef::new(route)];
+    config.agents.insert(agent.to_string(), agent_cfg);
+    (tmp, backend, config, lease)
+}
+
+/// What an agent posts to a shared-history room on its own (a scheduled
+/// job's announcement, `send_message_to_peer`) lands in that room's history
+/// under the key the room's inbound turns use, even when it was addressed by
+/// alias, so a reply in the room sees it.
+#[cfg(test)]
+#[tokio::test]
+async fn outbound_announcement_is_recorded_in_a_shared_room_history() {
+    let (_tmp, backend, config, _lease) =
+        outbound_record_fixture("outbound-record-shared", "matrix.pepper");
+    let ch = SharedRoomTestChannel { shares: true };
+
+    record_outbound_in_room_conversation(
+        &config,
+        "matrix.pepper",
+        "#calendar:example.org",
+        &ch,
+        "Who's taking Dustin to the doctor Thu 3pm?",
+    )
+    .await;
+
+    let inbound_key = conversation_history_key(&zeroclaw_api::channel::ChannelMessage {
+        channel: "matrix".into(),
+        channel_alias: Some("pepper".into()),
+        reply_target: "!room:example.org".into(),
+        sender: "@katie:example.org".into(),
+        conversation_scope: zeroclaw_api::channel::ChannelConversationScope::ReplyTarget,
+        ..Default::default()
+    });
+    let turns = backend.load(&inbound_key);
+    assert_eq!(turns.len(), 2, "marker + announcement: {turns:?}");
+    assert_eq!(turns[0].role, "user");
+    assert_eq!(turns[0].content, OUTBOUND_ANNOUNCEMENT_MARKER);
+    assert_eq!(turns[1].role, "assistant");
+    assert_eq!(turns[1].content, "Who's taking Dustin to the doctor Thu 3pm?");
+}
+
+/// A channel with per-sender histories has no one room history to record
+/// into, so nothing is written.
+#[cfg(test)]
+#[tokio::test]
+async fn outbound_announcement_is_not_recorded_for_per_sender_histories() {
+    let (_tmp, backend, config, _lease) =
+        outbound_record_fixture("outbound-record-per-sender", "matrix.solo");
+    let ch = SharedRoomTestChannel { shares: false };
+
+    record_outbound_in_room_conversation(&config, "matrix.solo", "!room:example.org", &ch, "hi")
+        .await;
+
+    let room_key = sanitize_session_key("matrix.solo_!room:example.org");
+    assert!(backend.load(&room_key).is_empty());
 }
 
 /// The bound exchange lands as one contiguous pair between a channel turn's

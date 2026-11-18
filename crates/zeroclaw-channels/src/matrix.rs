@@ -2522,6 +2522,14 @@ mod inbound {
             attachments,
             subject: None,
             voice_origin,
+            // `per_user_session = false`: one shared history per room, so a
+            // reply sees what the agent announced there (see
+            // `orchestrator::record_outbound_in_room_conversation`).
+            conversation_scope: if ctx.config.per_user_session {
+                zeroclaw_api::channel::ChannelConversationScope::Sender
+            } else {
+                zeroclaw_api::channel::ChannelConversationScope::ReplyTarget
+            },
             ..Default::default()
         };
 
@@ -4890,6 +4898,18 @@ impl Channel for MatrixChannel {
             Some(c) => c.matrix_auth().logged_in() && self.initial_sync_done.load(Ordering::SeqCst),
             None => false,
         }
+    }
+
+    async fn canonical_reply_target(&self, target: &str) -> Option<String> {
+        let client = self.ensure_client().await.ok()?;
+        client::resolve_room(client, &self.alias_cache, target)
+            .await
+            .ok()
+            .map(|id| id.to_string())
+    }
+
+    fn shares_room_conversation(&self) -> bool {
+        !self.config.per_user_session
     }
 
     async fn start_typing(&self, recipient: &str) -> Result<()> {
@@ -10486,6 +10506,7 @@ mod tests {
                 password: password.map(String::from),
                 approval_timeout_secs: 300,
                 reply_in_thread: true,
+                per_user_session: true,
                 ack_reactions: Some(true),
                 excluded_tools: vec![],
                 reply_min_interval_secs: 0,

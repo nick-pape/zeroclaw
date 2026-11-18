@@ -348,6 +348,14 @@ impl Channel for PacedChannel {
         self.inner.health_check().await
     }
 
+    async fn canonical_reply_target(&self, target: &str) -> Option<String> {
+        self.inner.canonical_reply_target(target).await
+    }
+
+    fn shares_room_conversation(&self) -> bool {
+        self.inner.shares_room_conversation()
+    }
+
     /// The picker is an interactive control surface, not paced outbound
     /// traffic. Without this forward the trait default's `Ok(false)` would
     /// silently swallow the picker whenever pacing wraps the channel.

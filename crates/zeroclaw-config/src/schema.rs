@@ -17883,6 +17883,15 @@ pub struct MatrixConfig {
     #[tab(Behavior)]
     #[serde(default = "default_true")]
     pub reply_in_thread: bool,
+    /// When true (default), each sender in a room gets their own conversation
+    /// history. When false, everyone in a room shares ONE history keyed on the
+    /// room (each user turn is attributed to its sender), and messages this
+    /// agent posts to the room from outside a reply (scheduled-job
+    /// announcements, `send_message_to_peer`) are recorded in it too, so a
+    /// reply in the room sees what the agent itself said there.
+    #[tab(Behavior)]
+    #[serde(default = "default_true")]
+    pub per_user_session: bool,
     /// Override for the top-level `[channels].ack_reactions`. When
     /// `None`, falls back to the channels-wide default. When set
     /// explicitly (`true`/`false`), takes precedence for this Matrix

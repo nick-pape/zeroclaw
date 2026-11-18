@@ -928,6 +928,21 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
     }
 
     /// Check if channel is healthy
+    /// The `reply_target` inbound messages from `target` carry, when `target`
+    /// is another spelling of it (a Matrix room alias for its room id). Used
+    /// to file an outbound announcement under the same conversation key as
+    /// the room's inbound turns. `None` when unknown.
+    async fn canonical_reply_target(&self, target: &str) -> Option<String> {
+        Some(target.to_string())
+    }
+
+    /// Whether this channel keeps ONE conversation history per room
+    /// (`ChannelConversationScope::ReplyTarget` for every inbound message), so
+    /// what the agent posts to a room on its own can be recorded in it.
+    fn shares_room_conversation(&self) -> bool {
+        false
+    }
+
     async fn health_check(&self) -> bool {
         true
     }
